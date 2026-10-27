@@ -1,0 +1,9 @@
+#pragma once
+#include <cstdint>
+namespace mafia::build {
+inline constexpr char elf_sha256[] = "@MAFIA_ELF_SHA256@";
+inline constexpr std::uint32_t entry_point = @MAFIA_ELF_ENTRY@u;
+inline constexpr char profile_id[] = "@MAFIA_PROFILE_ID@";
+inline constexpr char ps2recomp_commit[] = "@MAFIA_EXPECTED_UPSTREAM@";
+inline constexpr bool ffmpeg_enabled = @MAFIA_FFMPEG_BOOL@;
+}
