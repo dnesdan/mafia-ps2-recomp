@@ -77,8 +77,9 @@ jobs:
             ps2_iop_cdvd_memory_tests ps2_iop_boot_image_tests ps2_iop_strict_loader_tests \
             ps2_iop_emulator_tests ps2_iop_import_tests ps2_iop_compatibility_tests \
             ps2_iop_import_version_tests
-          # Upstream does not register ps2x_tests with CTest.
-          build/upstream-tests/ps2xTest/ps2x_tests
+          # Upstream does not register ps2x_tests with CTest. Its enum-coverage
+          # fixture reads instructions.h relative to the upstream source root.
+          cmake -E chdir .deps/PS2Recomp "$PWD/build/upstream-tests/ps2xTest/ps2x_tests"
           ctest --test-dir build/upstream-tests/ps2xIOP --output-on-failure --no-tests=error --parallel 2
       - name: Generated integer operations under UBSan
         shell: bash
