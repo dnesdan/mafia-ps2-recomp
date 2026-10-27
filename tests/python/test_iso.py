@@ -201,8 +201,13 @@ class IsoTests(unittest.TestCase):
 
     def test_extract_does_not_delete_a_file_created_by_another_writer(self) -> None:
         self.iso([record("RACE.TXT;1", 30, 4)], {30: b"ours"})
-        out = self.directory / "out"
-        target = out / "RACE.TXT"
+        # macOS temporary directories can have /var vs /private/var aliases.
+        # Exercise that layout on every platform, and intercept the same
+        # canonical destination that safe_destination intentionally uses.
+        alias = self.directory / "path-alias"
+        alias.symlink_to(self.directory, target_is_directory=True)
+        out = alias / "out"
+        target = (out / "RACE.TXT").resolve()
         original_open = Path.open
 
         def another_writer_wins(path: Path, mode: str = "r", *args: object, **kwargs: object):
