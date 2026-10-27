@@ -1,0 +1,627 @@
+diff --git a/ps2xRuntime/src/lib/ps2_ee_memory_layout.h b/ps2xRuntime/src/lib/ps2_ee_memory_layout.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_ee_memory_layout.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <cstdint>
++
++namespace ps2x::ee
++{
++    // The modeled kernel's mirrors end at 0x80000. Linked kernel support can
++    // also install the alarm trampoline at 0x82000 and use a stack below it;
++    // preserve that workspace through 0x84000. This is a modeled kernel arena,
++    // not a claim that every PS2 kernel leaves this interval unused. Reject
++    // application ELF, thread and heap declarations that conflict with it.
++    inline constexpr uint32_t kKernelMirrorLimit = 0x00080000u;
++    inline constexpr uint32_t kCallbackStackBase = 0x00084000u;
++    inline constexpr uint32_t kCallbackStackLimit = 0x00100000u;
++    inline constexpr uint32_t kRdramSize = 0x02000000u;
++
++    inline constexpr uint32_t callbackStackPhysicalAddress(uint32_t address)
++    {
++        // Generated RAM helpers support 32 MiB mirrors, including all of the
++        // 0x20000000..0x3fffffff uncached window. Conservatively include every
++        // such alias when checking ownership, not only the KSEG0/KSEG1 bits.
++        return address & (kRdramSize - 1u);
++    }
++
++    inline constexpr bool overlapsCallbackStackArena(uint32_t address, uint64_t size)
++    {
++        if (size == 0u)
++            return false;
++        if (size >= kRdramSize)
++            return true;
++        const uint32_t physical = callbackStackPhysicalAddress(address);
++        const uint64_t end = uint64_t(physical) + size;
++        return (physical < kCallbackStackLimit && end > kCallbackStackBase) ||
++               (end > kRdramSize && end - kRdramSize > kCallbackStackBase);
++    }
++
++    inline constexpr bool callbackStackContainsStackPointer(uint32_t address)
++    {
++        const uint32_t physical = callbackStackPhysicalAddress(address);
++        // A descending stack whose initial SP is the exclusive upper boundary
++        // would immediately enter the reserved arena on its first frame.
++        return physical > kCallbackStackBase && physical <= kCallbackStackLimit;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "ps2_ee_memory_layout.h"
+ #include "Kernel/Stubs/SIF.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -504,8 +505,8 @@
+     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+     m_guestHeapConfigured = false;
+-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    m_asyncCallbackStackFloor = ps2x::ee::kCallbackStackBase;
++    m_asyncCallbackStackTop = ps2x::ee::kCallbackStackLimit;
+ }
+ 
+ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -891,6 +892,13 @@
+             return false;
+         }
+ 
++        if (!scratch && ps2x::ee::overlapsCallbackStackArena(physAddr, ph.memsz))
++        {
++            std::cerr << "ELF segment " << i
++                      << " overlaps the modeled kernel callback stack arena." << std::endl;
++            return false;
++        }
++
+         uint8_t *destBase = scratch ? m_memory.getScratchpad() : m_memory.getRDRAM();
+         if (!destBase)
+         {
+@@ -970,12 +978,8 @@
+             m_guestHeapLimit = hardLimit;
+         }
+     }
+-    {
+-        std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+-    }
++    // The scheduler resets callback leases and their allocator together. ELF
++    // loading must not rewind this allocator while cached leases still exist.
+ 
+     LoadedModule module;
+     module.name = elfPath.substr(elfPath.find_last_of("/\\") + 1);
+@@ -1671,6 +1675,9 @@
+         limit = 0u;
+     }
+ 
++    if (limit > base && ps2x::ee::overlapsCallbackStackArena(base, uint64_t(limit) - base))
++        throw std::runtime_error("EE guest heap overlaps the modeled kernel callback stack arena");
++
+     m_guestHeapBlocks.clear();
+     if (limit > base)
+     {
+@@ -2004,10 +2011,9 @@
+ 
+     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+     uint32_t top = m_asyncCallbackStackTop;
+-    if (top > PS2_RAM_SIZE)
+-    {
+-        top = PS2_RAM_SIZE;
+-    }
++    if (m_asyncCallbackStackFloor != ps2x::ee::kCallbackStackBase ||
++        top > ps2x::ee::kCallbackStackLimit || top < m_asyncCallbackStackFloor)
++        throw std::runtime_error("EE callback stack allocator escaped its owned kernel arena");
+     top &= ~(kGuestHeapDefaultAlignment - 1u);
+ 
+     if (top <= allocSize)
+@@ -2279,7 +2285,7 @@
+ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, uint32_t handler)
+ {
+     constexpr uint32_t kTableBase = 0x80011F80u & 0x1FFFFFFFu;
+-    constexpr uint32_t kMirrorLimit = 0x00080000u;
++    constexpr uint32_t kMirrorLimit = ps2x::ee::kKernelMirrorLimit;
+     const int64_t offset = static_cast<int64_t>(static_cast<int32_t>(syscallNumber)) * 4;
+     const int64_t address = static_cast<int64_t>(kTableBase) + offset;
+ 
+@@ -2316,7 +2322,7 @@
+     }
+     constexpr uint32_t kTableGuestBase = 0x80011F80u;
+     constexpr uint32_t kTableBase = kTableGuestBase & 0x1FFFFFFFu;
+-    constexpr uint32_t kMirrorLimit = 0x00080000u;
++    constexpr uint32_t kMirrorLimit = ps2x::ee::kKernelMirrorLimit;
+     constexpr uint32_t kProbeBase = 0x000002F0u;
+ 
+     std::lock_guard lock(m_eeKernelStateMutex);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/ee_scheduler.h"
+ #include "../ps2_vif_internal.h"
++#include "../ps2_ee_memory_layout.h"
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+@@ -85,6 +86,16 @@
+ 
+ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+ {
++    if (ps2x::ee::callbackStackContainsStackPointer(getRegU32(&mainContext, 29)))
++        throw std::runtime_error("EE main stack pointer overlaps the modeled kernel callback stack arena");
++    // Cached leases and the bump allocator form one lifetime. Resetting only
++    // either side can hand the same stack to two later callback owners.
++    m_invocationStackTops.clear();
++    {
++        std::lock_guard lock(m_runtime.m_asyncCallbackStackMutex);
++        m_runtime.m_asyncCallbackStackFloor = ps2x::ee::kCallbackStackBase;
++        m_runtime.m_asyncCallbackStackTop = ps2x::ee::kCallbackStackLimit;
++    }
+     m_executorThread = std::this_thread::get_id();
+     m_rdram = rdram;
+     m_readyQueues = {};
+@@ -427,6 +438,10 @@
+         return;
+     }
+ 
++    if ((stackSize != 0u && ps2x::ee::overlapsCallbackStackArena(stack, stackSize)) ||
++        (stackSize == 0u && ps2x::ee::callbackStackContainsStackPointer(stack)))
++        throw std::runtime_error("EE thread stack overlaps the modeled kernel callback stack arena");
++
+     target->stack = stack;
+     target->stackSize = stackSize;
+     target->gp = gp;
+@@ -440,6 +455,11 @@
+     {
+         return KE_ILLEGAL_PRIORITY;
+     }
++
++    if (params.stack != 0u &&
++        ((params.stackSize != 0u && ps2x::ee::overlapsCallbackStackArena(params.stack, params.stackSize)) ||
++         (params.stackSize == 0u && ps2x::ee::callbackStackContainsStackPointer(params.stack))))
++        return KE_ERROR;
+ 
+     const int id = allocateThreadId();
+     if (id == 0)
+@@ -502,6 +522,14 @@
+         return KE_NOT_DORMANT;
+     }
+ 
++    const uint32_t stackTop = target->stack != 0u
++                                  ? (target->stack + target->stackSize) & ~0xFu
++                                  : getRegU32(&caller, 29);
++    if ((target->stack != 0u &&
++         ps2x::ee::overlapsCallbackStackArena(target->stack, target->stackSize)) ||
++        ps2x::ee::callbackStackContainsStackPointer(stackTop))
++        return KE_ERROR;
++
+     target->context = R5900Context{};
+     target->context.pc = target->entry;
+     target->arg = arg;
+@@ -510,9 +538,6 @@
+     target->wait = {};
+     SET_GPR_U32(&target->context, 4, arg);
+     SET_GPR_U32(&target->context, 28, target->gp != 0u ? target->gp : getRegU32(&caller, 28));
+-    const uint32_t stackTop = target->stack != 0u
+-                                  ? (target->stack + target->stackSize) & ~0xFu
+-                                  : getRegU32(&caller, 29);
+     SET_GPR_U32(&target->context, 29, stackTop);
+     SET_GPR_U32(&target->context, 31, 0u);
+     enqueueReady(*target);
+@@ -1184,10 +1209,43 @@
+         return existing->second;
+     }
+     constexpr uint32_t kInvocationStackSize = 0x4000u;
+-    const uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
++    uint32_t top = m_runtime.reserveAsyncCallbackStack(kInvocationStackSize, 16u);
+     if (top == 0u)
+     {
+-        throw std::runtime_error("EE invocation stack space exhausted");
++        // A cache entry is not a permanent reservation for a deleted thread or
++        // a completed invocation depth. Rebind an inactive lease when the
++        // bounded arena fills, while retaining every suspended/nested frame.
++        for (auto it = m_invocationStackTops.begin(); it != m_invocationStackTops.end(); ++it)
++        {
++            const auto oldOwnerId = static_cast<int32_t>(it->first >> 32u);
++            const auto oldDepth = static_cast<uint32_t>(it->first);
++            const GuestThread *oldOwner = thread(oldOwnerId);
++            if (oldOwner && oldDepth < oldOwner->invocations.size())
++                continue;
++
++            const uint32_t leaseEnd = it->second + 0x10u;
++            const uint32_t leaseBase = leaseEnd - kInvocationStackSize;
++            const auto referencesLease = [leaseBase, leaseEnd](const GuestInvocation &invocation)
++            {
++                const uint32_t sp = ps2x::ee::callbackStackPhysicalAddress(getRegU32(&invocation.context, 29));
++                return sp >= leaseBase && sp <= leaseEnd;
++            };
++            bool referenced = std::any_of(m_pendingInvocations.begin(), m_pendingInvocations.end(), referencesLease);
++            for (const auto &[id, candidate] : m_threads)
++            {
++                if (referenced)
++                    break;
++                referenced = std::any_of(candidate.invocations.begin(), candidate.invocations.end(), referencesLease);
++            }
++            if (referenced)
++                continue;
++
++            top = it->second;
++            m_invocationStackTops.erase(it);
++            break;
++        }
++        if (top == 0u)
++            throw std::runtime_error("EE invocation stack space exhausted");
+     }
+     m_invocationStackTops.emplace(key, top);
+     return top;
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -3,11 +3,14 @@
+ #include "ps2_syscalls.h"
+ #include "runtime/ee_scheduler.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <exception>
++#include <filesystem>
++#include <fstream>
+ #include <string_view>
+ #include <thread>
+ #include <utility>
+@@ -18,6 +21,7 @@
+ namespace
+ {
+     constexpr int KE_OK = 0;
++    constexpr int KE_ERROR = -1;
+     constexpr int KE_EVF_COND = -421;
+ 
+     constexpr uint32_t WEF_OR = 1u;
+@@ -373,12 +377,324 @@
+         ctx->pc = 0u;
+         runtime->requestStop();
+     }
++
++    constexpr uint32_t kKernelArenaBegin = 0x00084000u;
++    constexpr uint32_t kKernelArenaEnd = 0x00100000u;
++    constexpr uint32_t kArenaLeaseCount = (kKernelArenaEnd - kKernelArenaBegin) / 0x4000u;
++    constexpr uint32_t kArenaMainPc = 0x00160600u;
++    constexpr uint32_t kArenaHandlerPc = 0x00160610u;
++    constexpr uint32_t kArenaWorkerMainPc = 0x00160620u;
++    constexpr uint32_t kArenaWorkerPc = 0x00160630u;
++    constexpr uint32_t kArenaGuestStackBegin = 0x01F00000u;
++    constexpr uint32_t kArenaGuestStackSize = 0x00100000u;
++    uint32_t g_arenaPreSetupSp = 0u;
++    uint32_t g_arenaIrqSp = 0u;
++    bool g_arenaReturnPreserved = false;
++    bool g_arenaDeleteWorker = false;
++    std::vector<uint32_t> g_arenaWorkerStacks;
++
++    void schedulerArenaMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &ee = runtime->eeScheduler();
++        // Reserve the same owner/depth before SetupThread, as early kernel
++        // invocations can do. The cached lease must already be disjoint.
++        g_arenaPreSetupSp = ee.invocationStackTop();
++        ee.setupCurrentThread(kArenaGuestStackBegin, kArenaGuestStackSize, 0u);
++        ee.addIrqHandler(true, 5u, kArenaHandlerPc, true, 0u, 0u, 0u);
++        ee.dispatchIrq(true, 5u);
++        ctx->pc = 0u; // let the queued IRQ run on the reusable dispatcher owner.
++    }
++
++    void schedulerArenaHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_arenaIrqSp = getRegU32(ctx, 29);
++        constexpr uint64_t savedReturn = 0x0000000012345678ull;
++        std::memcpy(rdram + g_arenaIrqSp - 16u, &savedReturn, sizeof(savedReturn));
++        // An original file-completion callback can legitimately fill a live
++        // application stack buffer. No byte of that stack belongs to the IRQ.
++        std::memset(rdram + kArenaGuestStackBegin, 0xA5, kArenaGuestStackSize);
++        g_arenaReturnPreserved = readGuestU64(rdram, g_arenaIrqSp - 16u) == savedReturn;
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void startArenaWorker(R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeThreadCreateParams params{};
++        params.entry = kArenaWorkerPc;
++        params.stack = 0x001E0000u;
++        params.stackSize = 0x1000u;
++        params.priority = 10;
++        auto &ee = runtime->eeScheduler();
++        const int id = ee.createThread(params);
++        if (id <= 0 || ee.startThread(id, 0u, *ctx, false) != KE_OK)
++            throw std::runtime_error("cannot start authored callback-arena worker");
++    }
++
++    void schedulerArenaWorkerMain(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        startArenaWorker(ctx, runtime);
++        ctx->pc = 0u;
++    }
++
++    void schedulerArenaWorker(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_arenaWorkerStacks.push_back(runtime->eeScheduler().invocationStackTop());
++        if (g_arenaWorkerStacks.size() < 96u)
++            startArenaWorker(ctx, runtime);
++        else
++            runtime->requestStop();
++        runtime->eeScheduler().exitCurrent(g_arenaDeleteWorker);
++    }
++
++    struct ArenaElf
++    {
++        std::filesystem::path path;
++        explicit ArenaElf(uint32_t address, uint32_t memorySize = 4u)
++        {
++            static uint32_t serial = 0u;
++            path = std::filesystem::temp_directory_path() /
++                ("ps2-authored-arena-" + std::to_string(
++                    std::chrono::steady_clock::now().time_since_epoch().count()) +
++                 "-" + std::to_string(++serial) + ".elf");
++            std::vector<uint8_t> bytes(0x104u, 0u);
++            const auto put16 = [&](size_t at, uint16_t value)
++            {
++                bytes[at] = static_cast<uint8_t>(value);
++                bytes[at + 1u] = static_cast<uint8_t>(value >> 8u);
++            };
++            const auto put32 = [&](size_t at, uint32_t value)
++            {
++                put16(at, static_cast<uint16_t>(value));
++                put16(at + 2u, static_cast<uint16_t>(value >> 16u));
++            };
++            put32(0u, 0x464C457Fu);
++            bytes[4] = bytes[5] = bytes[6] = 1u;
++            put16(16u, 2u); put16(18u, 8u); put32(20u, 1u);
++            put32(24u, address); put32(28u, 52u);
++            put16(40u, 52u); put16(42u, 32u); put16(44u, 1u);
++            put32(52u, 1u); put32(56u, 0x100u);
++            put32(60u, address); put32(64u, address);
++            put32(68u, 4u); put32(72u, memorySize);
++            put32(76u, 7u); put32(80u, 4u);
++            put32(0x100u, 0x03E00008u);
++            std::ofstream output(path, std::ios::binary);
++            output.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++            if (!output)
++                throw std::runtime_error("cannot write authored callback-arena ELF");
++        }
++        ~ArenaElf()
++        {
++            std::error_code ignored;
++            std::filesystem::remove(path, ignored);
++        }
++    };
+ }
+ 
+ void register_ps2_runtime_interrupt_tests()
+ {
+     MiniTest::Case("PS2RuntimeInterrupt", [](TestCase &tc)
+     {
++        tc.Run("IRQ frames survive writes throughout the declared top-of-RAM main stack", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kArenaMainPc, schedulerArenaMain);
++            env.runtime.registerFunction(kArenaHandlerPc, schedulerArenaHandler);
++            g_arenaPreSetupSp = g_arenaIrqSp = 0u;
++            g_arenaReturnPreserved = false;
++            R5900Context mainContext{};
++            mainContext.pc = kArenaMainPc;
++            setRegU32(mainContext, 29, PS2_RAM_SIZE - 16u);
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++            t.IsTrue(g_arenaPreSetupSp >= kKernelArenaBegin && g_arenaPreSetupSp < kKernelArenaEnd,
++                     "pre-SetupThread callback lease must own modeled kernel memory");
++            t.IsTrue(g_arenaIrqSp >= kKernelArenaBegin && g_arenaIrqSp < kKernelArenaEnd &&
++                         g_arenaIrqSp != g_arenaPreSetupSp,
++                     "dispatcher and thread callback owners must have distinct bounded stacks");
++            t.IsTrue(g_arenaReturnPreserved,
++                     "legitimate main-stack file data must not overwrite a saved callback return");
++            t.IsTrue(std::all_of(env.rdram.begin() + kArenaGuestStackBegin, env.rdram.end(),
++                                [](uint8_t value) { return value == 0xA5u; }),
++                     "callback stack reservation must not alter or filter the original guest buffer write");
++        });
++
++        tc.Run("callback lease cache and allocator reset as one lifetime", [](TestCase &t)
++        {
++            TestEnv env;
++            R5900Context mainContext{};
++            setRegU32(mainContext, 29, PS2_RAM_SIZE - 16u);
++            auto &ee = env.runtime.eeScheduler();
++            for (uint32_t iteration = 0u; iteration < 3u; ++iteration)
++            {
++                ee.reset(env.rdram.data(), mainContext);
++                ee.bindMainContextForSyscall(mainContext, env.rdram.data());
++                const uint32_t cached = ee.invocationStackTop();
++                const uint32_t second = env.runtime.reserveAsyncCallbackStack(0x4000u);
++                t.Equals(cached, kKernelArenaEnd - 16u,
++                         "reset must recycle the arena instead of retaining prior allocation state");
++                t.Equals(second, kKernelArenaEnd - 0x4000u - 16u,
++                         "a stale cached lease must not alias the first post-reset reservation");
++                t.Equals(ee.invocationStackTop(), cached,
++                         "same owner/depth should reuse its existing lease");
++            }
++        });
++
++        tc.Run("callback arena exhaustion stays below application memory and above kernel mirrors", [](TestCase &t)
++        {
++            TestEnv env;
++            auto *ram = env.rdram.data();
++            std::memset(ram + 0x00080000u, 0xA7u, kKernelArenaBegin - 0x00080000u);
++            for (uint32_t i = 0u; i < kArenaLeaseCount; ++i)
++            {
++                const uint32_t top = env.runtime.reserveAsyncCallbackStack(0x4000u);
++                t.Equals(top, kKernelArenaEnd - i * 0x4000u - 16u,
++                         "each callback lease must be a distinct descending kernel interval");
++                std::memset(ram + top + 16u - 0x4000u, 0x55u, 0x4000u);
++            }
++            t.Equals(env.runtime.reserveAsyncCallbackStack(0x4000u), 0u,
++                     "exhaustion must fail instead of entering syscall mirrors or guest memory");
++            t.Equals(env.runtime.reserveAsyncCallbackStack(0u), 0u,
++                     "empty stack reservation must fail");
++            t.Equals(env.runtime.reserveAsyncCallbackStack(0xFFFFFFFFu), 0u,
++                     "overflowing stack reservation must fail");
++            t.IsTrue(std::all_of(ram + 0x00080000u, ram + kKernelArenaBegin,
++                                [](uint8_t value) { return value == 0xA7u; }),
++                     "all callback frames must preserve the original alarm trampoline and its stack workspace");
++        });
++
++        tc.Run("inactive and deleted thread callback leases are reusable", [](TestCase &t)
++        {
++            for (const bool deleteWorker : {false, true})
++            {
++                TestEnv env;
++                env.runtime.registerFunction(kArenaWorkerMainPc, schedulerArenaWorkerMain);
++                env.runtime.registerFunction(kArenaWorkerPc, schedulerArenaWorker);
++                g_arenaWorkerStacks.clear();
++                g_arenaDeleteWorker = deleteWorker;
++                R5900Context mainContext{};
++                mainContext.pc = kArenaWorkerMainPc;
++                setRegU32(mainContext, 29, PS2_RAM_SIZE - 16u);
++                env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++                env.runtime.eeScheduler().run();
++                t.Equals(g_arenaWorkerStacks.size(), size_t{96u},
++                         "sequential callback owners must not exhaust a pool with only one live lease");
++                t.IsTrue(std::all_of(g_arenaWorkerStacks.begin(), g_arenaWorkerStacks.end(), [](uint32_t sp)
++                         { return sp >= kKernelArenaBegin && sp < kKernelArenaEnd; }),
++                         "recycled callback leases must remain in their owned arena");
++            }
++        });
++
++        tc.Run("all active nested callback leases exhaust without recycling a live frame", [](TestCase &t)
++        {
++            TestEnv env;
++            R5900Context mainContext{};
++            setRegU32(mainContext, 29, PS2_RAM_SIZE - 16u);
++            auto &ee = env.runtime.eeScheduler();
++            ee.reset(env.rdram.data(), mainContext);
++            ee.bindMainContextForSyscall(mainContext, env.rdram.data());
++            std::vector<GuestInvocation> nested(kArenaLeaseCount);
++            for (auto &invocation : nested)
++                invocation.context.pc = kArenaHandlerPc;
++            try { ee.invokeCurrentSequence(std::move(nested)); }
++            catch (const EeDispatcherTransfer &) {}
++            bool exhausted = false;
++            try { (void)ee.invocationStackTop(); }
++            catch (const std::runtime_error &) { exhausted = true; }
++            t.IsTrue(exhausted, "all active callback frames must remain reserved on exhaustion");
++        });
++
++        tc.Run("thread and heap declarations cannot claim callback kernel memory", [](TestCase &t)
++        {
++            TestEnv env;
++            R5900Context mainContext{};
++            setRegU32(mainContext, 29, PS2_RAM_SIZE - 16u);
++            auto &ee = env.runtime.eeScheduler();
++            ee.reset(env.rdram.data(), mainContext);
++            ee.bindMainContextForSyscall(mainContext, env.rdram.data());
++            for (const uint32_t alias : {0u, 0x20000000u, 0x22000000u, 0x30000000u, 0x80000000u, 0xA0000000u})
++            {
++                EeThreadCreateParams params{};
++                params.entry = kArenaMainPc;
++                params.priority = 10;
++                params.stack = alias | 0x00090000u;
++                params.stackSize = 0x1000u;
++                t.Equals(ee.createThread(params), KE_ERROR,
++                         "aliased declared thread stack may not overlap the kernel arena");
++                bool setupRejected = false;
++                try { ee.setupCurrentThread(params.stack, params.stackSize, 0u); }
++                catch (const std::runtime_error &) { setupRejected = true; }
++                t.IsTrue(setupRejected, "main-thread setup must reject the same collision");
++                params.stack = alias | kKernelArenaEnd;
++                params.stackSize = 0u;
++                t.Equals(ee.createThread(params), KE_ERROR,
++                         "a top-only descending SP at the arena end still collides");
++            }
++            EeThreadCreateParams crossing{};
++            crossing.entry = kArenaMainPc; crossing.priority = 10;
++            crossing.stack = kKernelArenaBegin - 16u; crossing.stackSize = 32u;
++            t.Equals(ee.createThread(crossing), KE_ERROR, "partial interval overlap must be rejected");
++            crossing.stack = 0x21FFFFF0u;
++            crossing.stackSize = kKernelArenaBegin + 32u;
++            t.Equals(ee.createThread(crossing), KE_ERROR,
++                     "a declared span crossing a 32 MiB mirror boundary must detect the wrapped collision");
++            crossing.stack = 0xFFF00000u; crossing.stackSize = 0x200000u;
++            t.Equals(ee.createThread(crossing), KE_ERROR,
++                     "32-bit interval overflow must not hide a callback-arena collision");
++            EeThreadCreateParams ordinary = crossing;
++            ordinary.stack = kArenaGuestStackBegin; ordinary.stackSize = kArenaGuestStackSize;
++            t.IsTrue(ee.createThread(ordinary) > 0, "the full original high main-stack range remains available");
++            EeThreadCreateParams inherited = crossing;
++            inherited.stack = inherited.stackSize = 0u;
++            const int inheritedId = ee.createThread(inherited);
++            R5900Context callbackContext{};
++            setRegU32(callbackContext, 29, kKernelArenaEnd - 16u);
++            t.Equals(ee.startThread(inheritedId, 0u, callbackContext, false), KE_ERROR,
++                     "a new thread must not inherit a callback-owned SP");
++            bool resetRejected = false;
++            try { ee.reset(env.rdram.data(), callbackContext); }
++            catch (const std::runtime_error &) { resetRejected = true; }
++            t.IsTrue(resetRejected, "scheduler reset must reject an initial main SP inside the arena");
++            bool heapRejected = false;
++            try { env.runtime.configureGuestHeap(kKernelArenaBegin - 16u, kKernelArenaEnd + 16u); }
++            catch (const std::runtime_error &) { heapRejected = true; }
++            t.IsTrue(heapRejected, "configured heaps may not absorb the callback arena");
++            env.runtime.configureGuestHeap(kKernelArenaEnd, kKernelArenaEnd + 0x1000u);
++            t.Equals(env.runtime.guestMalloc(16u), kKernelArenaEnd,
++                     "an ordinary heap beginning immediately after the arena remains available");
++        });
++
++        tc.Run("ELF payload and BSS cannot overwrite the callback arena", [](TestCase &t)
++        {
++            for (const auto [address, size] : {std::pair{0x00090000u, 4u},
++                    std::pair{0x80090000u, 4u}, std::pair{0x30090000u, 4u},
++                    std::pair{kKernelArenaBegin - 16u, 32u}})
++            {
++                TestEnv env;
++                t.IsTrue(env.runtime.memory().initialize(), "ELF fixture memory initialization should succeed");
++                auto *ram = env.runtime.memory().getRDRAM();
++                std::memset(ram + kKernelArenaBegin, 0x5Au, kKernelArenaEnd - kKernelArenaBegin);
++                const ArenaElf file(address, size);
++                t.IsFalse(env.runtime.loadELF(file.path.string()),
++                          "overlapping PT_LOAD memsz must fail before writing its payload or BSS");
++                t.IsTrue(std::all_of(ram + kKernelArenaBegin, ram + kKernelArenaEnd,
++                                    [](uint8_t value) { return value == 0x5Au; }),
++                         "rejected ELF must leave all callback-owned bytes unchanged");
++            }
++        });
++
++        tc.Run("loading an ordinary ELF cannot rewind live callback reservations", [](TestCase &t)
++        {
++            TestEnv env;
++            t.IsTrue(env.runtime.memory().initialize(), "ELF fixture memory initialization should succeed");
++            const uint32_t first = env.runtime.reserveAsyncCallbackStack(0x4000u);
++            const ArenaElf file(0x00100000u);
++            t.IsTrue(env.runtime.loadELF(file.path.string()), "ordinary authored ELF should load");
++            const uint32_t second = env.runtime.reserveAsyncCallbackStack(0x4000u);
++            t.IsTrue(first != second && second + 0x4000u == first,
++                     "ELF load must preserve already-owned callback stack ranges");
++        });
++
+         tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -4194,8 +4194,9 @@
+                      "VSync callback should receive a positive tick value");
+             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
+                      "callback invocation should preserve the registered GP");
+-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
+-                     "callback invocation should use the reserved async stack pool");
++            const uint32_t callbackSp = g_gsSyncCallbackSp.load(std::memory_order_acquire);
++            t.IsTrue(callbackSp >= 0x00084000u && callbackSp < 0x00100000u,
++                     "callback invocation should use the reserved kernel callback stack arena");
+             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
+                      "callback invocation must not reuse the caller stack");
+         });

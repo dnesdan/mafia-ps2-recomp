@@ -59,6 +59,7 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0024` | Reuse freed IOP heap ranges without recycling lifetime identities; account separately for maximum contiguous and total free space. |
 | `0025` | Retire pending IOP loads before an import thunk enters a modeled service or original guest export. Arguments, results and return addresses retain their original instruction ordering. |
 | `0026` | Honor conventional optical open flags with existing read-only backing. Reject writes to owned read-only handles while preserving supplied guest exports for foreign handles. |
+| `0027` | Own EE callback stacks outside application stacks and heaps; preserve the original kernel-patch workspace, check aliases and declared ranges, and coordinate stack leases with scheduler reset and owner lifetime. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly from the upstream source directory; its separate GS-cache CTest directory does not run that executable.
 
@@ -71,6 +72,34 @@ IOP reset is explicitly modeled. The runtime parses the supplied replacement ima
 ## Runtime and platform
 
 The native host uses the actual upstream 32 MiB EE memory and scheduler. It sets missing-function handling to `Stop`. Reviewed patches make unknown syscalls and generic unsupported services fail under that policy. Scheduler initialization and execution stay on the same worker. Guest context/metrics are read after joining; the live timeout path uses only an atomic sampled PC.
+
+### Callback stack ownership
+
+The original startup declares its main stack over `[0x01F00000, 0x02000000)`.
+Using that same interval for runtime callbacks let a legitimate FILEIO tail copy
+overwrite the SIF interrupt handler's saved return address. Callback stacks now
+belong to the modeled kernel arena `[0x00084000, 0x00100000)`. Application heap
+space and the original main-stack region remain available to the program.
+
+The lower boundary preserves the supplied program's original kernel patches:
+their fixed copies occupy ranges starting at `0x74000`, `0x75000`, `0x76000`
+and `0x82000`; the highest copied byte is below `0x82028`. The alarm trampoline
+uses a descending stack from `0x81FC0`. This startup map was checked against
+the original ELF, including the copied routines' BSS and fixed globals.
+The primary [Open PS2 Loader changelog](https://github.com/ps2homebrew/Open-PS2-Loader/wiki/Home/efaa9c0c1cda2894e9b5bbbb3de78778cd4d1139)
+also identifies `0x84000` as the free-memory boundary after the Sony alarm
+patch. This is a deliberate reservation in this kernel model, not a claim
+that arbitrary guest kernels cannot use that memory.
+
+ELF segments, declared thread stacks and configured heaps must not overlap the
+arena. Checks account for the runtime's supported RAM aliases. The bounded
+pool fails explicitly on exhaustion. Scheduler reset clears cached leases and
+rewinds their allocator together; a completed or deleted owner's inactive
+lease can be reused without reclaiming a suspended callback's live stack.
+These changes affect runtime implementation files, preserving the public
+header layout used by the already compiled game corpus.
+
+### Presentation and platform
 
 The main thread owns the window and texture presentation. Pixel data comes from the upstream GS framebuffer; absent output remains absent. The initial backend uses the CPU GS and raylib. FFmpeg stays enabled for original media decoding. A Metal/MoltenVK accelerated GS is future work and needs comparison against the verified CPU path first.
 
