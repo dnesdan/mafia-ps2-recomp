@@ -1,0 +1,264 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index ec97c5d..8adcf66 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -213,12 +213,15 @@ namespace ps2x::iop::detail
+             // https://ps2dev.github.io/ps2sdk/ioman_8h_source.html
+             // https://ps2dev.github.io/ps2sdk/io__common_8h_source.html
+             const uint32_t flags = cpu.gpr[5];
+-            if (flags != 0u && flags != 1u && flags != 3u) // FIO_O_RDONLY / optical modes 0 and FIO_O_RDWR.
++            // CDVDMAN opens existing files, then forces O_RDONLY regardless of
++            // conventional access/create/truncate/exclusive flags. Those bits
++            // never grant writes or create a file on the optical device.
++            // Streaming, cache and other unmodeled modes remain unsupported.
++            constexpr uint32_t opticalFlags = 0x00000F03u;
++            if ((flags & ~opticalFlags) != 0u)
+                 return false;
+             const std::string path = filePath(m_memory, a0);
+-            // CDVDMAN accepts modes 0 and O_RDWR but sets the file to O_RDONLY.
+-            // Preserve that optical-driver behavior without granting host or
+-            // memory-card write access, or accepting unmodeled mode bits.
++            // Ordinary host and memory-card devices still require O_RDONLY.
+             // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html (cdrom_open)
+             if (flags != 1u && (path.find(':') == std::string::npos ||
+                                parsePs2Path(path).device != Ps2PathDevice::Cdrom))
+@@ -296,6 +299,15 @@ namespace ps2x::iop::detail
+             setV0(static_cast<uint32_t>(slot - m_files.begin()));
+             return true;
+         }
++        case 7: // write(fd, buffer, size)
++            // Every modeled descriptor is read-only. IOMAN rejects the access
++            // mode before inspecting a buffer or invoking a device's write.
++            // https://ps2dev.github.io/ps2sdk/ioman_8c_source.html (io_write)
++            // Unowned descriptors may belong to an original IOMAN export.
++            if (a0 >= m_files.size() || m_files[a0].handle == 0u)
++                return false;
++            setV0(static_cast<uint32_t>(-9)); // EBADF for the owned read-only fd.
++            return true;
+         case 5: // close(fd)
+         case 6: // read(fd, IOP destination, size)
+         case 8: // lseek(fd, signed offset, whence)
+diff --git a/ps2xIOP/tests/iop_ioman_file_tests.cpp b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+index c00f640..5081216 100644
+--- a/ps2xIOP/tests/iop_ioman_file_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+@@ -28,6 +28,8 @@ namespace
+     namespace fs = std::filesystem;
+ 
+     constexpr uint32_t marker = 0xD00DF00Du;
++    constexpr std::array<uint32_t, 12u> opticalOpenModes{
++        0u, 1u, 2u, 3u, 0x100u, 0x200u, 0x400u, 0x800u, 0x202u, 0x403u, 0x803u, 0xF03u};
+     const std::vector<uint8_t> content{0x00u, 0x7Fu, 0x80u, 0xFFu, 0x31u,
+                                        0x32u, 0x33u, 0x34u, 0x35u, 0x00u};
+ 
+@@ -356,14 +358,14 @@ namespace
+ 
+     void opticalModesRetainReadOnlyBacking()
+     {
+-        for (const uint32_t flags : {0u, 1u, 3u})
++        for (const uint32_t flags : opticalOpenModes)
+         {
+             Fixture f;
+             for (const std::string path : {"cdrom0:\\DATA\\TEST.BIN;1", "cdrom:DATA/TEST.BIN",
+                                           "CDROM0:DATA/TEST.BIN", "CdRoM:DATA/TEST.BIN"})
+             {
+-                // Optical modes 0, O_RDONLY and O_RDWR all keep the actual file
+-                // read-only. Without O_CREAT the optional creation mode is unused.
++                // The optical driver resolves only existing files and forces
++                // O_RDONLY. Even O_CREAT ignores the optional creation mode.
+                 const auto fd = static_cast<uint32_t>(f.open(path, flags, 0x50E670u));
+                 f.fill(0x11000u, 32u);
+                 require(fd < 16u && f.call(8u, fd, 0u, 2u) == content.size() &&
+@@ -379,7 +381,8 @@ namespace
+                 write.gpr[4] = fd;
+                 write.gpr[5] = 0x11001u;
+                 write.gpr[6] = 1u;
+-                require(!f.ioman->dispatchImport(7u, write, f.executor) && write.gpr[2] == marker &&
++                require(f.ioman->dispatchImport(7u, write, f.executor) &&
++                            static_cast<int32_t>(write.gpr[2]) == -9 &&
+                             f.position(fd) == content.size() && f.host.handles.size() == 1u &&
+                             f.host.handles.begin()->second == content && f.call(5u, fd) == 0u,
+                         "optical mode granted write behavior or changed the read-only file");
+@@ -411,8 +414,13 @@ namespace
+                             f.host.translations == translations,
+                         "optical mode bypassed route validation before host translation");
+             }
+-            require(f.open("cdrom0:MISSING.BIN", flags) == -2 && f.host.opens == opens + 1u,
+-                    "missing optical file did not return its actual ENOENT");
++            require(f.open("cdrom0:MISSING.BIN", flags) == -2 && f.host.opens == opens + 1u &&
++                        !fs::exists(f.tree.root / "cd" / "MISSING.BIN"),
++                    "missing optical file was created or did not return its actual ENOENT");
++            std::ifstream unchanged(f.tree.root / "cd" / "DATA" / "TEST.BIN", std::ios::binary);
++            const std::vector<uint8_t> actual{std::istreambuf_iterator<char>(unchanged),
++                                               std::istreambuf_iterator<char>()};
++            require(actual == content, "optical create, truncate or exclusive flags changed an existing file");
+             f.host.roots[0].clear();
+             require(f.open("cdrom0:DATA/TEST.BIN", flags) == -19 && f.host.opens == opens + 1u &&
+                         f.host.handles.empty() && f.host.guestWrites == 0u && f.host.guestReads == 0u,
+@@ -420,9 +428,43 @@ namespace
+         }
+     }
+ 
++    void readOnlyWritesFailBeforeBufferAccess()
++    {
++        Fixture f;
++        for (const std::string path : {"cdrom0:DATA/TEST.BIN", "host:TEST.BIN", "mc0:TEST.BIN"})
++        {
++            const auto fd = static_cast<uint32_t>(f.open(path));
++            require(fd < 16u, "could not create read-only write-rejection fixture");
++            {
++                const uint32_t descriptor = fd;
++                const size_t reads = f.host.reads, opens = f.host.opens, closes = f.host.closes;
++                // The invalid span would throw if an implementation examined
++                // the buffer before checking descriptor access permissions.
++                require(static_cast<int32_t>(f.call(7u, descriptor, 0xFFFFFFFFu, 0xFFFFFFFFu)) == -9 &&
++                            static_cast<int32_t>(f.call(7u, descriptor, 0u, 0u)) == -9 &&
++                            f.position(fd) == 0u && f.host.reads == reads &&
++                            f.host.opens == opens && f.host.closes == closes &&
++                            f.host.handles.size() == 1u && f.host.handles.begin()->second == content,
++                        "read-only write examined a buffer, changed file state or did not return EBADF");
++            }
++            require(f.call(5u, fd) == 0u, "could not close write-rejection fixture");
++            for (const uint32_t descriptor : {fd, 16u, 0xFFFFFFFFu})
++            {
++                IopCpuState foreign{};
++                foreign.gpr[2] = marker;
++                foreign.gpr[4] = descriptor;
++                foreign.gpr[5] = 0xFFFFFFFFu;
++                foreign.gpr[6] = 0xFFFFFFFFu;
++                require(!f.ioman->dispatchImport(7u, foreign, f.executor) && foreign.gpr[2] == marker &&
++                            f.host.handles.empty(),
++                        "unowned write descriptor was intercepted instead of reaching an original export");
++            }
++        }
++    }
++
+     void canonicalContainmentAndDriverPrecedence()
+     {
+-        for (const uint32_t flags : {0u, 1u, 3u})
++        for (const uint32_t flags : opticalOpenModes)
+         {
+             Fixture f;
+             for (const fs::path &target : {f.tree.root / "outside" / "SECRET.BIN", f.tree.root / "cd",
+@@ -468,10 +510,8 @@ namespace
+         Fixture f;
+         (void)f.open();
+         const size_t opens = f.host.opens;
+-        for (const uint32_t flags : {2u, 0x10u, 0x100u, 0x200u, 0x400u, 0x800u, 0x8000u,
+-                                     0x10000000u, 0x40000000u,
+-                                     0x11u, 0x101u, 0x201u, 0x401u, 0x8001u,
+-                                     0x13u, 0x103u, 0x203u, 0x403u, 0x803u, 0x8003u,
++        for (const uint32_t flags : {0x10u, 0x8000u, 0x10000000u, 0x40000000u,
++                                     0x11u, 0x8001u, 0x13u, 0x8003u,
+                                      0x10000003u, 0x40000003u})
+         {
+             IopCpuState cpu{};
+@@ -482,12 +522,12 @@ namespace
+                         f.host.opens == opens,
+                     "unsupported access mode invented an open result");
+         }
+-        for (const uint16_t ordinal : {7u, 9u, 10u, 30u})
++        for (const uint16_t ordinal : {9u, 10u, 30u})
+         {
+             IopCpuState cpu{};
+             cpu.gpr[2] = marker;
+             require(!f.ioman->dispatchImport(ordinal, cpu, f.executor) && cpu.gpr[2] == marker,
+-                    "unsupported write, metadata or 64-bit operation fabricated success");
++                    "unsupported metadata or 64-bit operation fabricated success");
+         }
+     }
+ 
+@@ -516,7 +556,7 @@ namespace
+                 return address;
+             },
+         };
+-        for (const uint32_t flags : {0u, 1u, 3u})
++        for (const uint32_t flags : opticalOpenModes)
+         for (const auto &alter : examples)
+         {
+             Fixture f;
+@@ -802,10 +842,55 @@ namespace
+         return image;
+     }
+ 
++    void unownedWritesReachOriginalIomanExports()
++    {
++        // An authored provider exports ioman:7 and an unrelated descriptor 123.
++        // The modeled read-only route must not intercept this original export.
++        iop_test::Irx provider(0x20000u);
++        provider.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0x3C040002u, 0x34840180u,
++            0x0C008045u, 0u, 0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00001021u,
++        });
++        provider.words(0x80u, {
++            0x3C080001u, 0x35080400u, 0x3C09C001u, 0x3529CAFEu,
++            0xAD090000u, 0x03E00008u, 0x24021234u,
++        });
++        provider.words(0x100u, {
++            0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++            0x03E00008u, 0x24000006u, 0u, 0u,
++        });
++        provider.words(0x180u, {
++            0x41C00000u, 0u, 0x0104u, 0x616D6F69u, 0x0000006Eu,
++            0x20000u, 0x20000u, 0x20000u, 0x20000u,
++            0x20000u, 0x20000u, 0x20000u, 0x20080u, 0u,
++        });
++        iop_test::Irx consumer;
++        consumer.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0x2404007Bu, 0x3C050001u,
++            0x34A50430u, 0x24060004u, 0x0C004045u, 0u,
++            0x3C080001u, 0x35080404u, 0xAD020000u, 0x8FBF001Cu,
++            0x27BD0020u, 0x03E00008u, 0x00001021u,
++        });
++        consumer.words(0x100u, {
++            0x41E00000u, 0u, 0x0104u, 0x616D6F69u, 0x0000006Eu,
++            0x03E00008u, 0x24000007u, 0u, 0u,
++        });
++        consumer.words(0x430u, {0x11223344u});
++        iop_test::Host host;
++        IopEmulator iop(host);
++        require(iop.loadModuleImage("authored-ioman-provider", provider.bytes, nullptr, 0u).moduleId > 0 &&
++                    iop.loadModuleImage("authored-ioman-consumer", consumer.bytes, nullptr, 0u).moduleId > 0,
++                "authored original IOMAN write modules failed");
++        std::array<uint32_t, 2u> values{};
++        require(iop.readMemory(0x10400u, values.data(), sizeof(values)) &&
++                    values[0] == 0xC001CAFEu && values[1] == 0x1234u,
++                "modeled read-only write shadowed a supplied original IOMAN export");
++    }
++
+     void authoredMipsImportsConsumeActualIopBytes()
+     {
+         TemporaryTree tree;
+-        for (const uint32_t flags : {0u, 1u, 3u})
++        for (const uint32_t flags : opticalOpenModes)
+         {
+             FileHost host(tree);
+             IopEmulator iop(host);
+@@ -829,13 +914,13 @@ namespace
+ 
+         FileHost unsupportedHost(tree);
+         IopEmulator unsupported(unsupportedHost);
+-        const auto writeMode = authoredFileImports(2u);
++        const auto writeMode = authoredFileImports(0x8000u);
+         bool rejected = false;
+-        try { (void)unsupported.loadModuleImage("authored-write-mode", writeMode.bytes, nullptr, 0u); }
++        try { (void)unsupported.loadModuleImage("authored-unmodeled-open-mode", writeMode.bytes, nullptr, 0u); }
+         catch (const std::runtime_error &error)
+         { rejected = std::string_view(error.what()).find("missing import ioman:4") != std::string_view::npos; }
+         require(rejected && unsupportedHost.opens == 0u && unsupportedHost.guestWrites == 0u,
+-                "unsupported imported write-open did not remain a strict missing operation");
++                "unsupported imported asynchronous open did not remain a strict missing operation");
+     }
+ }
+ 
+@@ -846,7 +931,9 @@ int main()
+         {"Read accepts complete RAM aliases and live allocation interiors", aliasesAndLiveHeapBuffers},
+         {"Bad descriptors and signed seek errors preserve file position", descriptorAndSeekErrorsPreservePosition},
+         {"Explicit mounts distinguish absent devices from absent files", supportedMountsAndAbsentRoutes},
+-        {"Optical modes 0, 1 and 3 open existing files with read-only backing", opticalModesRetainReadOnlyBacking},
++        {"Optical access/create/truncate flags preserve existing read-only backing", opticalModesRetainReadOnlyBacking},
++        {"Read-only writes return EBADF before reading any guest buffer", readOnlyWritesFailBeforeBufferAccess},
++        {"Unowned write descriptors reach supplied original IOMAN exports", unownedWritesReachOriginalIomanExports},
+         {"Canonical paths remain contained and original drivers take precedence", canonicalContainmentAndDriverPrecedence},
+         {"Unsupported file modes and operations remain strict", unsupportedOperationsStayStrict},
+         {"Malformed paths fail before host or guest side effects", malformedPathsFailBeforeHostActivity},
