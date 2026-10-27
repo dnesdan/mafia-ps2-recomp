@@ -2,11 +2,11 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original startup graphics on Linux; menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the Gathering publisher splash through the GS. The native host and runtime previously passed synthetic application tests on ARM64 macOS; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for exact execution evidence and remaining work.
+**Status: original frontend graphics on Linux; main menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the original autosave caution screen with its CONTINUE Cross prompt. A longer run passes its automatic dismissal and reaches the original memory-card query, where an unsupported secondary DMA transfer currently stops execution. Source, host and runtime regression tests also pass on ARM64 macOS through patch 0028; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for exact execution evidence and remaining work.
 
-![Original Gathering startup splash rendered by the translated game on Linux](docs/screenshots/mafia-linux-gathering.png)
+![Original Mafia autosave caution screen rendered by the translated game on Linux](docs/screenshots/mafia-linux-autosave.png)
 
-Actual 640×448 GS capture from the original program on Linux, encoded as PNG without changing or adding pixels. This is a startup splash, not the main menu. The capture path also works without a display server.
+Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This 120-second run reached the frontend screen without a strict execution failure. The later memory-card stop occurs before another screen is presented; main-menu entry and controller input remain unverified. The capture path also works without a display server; the earlier Gathering splash is retained in the progress report.
 
 ## Build from your own disc
 
