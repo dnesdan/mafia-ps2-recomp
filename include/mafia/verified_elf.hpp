@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -24,6 +25,13 @@ struct VerifiedElf {
     std::vector<LoadSegment> segments;
 };
 
+struct FunctionSymbol {
+    std::string name;
+    std::uint32_t address{};
+    std::uint32_t size{};
+    std::uint32_t offset{};
+};
+
 std::string sha256(std::span<const std::uint8_t> bytes);
 VerifiedElf verify_elf(std::span<const std::uint8_t> bytes,
                        std::string_view expected_sha256,
@@ -31,6 +39,11 @@ VerifiedElf verify_elf(std::span<const std::uint8_t> bytes,
 VerifiedElf read_verified_elf(const std::filesystem::path &path,
                             std::string_view expected_sha256,
                             std::uint32_t expected_entry);
+// Diagnostic lookup in the immutable, already verified ELF. A stripped file or
+// address outside an explicit function extent has no symbol; malformed optional
+// section metadata raises an error for the caller to report separately.
+std::optional<FunctionSymbol> resolve_function_symbol(const VerifiedElf &image,
+                                                     std::uint32_t address);
 std::string json_string(std::string_view value);
 
 } // namespace mafia

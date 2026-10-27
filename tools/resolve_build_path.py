@@ -12,9 +12,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build", type=Path)
     parser.add_argument("configuration", choices=("Debug", "Release", "RelWithDebInfo", "MinSizeRel"))
+    parser.add_argument("--platform", choices=("macos", "linux"), default="macos")
     args = parser.parse_args()
     try:
-        print(executable_path(args.build.resolve(), "", "MafiaNative.app/Contents/MacOS/MafiaNative", args.configuration))
+        name = "MafiaNative.app/Contents/MacOS/MafiaNative" if args.platform == "macos" else "MafiaNative"
+        print(executable_path(args.build.resolve(), "", name, args.configuration))
         return 0
     except (OSError, ValueError) as exc:
         print(f"resolve_build_path: {exc}", file=sys.stderr)

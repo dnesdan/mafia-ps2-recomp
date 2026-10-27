@@ -20,8 +20,9 @@ task_elf="$("${PYTHON:-python3}" - "$task_work" <<'PY'
 import json,pathlib,sys
 root=pathlib.Path(sys.argv[1]).resolve()
 disc=json.loads((root/'disc.json').read_text())
-path=(root/'extracted'/disc['boot_elf']).resolve()
-if not path.is_relative_to(root/'extracted'):
+extracted=(root/'extracted').resolve()
+path=(extracted/disc['boot_elf']).resolve()
+if not path.is_relative_to(extracted):
     raise SystemExit('Invalid boot path in disc report')
 print(path)
 PY

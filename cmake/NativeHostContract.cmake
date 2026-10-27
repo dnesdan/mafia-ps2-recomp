@@ -24,7 +24,7 @@ function(mafia_add_native_host_contract)
         "${contract_dir}/mafia_build_profile.hpp" @ONLY)
     add_executable(MafiaHostContract src/native_main.cpp tests/cpp/native_host_fixture.cpp)
     target_include_directories(MafiaHostContract PRIVATE "${contract_dir}")
-    target_link_libraries(MafiaHostContract PRIVATE mafia_host_core ps2_runtime)
+    target_link_libraries(MafiaHostContract PRIVATE mafia_host_core ps2_runtime mafia_gs_capture)
     target_compile_options(MafiaHostContract PRIVATE -fno-fast-math -ffp-contract=off)
     if(APPLE)
         set_target_properties(MafiaHostContract PROPERTIES

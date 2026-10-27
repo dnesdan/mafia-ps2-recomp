@@ -6,6 +6,7 @@
 
 #include "mafia/verified_elf.hpp"
 #include "mafia/guest_executor.hpp"
+#include "mafia/gs_capture.hpp"
 #include "mafia_build_profile.hpp"
 #include "ps2_runtime.h"
 #include "ps2_host_backend.h"
@@ -23,8 +24,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -32,7 +35,7 @@ namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 struct Options {
-    fs::path elf, iso, data_root, save_root, report;
+    fs::path elf, iso, data_root, save_root, report, capture_frame;
     std::uint64_t timeout_ms = 10000;
     bool headless = false, validate_only = false, help = false;
 };
@@ -52,6 +55,7 @@ Options parse_options(int argc, char **argv) {
             else if (arg == "--data-root") options.data_root = value;
             else if (arg == "--save-root") options.save_root = value;
             else if (arg == "--report") options.report = value;
+            else if (arg == "--capture-frame") options.capture_frame = value;
             else if (arg == "--timeout-ms") {
                 const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.timeout_ms);
                 if (error != std::errc{} || end != value.data() + value.size() || options.timeout_ms > 86400000)
@@ -86,6 +90,18 @@ Options parse_options(int argc, char **argv) {
             (fs::exists(options.report) && (fs::equivalent(options.report,options.elf) ||
                 (!options.iso.empty() && fs::equivalent(options.report,options.iso)))))
             throw std::runtime_error("Report output must not overwrite a game input");
+    }
+    if (!options.capture_frame.empty()) {
+        options.capture_frame = fs::absolute(options.capture_frame);
+        if (options.validate_only)
+            throw std::runtime_error("--capture-frame requires guest execution; remove --validate-only");
+        if (options.capture_frame.extension() != ".ppm")
+            throw std::runtime_error("--capture-frame requires a .ppm filename (unscaled GS RGB pixels)");
+        if (fs::exists(options.capture_frame) || fs::is_symlink(options.capture_frame))
+            throw std::runtime_error("Capture output already exists; choose a fresh .ppm filename");
+        if (!options.report.empty() &&
+            fs::weakly_canonical(options.capture_frame) == fs::weakly_canonical(options.report))
+            throw std::runtime_error("Capture and report must use different output paths");
     }
     return options;
 }
@@ -134,11 +150,113 @@ struct Report {
     std::string status = "failed", stage = "arguments", error;
     bool elf_verified = false, elf_loaded = false, entered = false, metrics_available = false;
     std::uint32_t last_pc = 0, last_branch_pc = 0;
+    std::optional<mafia::FunctionSymbol> symbol, branch_symbol;
+    std::string symbol_error;
     std::uint64_t presentations = 0, dma = 0, gif = 0, gs = 0, vif = 0;
+    bool ee_metrics_available = false, io_metrics_available = false;
+    EeKernelSnapshot ee;
+    std::string ee_final_context = "null", ee_context_error;
+    std::vector<std::pair<std::string, std::uint32_t>> io_registers;
+    std::string ee_error, io_error;
+    bool iop_metrics_available = false;
+    ps2x::iop::DebugSnapshot iop;
+    std::string iop_error;
+    std::string latest_sce_open_request = "null", sce_open_request_error;
+    std::string capture_status = "not-executed", capture_error, capture_sha256;
+    mafia::GsFrameCapture capture;
 };
+
+const char *thread_status(EeThreadStatus status) {
+    switch (status) {
+    case EeThreadStatus::Running: return "running";
+    case EeThreadStatus::Ready: return "ready";
+    case EeThreadStatus::Waiting: return "waiting";
+    case EeThreadStatus::WaitingSuspended: return "waiting-suspended";
+    case EeThreadStatus::Suspended: return "suspended";
+    case EeThreadStatus::Dormant: return "dormant";
+    }
+    return "unknown";
+}
+
+const char *wait_reason(EeWaitReason reason) {
+    switch (reason) {
+    case EeWaitReason::None: return "none";
+    case EeWaitReason::Sleep: return "sleep";
+    case EeWaitReason::Semaphore: return "semaphore";
+    case EeWaitReason::EventFlag: return "event-flag";
+    case EeWaitReason::VSync: return "vsync";
+    case EeWaitReason::External: return "external";
+    case EeWaitReason::Mpeg: return "mpeg";
+    }
+    return "unknown";
+}
+
+std::string ee_json(const Report &report) {
+    if (!report.ee_metrics_available) return "null";
+    std::string threads = "[", semaphores = "[";
+    for (const auto &thread : report.ee.threads) {
+        if (threads.size() != 1) threads += ", ";
+        threads += "{\"id\": " + std::to_string(thread.id) +
+            ", \"pc\": " + std::to_string(thread.pc) +
+            ", \"ra\": " + std::to_string(thread.ra) +
+            ", \"entry\": " + std::to_string(thread.entry) +
+            ", \"gp\": " + std::to_string(thread.contextGp) +
+            ", \"priority\": " + std::to_string(thread.currentPriority) +
+            ", \"status\": " + mafia::json_string(thread_status(thread.status)) +
+            ", \"wait_reason\": " + mafia::json_string(wait_reason(thread.waitReason)) +
+            ", \"wait_id\": " + std::to_string(thread.waitId) +
+            ", \"suspend_count\": " + std::to_string(thread.suspendCount) +
+            ", \"invocation_depth\": " + std::to_string(thread.invocationDepth) + "}";
+    }
+    for (const auto &semaphore : report.ee.semaphores) {
+        if (semaphores.size() != 1) semaphores += ", ";
+        semaphores += "{\"id\": " + std::to_string(semaphore.id) +
+            ", \"count\": " + std::to_string(semaphore.count) +
+            ", \"max_count\": " + std::to_string(semaphore.maxCount) +
+            ", \"waiters\": " + std::to_string(semaphore.waiters) + "}";
+    }
+    return "{\n    \"sequence\": " + std::to_string(report.ee.sequence) +
+        ",\n    \"cycles\": " + std::to_string(report.ee.eeCycle) +
+        ",\n    \"next_event_cycle\": " + std::to_string(report.ee.nextEventCycle) +
+        ",\n    \"running_thread_id\": " + std::to_string(report.ee.runningThreadId) +
+        ",\n    \"threads\": " + threads + "],\n    \"semaphores\": " + semaphores + "]\n  }";
+}
 
 void emit_report(const Options &options, const Report &report) {
     const auto boolean = [](bool value) { return value ? "true" : "false"; };
+    std::string io_json = "{";
+    for (const auto &[name, value] : report.io_registers) {
+        if (io_json.size() != 1) io_json += ", ";
+        io_json += mafia::json_string(name) + ": " + std::to_string(value);
+    }
+    io_json += "}";
+    std::string iop_diagnostics = "[";
+    for (const auto &diagnostic : report.iop.diagnostics) {
+        if (iop_diagnostics.size() != 1) iop_diagnostics += ", ";
+        iop_diagnostics += mafia::json_string(diagnostic);
+    }
+    iop_diagnostics += "]";
+    const std::string iop_json = !report.iop_metrics_available ? "null" :
+        "{\n    \"cycles\": " + std::to_string(report.iop.emulatorCycles) +
+        ",\n    \"instructions\": " + std::to_string(report.iop.emulatorInstructions) +
+        ",\n    \"loaded_guest_modules\": " + std::to_string(report.iop.emulatorLoadedModules) +
+        ",\n    \"guest_threads\": " + std::to_string(report.iop.emulatorThreads) +
+        ",\n    \"guest_rpc_servers\": " + std::to_string(report.iop.emulatorRpcServers) +
+        ",\n    \"diagnostics\": " + iop_diagnostics + "\n  }";
+    const auto &frame = report.capture;
+    const std::string capture_json = options.capture_frame.empty() ? "null" :
+        "{\n    \"status\": " + mafia::json_string(report.capture_status) +
+        ",\n    \"path\": " + mafia::json_string(options.capture_frame.string()) +
+        ",\n    \"format\": \"ppm\",\n    \"source\": \"gs-presentation\"" +
+        ",\n    \"error\": " + mafia::json_string(report.capture_error) +
+        ",\n    \"sha256\": " + mafia::json_string(report.capture_sha256) +
+        ",\n    \"width\": " + std::to_string(frame.width) +
+        ",\n    \"height\": " + std::to_string(frame.height) +
+        ",\n    \"vsync_tick\": " + std::to_string(frame.vsync_tick) +
+        ",\n    \"display_fbp\": " + std::to_string(frame.display_fbp) +
+        ",\n    \"source_fbp\": " + std::to_string(frame.source_fbp) +
+        ",\n    \"used_preferred_source\": " + boolean(frame.used_preferred) +
+        ",\n    \"nonblack_pixels\": " + std::to_string(frame.encoded.nonblack_pixels) + "\n  }";
     const std::string json = "{\n  \"schema_version\": 1,\n  \"profile_id\": " + mafia::json_string(mafia::build::profile_id) +
         ",\n  \"elf_sha256\": " + mafia::json_string(mafia::build::elf_sha256) +
         ",\n  \"ps2recomp_commit\": " + mafia::json_string(mafia::build::ps2recomp_commit) +
@@ -151,13 +269,32 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"metrics_available\": " + boolean(report.metrics_available) +
         ",\n  \"last_guest_pc\": " + std::to_string(report.last_pc) +
         ",\n  \"last_guest_branch_pc\": " + std::to_string(report.last_branch_pc) +
-        ",\n  \"symbol\": null,\n  \"gameplay_verified\": false,\n  \"game_frame_verified\": false" +
+        ",\n  \"symbol\": " + (report.symbol ? mafia::json_string(report.symbol->name) : "null") +
+        ",\n  \"symbol_address\": " + (report.symbol ? std::to_string(report.symbol->address) : "null") +
+        ",\n  \"symbol_offset\": " + (report.symbol ? std::to_string(report.symbol->offset) : "null") +
+        ",\n  \"branch_symbol\": " + (report.branch_symbol ? mafia::json_string(report.branch_symbol->name) : "null") +
+        ",\n  \"branch_symbol_address\": " + (report.branch_symbol ? std::to_string(report.branch_symbol->address) : "null") +
+        ",\n  \"branch_symbol_offset\": " + (report.branch_symbol ? std::to_string(report.branch_symbol->offset) : "null") +
+        ",\n  \"symbol_source\": " + (report.symbol || report.branch_symbol ? "\"verified-elf\"" : "null") +
+        ",\n  \"symbol_lookup_error\": " + mafia::json_string(report.symbol_error) +
+        ",\n  \"gameplay_verified\": false,\n  \"game_frame_verified\": false" +
         ",\n  \"ffmpeg_enabled\": " + boolean(mafia::build::ffmpeg_enabled) +
         ",\n  \"presentations\": " + std::to_string(report.presentations) +
         ",\n  \"dma_starts\": " + std::to_string(report.dma) +
         ",\n  \"gif_copies\": " + std::to_string(report.gif) +
         ",\n  \"gs_writes\": " + std::to_string(report.gs) +
-        ",\n  \"vif_writes\": " + std::to_string(report.vif) + "\n}\n";
+        ",\n  \"vif_writes\": " + std::to_string(report.vif) +
+        ",\n  \"ee\": " + ee_json(report) +
+        ",\n  \"ee_snapshot_error\": " + mafia::json_string(report.ee_error) +
+        ",\n  \"ee_final_context\": " + report.ee_final_context +
+        ",\n  \"ee_context_snapshot_error\": " + mafia::json_string(report.ee_context_error) +
+        ",\n  \"io_registers\": " + (report.io_metrics_available ? io_json : "null") +
+        ",\n  \"io_snapshot_error\": " + mafia::json_string(report.io_error) +
+        ",\n  \"iop\": " + iop_json +
+        ",\n  \"iop_snapshot_error\": " + mafia::json_string(report.iop_error) +
+        ",\n  \"latest_sce_open_request\": " + report.latest_sce_open_request +
+        ",\n  \"sce_open_request_snapshot_error\": " + mafia::json_string(report.sce_open_request_error) +
+        ",\n  \"frame_capture\": " + capture_json + "\n}\n";
     std::cout << json;
     if (!options.report.empty()) {
         fs::create_directories(options.report.parent_path());
@@ -240,6 +377,117 @@ private:
     bool have_frame_{};
 };
 
+void collect_symbols(const mafia::VerifiedElf &image, Report &report) {
+    try {
+        report.symbol = mafia::resolve_function_symbol(image, report.last_pc);
+        report.branch_symbol = mafia::resolve_function_symbol(image, report.last_branch_pc);
+    } catch (const std::exception &error) {
+        report.symbol.reset();
+        report.branch_symbol.reset();
+        report.symbol_error = error.what();
+    }
+}
+
+void collect_sce_open_request(PS2Runtime &runtime, Report &report) {
+    report.latest_sce_open_request = "null";
+    report.sce_open_request_error.clear();
+    // This address and layout come from sceOpen in this exact verified ELF.
+    // The shared EE request is useful evidence, but is not the IOP's current
+    // argument registers and does not establish which request it is executing.
+    if (!report.elf_verified || !report.entered ||
+        std::string_view(mafia::build::elf_sha256) !=
+            "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f" ||
+        report.error.find("missing import ioman:4") == std::string::npos)
+        return;
+    try {
+        constexpr std::uint32_t address = 0x00538100u, size = 0x418u;
+        static_assert(address <= PS2_RAM_SIZE && size <= PS2_RAM_SIZE - address);
+        const auto *ram = runtime.memory().getRDRAM();
+        if (!ram) throw std::runtime_error("EE RAM is unavailable for the latest sceOpen request");
+        const auto *request = ram + address;
+        const auto word = [&](std::uint32_t offset) {
+            return std::uint32_t{request[offset]} | (std::uint32_t{request[offset + 1]} << 8u) |
+                (std::uint32_t{request[offset + 2]} << 16u) | (std::uint32_t{request[offset + 3]} << 24u);
+        };
+        constexpr char hex[] = "0123456789abcdef";
+        std::string path, path_hex;
+        bool ascii = true, terminated = false;
+        for (std::uint32_t i = 0; i < 1024u; ++i) {
+            const auto byte = request[0x14u + i];
+            if (!byte) { terminated = true; break; }
+            ascii = ascii && byte < 0x80u;
+            path += static_cast<char>(byte);
+            path_hex += hex[byte >> 4u];
+            path_hex += hex[byte & 15u];
+        }
+        report.latest_sce_open_request = "{\"source\": \"verified-elf-shared-ee-request-buffer\""
+            ", \"address\": " + std::to_string(address) +
+            ", \"size\": " + std::to_string(size) +
+            ", \"semaphore_id\": " + std::to_string(word(0)) +
+            ", \"result_address\": " + std::to_string(word(4)) +
+            ", \"result_length\": " + std::to_string(word(8)) +
+            ", \"flags\": " + std::to_string(word(0xcu)) +
+            ", \"mode\": " + std::to_string(word(0x10u)) +
+            ", \"path\": " + (ascii ? mafia::json_string(path) : "null") +
+            ", \"path_bytes_hex\": " + mafia::json_string(path_hex) +
+            ", \"path_terminated\": " + (terminated ? "true" : "false") +
+            ", \"iob_slot\": " + std::to_string(word(0x414u)) + "}";
+    } catch (const std::exception &error) {
+        report.sce_open_request_error = error.what();
+    }
+}
+
+void collect_ee_context(PS2Runtime &runtime, const R5900Context &context, Report &report) {
+    report.ee_final_context = "null";
+    report.ee_context_error.clear();
+    try {
+        constexpr const char *names[] = {
+            "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+            "t8", "t9", "k0", "k1", "gp", "sp", "fp", "ra"
+        };
+        std::string registers = "{";
+        for (std::uint32_t i = 0; i < 32u; ++i) {
+            if (i) registers += ", ";
+            registers += mafia::json_string(names[i]) + ": " +
+                std::to_string(static_cast<std::uint32_t>(_mm_cvtsi128_si32(context.r[i])));
+        }
+        registers += "}";
+        std::string stack = "null", stack_status = "guest-not-entered";
+        if (report.elf_loaded && report.entered) {
+            // Snapshot bytes only; do not dereference arbitrary guest pointers
+            // through MMIO or interpret stack words as verified return addresses.
+            const auto sp = static_cast<std::uint32_t>(_mm_cvtsi128_si32(context.r[29]));
+            const auto segment = sp & 0xe0000000u, physical = sp & 0x1fffffffu;
+            const auto *ram = runtime.memory().getRDRAM();
+            stack_status = "outside-physical-ram";
+            if (ram && sp != 0u && physical < PS2_RAM_SIZE &&
+                (segment == 0u || segment == 0x80000000u || segment == 0xa0000000u)) {
+                constexpr char hex[] = "0123456789abcdef";
+                const auto size = std::min(1024u, PS2_RAM_SIZE - physical);
+                std::string bytes;
+                bytes.reserve(size * 2u);
+                for (std::uint32_t i = 0; i < size; ++i) {
+                    const auto byte = ram[physical + i];
+                    bytes += hex[byte >> 4u];
+                    bytes += hex[byte & 15u];
+                }
+                stack = "{\"guest_address\": " + std::to_string(sp) +
+                    ", \"physical_address\": " + std::to_string(physical) +
+                    ", \"size\": " + std::to_string(size) +
+                    ", \"bytes_hex\": " + mafia::json_string(bytes) + "}";
+                stack_status = "captured";
+            }
+        }
+        report.ee_final_context = "{\"gpr_low32\": " + registers +
+            ", \"stack_status\": " + mafia::json_string(stack_status) +
+            ", \"stack\": " + stack + "}";
+    } catch (const std::exception &error) {
+        report.ee_context_error = error.what();
+    }
+}
+
 void collect(PS2Runtime &runtime, Report &report) {
     report.metrics_available = true;
     report.entered = entry_executed.load(std::memory_order_acquire);
@@ -249,16 +497,62 @@ void collect(PS2Runtime &runtime, Report &report) {
     if (!context) context = &runtime.cpu();
     report.last_pc = context->pc;
     report.last_branch_pc = context->branch_pc;
+    collect_ee_context(runtime, *context, report);
     report.dma = runtime.memory().dmaStartCount();
     report.gif = runtime.memory().gifCopyCount();
     report.gs = runtime.memory().gsWriteCount();
     report.vif = runtime.memory().vifWriteCount();
+    report.ee_metrics_available = false;
+    report.ee_error.clear();
+    try {
+        report.ee = runtime.eeScheduler().snapshot();
+        report.ee_metrics_available = true;
+    } catch (const std::exception &error) {
+        report.ee_error = error.what();
+    }
+    report.io_metrics_available = false;
+    report.io_error.clear();
+    report.io_registers.clear();
+    try {
+        const auto &memory = runtime.memory();
+        // Read raw state only after joining the worker. Some upstream MMIO
+        // accessors change DMA state, and VIF's live parser fields can differ
+        // from the register cache; preserve both without diagnostic side effects.
+        const auto raw = [&](const char *name, std::uint32_t address) {
+            const auto found = memory.m_ioRegisters.find(address);
+            report.io_registers.emplace_back(name, found == memory.m_ioRegisters.end() ? 0u : found->second);
+        };
+        report.io_registers.emplace_back("vif1_stat", memory.vif1_regs.stat);
+        report.io_registers.emplace_back("vif1_code", memory.vif1_regs.code);
+        raw("vif1_cached_stat", 0x10003c00u);
+        raw("vif1_cached_code", 0x10003c80u);
+        raw("vif1_fbrst", 0x10003c10u);
+        raw("intc_stat", 0x1000f000u);
+        raw("intc_mask", 0x1000f010u);
+        raw("d_stat", 0x1000e010u);
+        raw("vif1_dma_chcr", 0x10009000u);
+        raw("vif1_dma_qwc", 0x10009020u);
+        report.io_metrics_available = true;
+    } catch (const std::exception &error) {
+        report.io_error = error.what();
+    }
+    report.iop_metrics_available = false;
+    report.iop_error.clear();
+    try {
+        report.iop = runtime.iopDebugSnapshot();
+        report.iop_metrics_available = true;
+    } catch (const std::exception &error) {
+        // Optional diagnostics must not conceal the original guest failure.
+        report.iop_error = error.what();
+    }
+    collect_sce_open_request(runtime, report);
 }
 } // namespace
 
 int main(int argc, char **argv) {
     Options options;
     Report report;
+    std::optional<mafia::VerifiedElf> image;
     std::unique_ptr<PS2Runtime> runtime;
     int result = 1;
     try {
@@ -266,20 +560,24 @@ int main(int argc, char **argv) {
         if (options.help) {
             std::cout << "MafiaNative --elf PATH [--data-root PATH] [--iso PATH] [--save-root PATH]\n"
                          "  [--headless] [--validate-only] [--timeout-ms 10000] [--report PATH]\n"
+                         "  [--capture-frame NEW-PATH.ppm]\n"
+                         "Capture saves the unscaled GS surface after execution stops, including in headless mode.\n"
+                         "No image is written if the guest did not configure a display surface.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;
         }
         report.stage = "elf-verification";
-        const auto image = mafia::read_verified_elf(options.elf, mafia::build::elf_sha256,
-                                                   mafia::build::entry_point);
+        image = mafia::read_verified_elf(options.elf, mafia::build::elf_sha256,
+                                        mafia::build::entry_point);
         report.elf_verified = true;
-        report.last_pc = image.entry;
+        report.last_pc = image->entry;
         if (options.validate_only) {
             report.status = "validated-only";
+            collect_symbols(*image, report);
             emit_report(options, report);
             return 0;
         }
-        VerifiedCopy copy(image, options.elf);
+        VerifiedCopy copy(*image, options.elf);
         report.stage = "runtime-initialization";
         runtime = std::make_unique<PS2Runtime>();
         runtime->setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
@@ -305,9 +603,9 @@ int main(int argc, char **argv) {
         runtime->cpu().r[4] = _mm_setzero_si128();
         runtime->cpu().r[5] = _mm_setzero_si128();
         runtime->cpu().r[29] = _mm_set_epi64x(0, static_cast<std::int64_t>(PS2_RAM_SIZE - 0x10u));
-        if (!runtime->hasFunction(image.entry)) throw std::runtime_error("The generated function table does not contain the original entry point");
-        original_entry = runtime->lookupFunction(image.entry);
-        if (!runtime->replaceFunction(image.entry, &observe_entry))
+        if (!runtime->hasFunction(image->entry)) throw std::runtime_error("The generated function table does not contain the original entry point");
+        original_entry = runtime->lookupFunction(image->entry);
+        if (!runtime->replaceFunction(image->entry, &observe_entry))
             throw std::runtime_error("Cannot install original-entry execution observation");
         report.stage = "guest-execution";
         const auto started = Clock::now();
@@ -345,8 +643,13 @@ int main(int argc, char **argv) {
             if (!executor.done()) {
                 report.status = "stop-timeout";
                 report.error = "EE executor did not stop within two seconds of a stop request";
+                report.capture_status = "executor-still-running";
+                report.capture_error = "Cannot snapshot mutable GS state until the EE executor has joined";
                 report.entered = entry_executed.load(std::memory_order_acquire);
                 report.last_pc = runtime->m_debugPc.load(std::memory_order_relaxed);
+                // Symbols come from immutable verified input, independent of
+                // guest memory even when the executor has not stopped.
+                collect_symbols(*image, report);
                 // Do not inspect mutable guest memory or contexts while the
                 // executor is still running. Its last sampled PC is all we have.
                 try { emit_report(options, report); }
@@ -383,6 +686,39 @@ int main(int argc, char **argv) {
         std::cerr << "MafiaNative: " << report.error << " (stage=" << report.stage
                   << ", guest_pc=0x" << std::hex << report.last_pc
                   << ", last_branch_pc=0x" << report.last_branch_pc << std::dec << ")\n";
+    }
+    if (image) collect_symbols(*image, report);
+    if (!options.capture_frame.empty()) {
+        // All ordinary and exceptional paths above join the EE worker before
+        // inspecting mutable state. The unresponsive-worker path exits earlier.
+        try {
+            if (!runtime || !report.elf_loaded || !report.entered) {
+                report.capture_status = "not-executed";
+                report.capture_error = "Guest entry did not execute; no framebuffer evidence is available";
+            } else {
+                report.capture = mafia::capture_gs_frame(*runtime);
+                if (!report.capture.available) {
+                    report.capture_status = "unavailable";
+                    report.capture_error = "The GS did not produce a valid presentation surface";
+                } else {
+                    const auto digest = mafia::sha256(report.capture.encoded.ppm);
+                    mafia::save_frame_exclusive(options.capture_frame, report.capture.encoded.ppm);
+                    report.capture_sha256 = digest;
+                    report.capture_status = "saved";
+                }
+            }
+        } catch (const std::exception &error) {
+            report.capture_status = "failed";
+            report.capture_error = error.what();
+        }
+        if (report.capture_status != "saved") {
+            std::cerr << "MafiaNative capture: " << report.capture_error << '\n';
+            if (result == 0) {
+                result = 1;
+                report.status = "capture-unavailable";
+                report.error = report.capture_error;
+            }
+        }
     }
     if (!options.headless && IsWindowReady()) CloseWindow();
     try { emit_report(options, report); }

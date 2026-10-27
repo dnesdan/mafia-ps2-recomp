@@ -7,29 +7,79 @@ This test does not contain, generate, load, or establish any Mafia game content.
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import struct
 import subprocess
 import sys
+import tempfile
 
 
 def fixture_bytes() -> bytes:
-    image = bytearray(0x110)
+    image = bytearray(0x200)
     image[:16] = b"\x7fELF\x01\x01\x01" + bytes(9)
     struct.pack_into("<HHIIIIIHHHHHH", image, 16,
-                     2, 8, 1, 0x100000, 52, 0, 0x20924001,
-                     52, 32, 1, 0, 0, 0)
+                     2, 8, 1, 0x100000, 52, 0x120, 0x20924001,
+                     52, 32, 1, 40, 4, 0)
     struct.pack_into("<IIIIIIII", image, 52,
                      1, 0x100, 0x100000, 0x100000, 16, 16, 5, 0x100)
     struct.pack_into("<IIII", image, 0x100,
                      0x3C021234, 0x34425678, 0x03E00008, 0)
+    # Authored symbols exercise report resolution from the same verified bytes.
+    names = b"\0synthetic_entry\0"
+    image[0x1C0:0x1C0 + len(names)] = names
+    struct.pack_into("<10I", image, 0x148, 0, 1, 6, 0x100000, 0x100, 16, 0, 0, 4, 0)
+    struct.pack_into("<10I", image, 0x170, 0, 3, 0, 0, 0x1C0, len(names), 0, 0, 1, 0)
+    struct.pack_into("<10I", image, 0x198, 0, 2, 0, 0, 0x1E0, 32, 2, 1, 4, 16)
+    struct.pack_into("<IIIBBH", image, 0x1F0, 1, 0x100000, 16, 0x12, 0, 1)
     return bytes(image)
 
 
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def verify_default_launcher(repo: Path, work: Path) -> None:
+    """Exercise default-path resolution without opening a window or any game."""
+    platform = "macos" if sys.platform == "darwin" else "linux"
+    with tempfile.TemporaryDirectory(prefix="launcher-contract-", dir=work) as temporary:
+        root = Path(temporary)
+        build, data, extracted = root / "build", root / "work", root / "actual-extracted"
+        build.mkdir()
+        data.mkdir()
+        extracted.mkdir()
+        (data / "extracted").symlink_to(extracted, target_is_directory=True)
+        boot = extracted / "synthetic.elf"
+        boot.write_bytes(fixture_bytes())
+        disc = data / "disc.json"
+        disc.write_text(json.dumps({"boot_elf": boot.name}))
+        (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Debug\n")
+        binary = build / ("MafiaNative.app/Contents/MacOS/MafiaNative" if platform == "macos"
+                          else "MafiaNative")
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+        binary.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(MAFIA_BUILD_DIR=str(build), MAFIA_BUILD_CONFIG="Debug",
+                           MAFIA_WORK_DIR=str(data), PYTHON=sys.executable)
+        environment.pop("MAFIA_PS2_ISO", None)
+        launcher = repo / "tools" / f"run_{platform}.sh"
+        result = subprocess.run(["bash", str(launcher)], env=environment, capture_output=True,
+                                text=True, timeout=5)
+        check(result.returncode == 0, f"Launcher rejected a symlinked data root: {result.stderr}")
+        arguments = json.loads(result.stdout)
+        check(Path(arguments[arguments.index("--elf") + 1]) == boot,
+              "Launcher did not use the canonical boot ELF inside its selected data root")
+        outside = root / "outside.elf"
+        outside.write_bytes(fixture_bytes())
+        (extracted / "escape.elf").symlink_to(outside)
+        disc.write_text(json.dumps({"boot_elf": "escape.elf"}))
+        rejected = subprocess.run(["bash", str(launcher)], env=environment, capture_output=True,
+                                  text=True, timeout=5)
+        check(rejected.returncode != 0 and "Invalid boot path" in rejected.stderr,
+              "Launcher permitted an individual boot-file symlink outside the selected data root")
 
 
 def verify_host(executable: Path, fixture: Path, work: Path) -> None:
@@ -60,12 +110,21 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
         check(data["elf_sha256"] == hashlib.sha256(original).hexdigest(), "Compiled fixture SHA mismatch")
         check(data["gameplay_verified"] is False and data["game_frame_verified"] is False,
               "A synthetic host test must never claim game verification")
+        check(data["latest_sce_open_request"] is None and data["sce_open_request_snapshot_error"] == "",
+              "Synthetic or rejected input acquired a game-specific sceOpen request")
         return result.returncode, data
 
     code, validation = run("validated-only", fixture, "--validate-only")
     check(code == 0 and validation["status"] == "validated-only", "ELF-only validation failed")
     check(validation["elf_verified"] is True and validation["elf_loaded"] is False
           and validation["entry_executed"] is False, "Validation was confused with execution")
+    check(validation["iop"] is None, "ELF-only validation invented an IOP execution snapshot")
+    check(validation["ee"] is None and validation["io_registers"] is None,
+          "ELF-only validation invented EE or device execution state")
+    check(validation["ee_final_context"] is None, "ELF-only validation invented a guest context")
+    check(validation["symbol"] == "synthetic_entry" and validation["symbol_address"] == 0x100000
+          and validation["symbol_offset"] == 0 and validation["symbol_source"] == "verified-elf"
+          and validation["symbol_lookup_error"] == "", "Verified entry symbol was not resolved")
 
     code, execution = run("strict-return", fixture)
     check(code == 1 and execution["status"] == "missing-dispatch", "Root zero return did not fail closed")
@@ -73,17 +132,54 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
           and execution["entry_executed"] is True, "Original synthetic entry was not dispatched")
     check(execution["last_guest_pc"] == 0 and execution["last_guest_branch_pc"] == 0x100008,
           "Failed branch source/target diagnostics were lost")
+    check(execution["symbol"] is None and execution["branch_symbol"] == "synthetic_entry"
+          and execution["branch_symbol_address"] == 0x100000 and execution["branch_symbol_offset"] == 8,
+          "Branch source symbol was lost or an invalid target acquired a guessed symbol")
     check(execution["presentations"] == 0, "Headless synthetic execution unexpectedly presented an image")
+    check(execution["ee_snapshot_error"] == "" and execution["ee"]["sequence"] > 0
+          and any(thread["entry"] == 0x100000 for thread in execution["ee"]["threads"]),
+          "Native execution lost its EE scheduler snapshot")
+    context = execution["ee_final_context"]
+    check(execution["ee_context_snapshot_error"] == "" and context["gpr_low32"]["sp"] == 0x1FFFFF0
+          and context["stack_status"] == "captured" and context["stack"]["size"] == 16
+          and context["stack"]["physical_address"] == 0x1FFFFF0
+          and len(context["stack"]["bytes_hex"]) == 32,
+          "Final context lost the actual guest stack pointer or read past the end of RAM")
+    check(execution["io_snapshot_error"] == "" and execution["io_registers"]["vif1_stat"] == 0
+          and execution["io_registers"]["vif1_dma_chcr"] == 0,
+          "EE-only fixture invented VIF or DMA state")
+    check(execution["iop_snapshot_error"] == "" and execution["iop"]["instructions"] == 0
+          and execution["iop"]["loaded_guest_modules"] == 0
+          and execution["iop"]["guest_rpc_servers"] == 0,
+          "EE-only fixture incorrectly claimed IOP guest module execution")
+
+    capture = work / "no-surface.ppm"
+    capture.unlink(missing_ok=True)
+    code, no_surface = run("capture-no-surface", fixture, "--capture-frame", str(capture))
+    check(code == 1 and no_surface["status"] == "missing-dispatch", "Capture concealed the guest failure")
+    check(no_surface["frame_capture"]["status"] == "unavailable" and not capture.exists(),
+          "Capture fabricated an image without a configured GS surface")
+    check(no_surface["frame_capture"]["sha256"] == "", "A missing image acquired a content digest")
 
     changed = bytearray(original)
     changed[-1] ^= 1
     wrong_elf = work / "wrong-hash.elf"
     wrong_elf.write_bytes(changed)
-    code, rejected = run("wrong-hash", wrong_elf)
+    code, rejected = run("wrong-hash", wrong_elf, "--capture-frame", str(capture))
     check(code == 1 and rejected["stage"] == "elf-verification", "Wrong ELF did not fail verification")
     check(rejected["elf_verified"] is False and rejected["elf_loaded"] is False
           and rejected["entry_executed"] is False, "Unverified bytes reached the runtime")
-    checks = ["SHA gate", "validation", "synthetic entry", "strict return"]
+    check(rejected["iop"] is None, "Rejected input acquired an IOP execution snapshot")
+    check(rejected["ee"] is None and rejected["io_registers"] is None,
+          "Rejected input acquired EE or device execution state")
+    check(rejected["ee_final_context"] is None, "Rejected input acquired a guest context")
+    check(rejected["symbol"] is None and rejected["branch_symbol"] is None
+          and rejected["symbol_source"] is None, "Unverified input acquired symbol evidence")
+    check(rejected["frame_capture"]["status"] == "not-executed" and not capture.exists(),
+          "Rejected input produced framebuffer evidence")
+    verify_default_launcher(Path(__file__).resolve().parents[2], work)
+    checks = ["SHA gate", "validation", "verified ELF symbols", "synthetic entry", "strict return", "absent-frame refusal",
+              "launcher symlink containment"]
     if sys.platform == "darwin":
         checks.insert(0, "ARM64 application bundle")
     print("Native host contract passed: " + ", ".join(checks) + "; no game execution.")

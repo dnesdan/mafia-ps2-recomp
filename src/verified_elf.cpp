@@ -6,6 +6,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace mafia {
 namespace {
@@ -152,6 +153,88 @@ VerifiedElf read_verified_elf(const std::filesystem::path &path,
     if(!file.read(reinterpret_cast<char*>(bytes.data()),size))
         throw std::runtime_error("ELF read failed: "+path.string());
     return verify_elf(bytes,expected_sha256,expected_entry);
+}
+
+std::optional<FunctionSymbol> resolve_function_symbol(const VerifiedElf &image,
+                                                     std::uint32_t address) {
+    const std::span<const std::uint8_t> bytes=image.bytes;
+    const auto table=little32(bytes,32);
+    const auto stride=little16(bytes,46);
+    const auto count=little16(bytes,48);
+    if(table==0 && count==0) return std::nullopt;
+    if(table==0 || stride!=40 || count==0 ||
+       std::uint64_t{table}+std::uint64_t{stride}*count>bytes.size())
+        throw std::runtime_error("ELF symbol section table is unsupported or truncated");
+    const auto section=[&](std::uint32_t index) {
+        if(index>=count) throw std::runtime_error("ELF symbol section index exceeds table bounds");
+        return static_cast<std::size_t>(table)+static_cast<std::size_t>(index)*stride;
+    };
+    const auto contents=[&](std::size_t header) {
+        const auto offset=little32(bytes,header+16), size=little32(bytes,header+20);
+        if(std::uint64_t{offset}+size>bytes.size())
+            throw std::runtime_error("ELF symbol or string section exceeds file bounds");
+        return bytes.subspan(offset,size);
+    };
+    const auto pc=physical_address(address);
+    std::optional<FunctionSymbol> result;
+    for(std::uint32_t index=0;index<count;++index) {
+        const auto header=section(index);
+        const auto type=little32(bytes,header+4);
+        if(type!=2 && type!=11) continue; // SHT_SYMTAB or SHT_DYNSYM.
+        const auto symbols=contents(header);
+        if(little32(bytes,header+36)!=16 || symbols.size()%16!=0)
+            throw std::runtime_error("ELF function symbol entries have an invalid size");
+        const auto strings_header=section(little32(bytes,header+24));
+        if(little32(bytes,strings_header+4)!=3)
+            throw std::runtime_error("ELF symbol table does not reference a string table");
+        const auto strings=contents(strings_header);
+        for(std::size_t at=0;at<symbols.size();at+=16) {
+            if((symbols[at+12]&15u)!=2) continue; // STT_FUNC only.
+            const auto owner=little16(symbols,at+14);
+            if(owner==0 || owner>=0xff00u || owner>=count) continue; // No undefined/reserved owners.
+            const auto start=little32(symbols,at+4), size=little32(symbols,at+8);
+            const auto physical=physical_address(start);
+            if((address&3u)!=0 || (start&3u)!=0 || pc<physical ||
+               (size==0 ? pc!=physical : std::uint64_t{pc}>=std::uint64_t{physical}+size))
+                continue;
+            const auto extent=std::max(size,4u);
+            if(std::uint64_t{start}+extent>0x100000000ull) continue;
+            const auto owner_header=section(owner);
+            if(little32(bytes,owner_header+4)!=1 || (little32(bytes,owner_header+8)&6u)!=6u)
+                continue; // The declared owner must be allocated executable PROGBITS.
+            const auto owner_start=little32(bytes,owner_header+12);
+            const auto owner_physical=physical_address(owner_start);
+            const auto owner_contents=contents(owner_header);
+            if(std::uint64_t{owner_start}+owner_contents.size()>0x100000000ull ||
+               physical<owner_physical ||
+               std::uint64_t{physical}+extent>std::uint64_t{owner_physical}+owner_contents.size())
+                continue;
+            const std::uint64_t owner_file=little32(bytes,owner_header+16);
+            const bool executable=std::any_of(image.segments.begin(),image.segments.end(),[&](const auto &segment) {
+                const std::uint64_t base=physical_address(segment.virtual_address);
+                return (segment.flags&1u)!=0 && physical>=base &&
+                       std::uint64_t{physical}+extent<=base+segment.file_size &&
+                       owner_file+(physical-owner_physical)==std::uint64_t{segment.offset}+(physical-base);
+            });
+            if(!executable) continue;
+            const auto name=little32(symbols,at);
+            if(name>=strings.size()) throw std::runtime_error("ELF function name exceeds its string table");
+            const auto begin=strings.begin()+name;
+            const auto end=std::find(begin,strings.end(),std::uint8_t{0});
+            if(end==strings.end() || end-begin>4096)
+                throw std::runtime_error("ELF function name is unterminated or too long");
+            if(begin==end) continue;
+            if(!std::all_of(begin,end,[](std::uint8_t byte) {return byte>=32 && byte<127;}))
+                throw std::runtime_error("ELF function name contains unsupported diagnostic characters");
+            FunctionSymbol candidate{std::string(begin,end),start,size,pc-physical};
+            // Prefer the closest explicit containing start. Stable name ordering
+            // resolves aliases at the same address without consulting host maps.
+            if(!result || physical>physical_address(result->address) ||
+               (physical==physical_address(result->address) && candidate.name<result->name))
+                result=std::move(candidate);
+        }
+    }
+    return result;
 }
 
 std::string json_string(std::string_view value) {

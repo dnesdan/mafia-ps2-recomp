@@ -1,6 +1,8 @@
 #include "ps2_runtime.h"
 #include "runtime/ee_scheduler.h"
 #include "mafia/guest_executor.hpp"
+#include "mafia/gs_capture.hpp"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -34,6 +36,9 @@ int main(int argc, char **argv) {
         runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
         if(!runtime.memory().initialize() || !runtime.syncCoreSubsystems())
             throw std::runtime_error("Core subsystem initialization failed");
+        const auto absent_frame = mafia::capture_gs_frame(runtime);
+        if(absent_frame.available || !absent_frame.encoded.ppm.empty())
+            throw std::runtime_error("Capture fabricated a surface before GS display setup");
         runtime.Store32(runtime.memory().getRDRAM(),&runtime.cpu(),0x00100000u,0x12345678u);
         if(runtime.Load32(runtime.memory().getRDRAM(),&runtime.cpu(),0x80100000u)!=0x12345678u)
             throw std::runtime_error("EE cached memory alias mismatch");
@@ -55,6 +60,31 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Scheduler did not invoke the registered synthetic entry");
         if(!runtime.isStopRequested() || runtime.cpu().pc!=0x00100004u)
             throw std::runtime_error("Missing dispatch did not preserve the failed PC and request stop");
+        // Synthetic hardware contract: configure CRT1 and write three known
+        // colors to swizzled GS local memory. No authored image is used by the
+        // game target, and this does not establish any Mafia rendering milestone.
+        runtime.Store64(runtime.memory().getRDRAM(),&runtime.cpu(),0x12000000u,1u);
+        runtime.Store64(runtime.memory().getRDRAM(),&runtime.cpu(),0x12000070u,1u | (1u<<9));
+        runtime.Store64(runtime.memory().getRDRAM(),&runtime.cpu(),0x12000080u,
+                        (std::uint64_t{63}<<32) | (std::uint64_t{63}<<44));
+        runtime.memory().gs().vsyncTick.store(7,std::memory_order_release);
+        runtime.gs().WriteVram(0u,32u,1u,0u,0u,0x80030201u);
+        runtime.gs().WriteVram(0u,32u,1u,1u,0u,0x80060504u);
+        runtime.gs().WriteVram(0u,32u,1u,63u,63u,0x804080ffu);
+        const auto frame=mafia::capture_gs_frame(runtime);
+        if(!frame.available || frame.width!=64 || frame.height!=64 || frame.display_fbp!=1 ||
+           frame.source_fbp!=1 || frame.used_preferred || frame.vsync_tick!=7 ||
+           frame.encoded.nonblack_pixels!=3)
+            throw std::runtime_error("Synthetic GS capture metadata does not match the configured surface");
+        const std::string ppm_header="P6\n64 64\n255\n";
+        const auto &ppm=frame.encoded.ppm;
+        const auto start=ppm_header.size();
+        if(ppm.size()!=start+64u*64u*3u ||
+           !std::equal(ppm_header.begin(),ppm_header.end(),ppm.begin()) ||
+           ppm[start]!=1 || ppm[start+1]!=2 || ppm[start+2]!=3 ||
+           ppm[start+3]!=4 || ppm[start+4]!=5 || ppm[start+5]!=6 ||
+           ppm[ppm.size()-3]!=255 || ppm[ppm.size()-2]!=128 || ppm.back()!=64)
+            throw std::runtime_error("Capture changed the actual GS conversion's RGB bytes or row order");
         PS2Runtime unwind_runtime;
         unwind_runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
         if(!unwind_runtime.memory().initialize() || !unwind_runtime.syncCoreSubsystems())
@@ -72,7 +102,7 @@ int main(int argc, char **argv) {
         } catch(const std::runtime_error &) {caught=true;}
         if(!caught || !waiting_entered.load(std::memory_order_acquire) || !unwind_runtime.isStopRequested())
             throw std::runtime_error("Host exception did not stop and join the EE worker");
-        std::cout<<"Runtime contracts passed (memory, scratchpad, scheduler entry, strict dispatch, exception shutdown; no game execution).\n";
+        std::cout<<"Runtime contracts passed (memory, scratchpad, scheduler entry, strict dispatch, GS capture, exception shutdown; no game execution).\n";
         return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }
