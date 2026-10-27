@@ -1,3 +1,9 @@
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+// Darwin declares mkdtemp in unistd.h's extension namespace. Select that
+// namespace before any transitive system header establishes feature visibility.
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "mafia/verified_elf.hpp"
 #include "mafia/guest_executor.hpp"
 #include "mafia_build_profile.hpp"
@@ -18,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
