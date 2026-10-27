@@ -1,0 +1,172 @@
+diff --git a/ps2xRecomp/include/ps2recomp/types.h b/ps2xRecomp/include/ps2recomp/types.h
+index 9bd687d..c2402dd 100644
+--- a/ps2xRecomp/include/ps2recomp/types.h
++++ b/ps2xRecomp/include/ps2recomp/types.h
+@@ -184,6 +184,8 @@ namespace ps2recomp
+         bool patchSyscalls = false;
+         bool patchCop0 = true;
+         bool patchCache = true;
++        // Explicit stubs remain available when automatic name-based bindings are disabled.
++        bool autoBindRuntimeCalls = true;
+         std::vector<std::string> skipFunctions;
+         std::unordered_map<uint32_t, std::string> patches;
+         std::vector<std::string> stubImplementations;
+diff --git a/ps2xRecomp/src/lib/config_manager.cpp b/ps2xRecomp/src/lib/config_manager.cpp
+index 97dc2dd..24f7d78 100644
+--- a/ps2xRecomp/src/lib/config_manager.cpp
++++ b/ps2xRecomp/src/lib/config_manager.cpp
+@@ -64,6 +64,7 @@ namespace ps2recomp
+             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
+             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
+             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
++            config.autoBindRuntimeCalls = toml::find_or<bool>(general, "auto_bind_runtime_calls", config.autoBindRuntimeCalls);
+ 
+             if (general.contains("stubs") && general.at("stubs").is_array())
+             {
+@@ -295,6 +296,7 @@ namespace ps2recomp
+         general["patch_syscalls"] = config.patchSyscalls;
+         general["patch_cop0"] = config.patchCop0;
+         general["patch_cache"] = config.patchCache;
++        general["auto_bind_runtime_calls"] = config.autoBindRuntimeCalls;
+         general["skip"] = config.skipFunctions;
+         general["stubs"] = config.stubImplementations;
+         general["entry_points"] = config.entryPointHints;
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index 8c1c7c5..35ab4d5 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -1004,7 +1004,7 @@ namespace ps2recomp
+             relocationCallNames.reserve(m_relocations.size());
+             for (const auto &reloc : m_relocations)
+             {
+-                if (reloc.symbolName.empty())
++                if (!m_config.autoBindRuntimeCalls || reloc.symbolName.empty())
+                 {
+                     continue;
+                 }
+@@ -2230,7 +2230,7 @@ namespace ps2recomp
+         {
+             return true;
+         }
+-        return ps2_runtime_calls::isStubName(function.name);
++        return m_config.autoBindRuntimeCalls && ps2_runtime_calls::isStubName(function.name);
+     }
+ 
+     bool PS2Recompiler::IsCorrectnessCriticalFunctionName(const std::string &name)
+diff --git a/ps2xTest/src/ps2_recompiler_tests.cpp b/ps2xTest/src/ps2_recompiler_tests.cpp
+index 201b71e..30d397c 100644
+--- a/ps2xTest/src/ps2_recompiler_tests.cpp
++++ b/ps2xTest/src/ps2_recompiler_tests.cpp
+@@ -762,6 +762,41 @@ static bool writeMinimalMipsElfWithInitializer(const std::filesystem::path &elfP
+     return writer.save(elfPath.string());
+ }
+ 
++static bool writeMinimalMipsElfWithRuntimeCallRelocation(const std::filesystem::path &elfPath)
++{
++    if (!writeMinimalMipsElfWithJalFallbackTarget(elfPath))
++        return false;
++    ELFIO::elfio writer;
++    if (!writer.load(elfPath.string()))
++        return false;
++    ELFIO::section *text = writer.sections[".text"];
++    ELFIO::section *strtab = writer.sections.add(".strtab");
++    strtab->set_type(ELFIO::SHT_STRTAB);
++    strtab->set_addr_align(1);
++    ELFIO::section *symtab = writer.sections.add(".symtab");
++    symtab->set_type(ELFIO::SHT_SYMTAB);
++    symtab->set_info(1);
++    symtab->set_link(strtab->get_index());
++    symtab->set_addr_align(4);
++    symtab->set_entry_size(writer.get_default_entry_size(ELFIO::SHT_SYMTAB));
++    ELFIO::symbol_section_accessor symbols(writer, symtab);
++    ELFIO::string_section_accessor strings(strtab);
++    symbols.add_symbol(strings, "", 0, 0, ELFIO::STB_LOCAL, ELFIO::STT_NOTYPE, 0, ELFIO::SHN_UNDEF);
++    symbols.add_symbol(strings, "caller", 0x00100000u, 16u,
++                       ELFIO::STB_GLOBAL, ELFIO::STT_FUNC, 0, text->get_index());
++    const auto targetSymbol = symbols.add_symbol(strings, "memcpy", 0x00100010u, 8u,
++                                                ELFIO::STB_GLOBAL, ELFIO::STT_FUNC, 0, text->get_index());
++    ELFIO::section *rel = writer.sections.add(".rel.text");
++    rel->set_type(ELFIO::SHT_REL);
++    rel->set_info(text->get_index());
++    rel->set_link(symtab->get_index());
++    rel->set_addr_align(4);
++    rel->set_entry_size(writer.get_default_entry_size(ELFIO::SHT_REL));
++    ELFIO::relocation_section_accessor relocations(writer, rel);
++    relocations.add_entry(0x00100000u, targetSymbol, 4u); // R_MIPS_26
++    return writer.save(elfPath.string());
++}
++
+ static bool writeRecompilerTestConfig(const std::filesystem::path &configPath,
+                                       const std::filesystem::path &elfPath,
+                                       const std::filesystem::path &outputPath,
+@@ -807,6 +842,70 @@ void register_ps2_recompiler_tests()
+ {
+     MiniTest::Case("PS2Recompiler", [](TestCase &tc)
+                    {
++        tc.Run("automatic runtime binding can be disabled without disabling explicit stubs", [](TestCase &t) {
++            const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
++            const auto root = std::filesystem::temp_directory_path() / ("ps2recomp-runtime-bindings-" + suffix);
++            std::filesystem::create_directories(root);
++            const auto elfPath = root / "guest.elf";
++            const bool written = writeMinimalMipsElfWithRuntimeCallRelocation(elfPath);
++            t.IsTrue(written, "fixture ELF with a named guest memcpy and call relocation should be written");
++            if (!written)
++                return;
++
++            for (unsigned mode = 0; mode < 3; ++mode)
++            {
++                const bool automatic = mode == 0;
++                const bool explicitStub = mode == 2;
++                const auto outputPath = root / ("output-" + std::to_string(mode));
++                const auto configPath = root / ("config-" + std::to_string(mode) + ".toml");
++                RecompilerConfig config;
++                config.inputPath = elfPath.string();
++                config.outputPath = outputPath.string();
++                t.IsTrue(config.autoBindRuntimeCalls, "automatic bindings remain enabled by default");
++                config.autoBindRuntimeCalls = automatic;
++                if (explicitStub)
++                    config.stubImplementations = {"memcpy"};
++                ConfigManager manager(configPath.string());
++                manager.saveConfig(config);
++                t.Equals(manager.loadConfig().autoBindRuntimeCalls, automatic,
++                         "auto_bind_runtime_calls must round trip through configuration");
++
++                PS2Recompiler recompiler(configPath.string());
++                const bool initialized = recompiler.initialize();
++                t.IsTrue(initialized, "fixture ELF should initialize");
++                if (!initialized)
++                    continue;
++                const bool compiled = recompiler.recompile();
++                t.IsTrue(compiled, "fixture ELF should recompile");
++                if (!compiled)
++                    continue;
++                recompiler.generateOutput();
++                t.Equals(recompiler.reportCounters().functionsStubbed,
++                         static_cast<size_t>(automatic || explicitStub),
++                         "only configured or enabled automatic bindings should produce a host stub");
++
++                std::string generated;
++                for (const auto &entry : std::filesystem::directory_iterator(outputPath))
++                {
++                    if (entry.path().extension() != ".cpp")
++                        continue;
++                    std::ifstream stream(entry.path());
++                    generated.append(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
++                }
++                size_t calls = 0;
++                size_t offset = 0;
++                while ((offset = generated.find("ps2_stubs::memcpy(", offset)) != std::string::npos)
++                {
++                    ++calls;
++                    ++offset;
++                }
++                t.Equals(calls, static_cast<size_t>(automatic ? 2 : explicitStub ? 1 : 0),
++                         "disabled automatic binding must also suppress relocation-based direct host calls");
++            }
++            std::error_code error;
++            std::filesystem::remove_all(root, error);
++        });
++
+         tc.Run("game helpers are not classified as runtime stubs", [](TestCase &t) {
+             t.IsFalse(ps2_runtime_calls::isStubName("Pad_init"),
+                       "Pad_init should be recompiled as game code");

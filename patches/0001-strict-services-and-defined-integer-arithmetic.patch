@@ -1,0 +1,234 @@
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 7684097..dbaac70 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -216,16 +216,16 @@ namespace ps2recomp
+             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+         case OPCODE_DADDI:
+             return fmt::format(
+-                "{{ int64_t src = (int64_t)GPR_S64(ctx, {}); "
+-                "int64_t imm = (int64_t)(int32_t){}; "
+-                "int64_t res = src + imm; "
+-                "if (((src ^ imm) >= 0) && ((src ^ res) < 0)) "
++                "{{ uint64_t src = GPR_U64(ctx, {}); "
++                "uint64_t imm = (uint64_t)(int64_t)(int32_t){}; "
++                "uint64_t res = src + imm; "
++                "if (((~(src ^ imm) & (src ^ res)) >> 63) != 0u) "
+                 "    runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+-                "else SET_GPR_S64(ctx, {}, res); }}",
++                "else SET_GPR_U64(ctx, {}, res); }}",
+                 inst.rs, inst.simmediate, inst.rt);
+         case OPCODE_DADDIU:
+             return fmt::format(
+-                "SET_GPR_S64(ctx, {}, (int64_t)GPR_S64(ctx, {}) + (int64_t)(int32_t){});",
++                "SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}) + (uint64_t)(int64_t)(int32_t){});",
+                 inst.rt, inst.rs, inst.simmediate);
+         case OPCODE_J:
+             return fmt::format("// J 0x{:X} - Handled by branch logic", buildAbsoluteJumpTarget(inst.address, inst.target));
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..6b50847 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -130,11 +130,11 @@ namespace ps2recomp
+             return fmt::format("ctx->sa = GPR_U32(ctx, {}) & 0x7F;", inst.rs);
+         case SPECIAL_DADD:
+             return fmt::format(
+-                "{{ int64_t a = (int64_t)GPR_S64(ctx, {}); "
+-                "int64_t b = (int64_t)GPR_S64(ctx, {}); "
+-                "int64_t r = a + b; "
+-                "if (((a ^ b) >= 0) && ((a ^ r) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+-                "else SET_GPR_S64(ctx, {}, r); }}",
++                "{{ uint64_t a = GPR_U64(ctx, {}); "
++                "uint64_t b = GPR_U64(ctx, {}); "
++                "uint64_t r = a + b; "
++                "if (((~(a ^ b) & (a ^ r)) >> 63) != 0u) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
++                "else SET_GPR_U64(ctx, {}, r); }}",
+                 inst.rs, inst.rt, inst.rd);
+         case SPECIAL_DADDU:
+             return fmt::format(
+@@ -142,11 +142,11 @@ namespace ps2recomp
+                 inst.rd, inst.rs, inst.rt);
+         case SPECIAL_DSUB:
+             return fmt::format(
+-                "{{ int64_t a = (int64_t)GPR_S64(ctx, {}); "
+-                "int64_t b = (int64_t)GPR_S64(ctx, {}); "
+-                "int64_t r = a - b; "
+-                "if (((a ^ b) < 0) && ((a ^ r) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+-                "else SET_GPR_S64(ctx, {}, r); }}",
++                "{{ uint64_t a = GPR_U64(ctx, {}); "
++                "uint64_t b = GPR_U64(ctx, {}); "
++                "uint64_t r = a - b; "
++                "if ((((a ^ b) & (a ^ r)) >> 63) != 0u) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
++                "else SET_GPR_U64(ctx, {}, r); }}",
+                 inst.rs, inst.rt, inst.rd);
+         case SPECIAL_DSUBU:
+             return fmt::format("SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}) - GPR_U64(ctx, {}));", inst.rd, inst.rs, inst.rt);
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0485d50..60db586 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -90,21 +90,21 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
+ #define ADD32_OV(rs, rt, result32, overflow)              \
+     do                                                    \
+     {                                                     \
+-        int32_t _a = (int32_t)(rs);                       \
+-        int32_t _b = (int32_t)(rt);                       \
+-        int32_t _r = _a + _b;                             \
+-        overflow = (((_a ^ _b) >= 0) && ((_a ^ _r) < 0)); \
+-        result32 = (uint32_t)_r;                          \
++        uint32_t _a = (uint32_t)(rs);                    \
++        uint32_t _b = (uint32_t)(rt);                    \
++        uint32_t _r = _a + _b;                           \
++        overflow = ((~(_a ^ _b) & (_a ^ _r)) >> 31) != 0u; \
++        result32 = _r;                                  \
+     } while (0);
+ #define SUB32(a, b) ((uint32_t)((a) - (b)))
+ #define SUB32_OV(rs, rt, result32, overflow)             \
+     do                                                   \
+     {                                                    \
+-        int32_t _a = (int32_t)(rs);                      \
+-        int32_t _b = (int32_t)(rt);                      \
+-        int32_t _r = _a - _b;                            \
+-        overflow = (((_a ^ _b) < 0) && ((_a ^ _r) < 0)); \
+-        result32 = (uint32_t)_r;                         \
++        uint32_t _a = (uint32_t)(rs);                   \
++        uint32_t _b = (uint32_t)(rt);                   \
++        uint32_t _r = _a - _b;                          \
++        overflow = (((_a ^ _b) & (_a ^ _r)) >> 31) != 0u; \
++        result32 = _r;                                 \
+     } while (0);
+ #define MUL32(a, b) ((uint32_t)((a) * (b)))
+ #define DIV32(a, b) ((uint32_t)((a) / (b)))
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Unimplemented.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Unimplemented.cpp
+index 561d619..cfda78b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Unimplemented.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Unimplemented.cpp
+@@ -12,6 +12,13 @@ namespace ps2_stubs
+     {
+         const std::string stubName = name ? name : "unknown";
+ 
++        // A strict host must never turn an unsupported service into a return value,
++        // even after another diagnostic run exhausted the process-wide warning limit.
++        if (runtime && runtime->missingFunctionPolicy() == PS2Runtime::MissingFunctionPolicy::Stop)
++        {
++            throw std::runtime_error("Unimplemented PS2 stub called: " + stubName);
++        }
++
+         uint32_t callCount = 0;
+         {
+             std::lock_guard<std::mutex> lock(g_stubWarningMutex);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..9809e30 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -382,7 +382,12 @@ namespace ps2_syscalls
+             }
+         }
+ 
+-        // Bootstrap default: avoid hard-failing loops that probe syscall availability.
++        if (runtime && runtime->missingFunctionPolicy() == PS2Runtime::MissingFunctionPolicy::Stop)
++        {
++            throw std::runtime_error("Unimplemented PS2 syscall: " + std::to_string(syscallId));
++        }
++
++        // Legacy diagnostic mode may probe syscall availability; strict hosts fail above.
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..4438fef 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
+ #include "ps2_runtime_macros.h"
+ #include "Stubs/DMA.h"
+ #include "Stubs/GS.h"
+@@ -2034,6 +2035,7 @@ void register_ps2_memory_tests()
+             R5900Context ctx{};
+             setRegU32(ctx, 4, 1u); // sceDmaGetChan(1) / VIF1
+             setRegU32(ctx, 5, kTag);
++            runtime.eeScheduler().bindMainContextForSyscall(ctx, rdram);
+             ps2_stubs::sceDmaSend(rdram, &ctx, &runtime);
+ 
+             t.Equals(static_cast<int32_t>(::getRegU32(&ctx, 2)), 0,
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..ae16354 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -315,6 +315,60 @@ void register_ps2_runtime_expansion_tests()
+ {
+     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
+     {
++        tc.Run("arithmetic overflow helpers preserve wrapped results and signed traps", [](TestCase &t)
++        {
++            const uint32_t values[] = {0u, 1u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu};
++            for (uint32_t a : values)
++            {
++                for (uint32_t b : values)
++                {
++                    uint32_t result = 0;
++                    bool overflow = false;
++                    const int64_t sa = static_cast<int32_t>(a);
++                    const int64_t sb = static_cast<int32_t>(b);
++                    ADD32_OV(a, b, result, overflow);
++                    t.Equals(result, static_cast<uint32_t>(sa + sb), "ADD32 must retain the low result bits");
++                    t.Equals(overflow, sa + sb > INT32_MAX || sa + sb < INT32_MIN, "ADD32 signed overflow");
++                    SUB32_OV(a, b, result, overflow);
++                    t.Equals(result, static_cast<uint32_t>(sa - sb), "SUB32 must retain the low result bits");
++                    t.Equals(overflow, sa - sb > INT32_MAX || sa - sb < INT32_MIN, "SUB32 signed overflow");
++                }
++            }
++        });
++
++        tc.Run("strict runtime rejects unknown syscalls and repeated unsupported stubs", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            R5900Context ctx{};
++            ctx.pc = 0x00101000u;
++            setRegU32(ctx, 2, 0x1234u);
++            bool syscallRejected = false;
++            try
++            {
++                ps2_syscalls::TODO(nullptr, &ctx, &runtime, 0x7FFFFu);
++            }
++            catch (const std::runtime_error &)
++            {
++                syscallRejected = true;
++            }
++            t.IsTrue(syscallRejected, "unsupported syscall must throw in strict mode");
++            t.Equals(::getRegU32(&ctx, 2), 0x1234u, "unsupported syscall must not claim success");
++            for (int attempt = 0; attempt != 16; ++attempt)
++            {
++                bool stubRejected = false;
++                try
++                {
++                    ps2_stubs::sceDmaCallback(nullptr, &ctx, &runtime);
++                }
++                catch (const std::runtime_error &)
++                {
++                    stubRejected = true;
++                }
++                t.IsTrue(stubRejected, "unsupported stub must keep throwing after repeated attempts");
++            }
++        });
++
+         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
+         {
+             R5900Decoder decoder;
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index aace83c..f2a869f 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -31,6 +31,7 @@ namespace
+         {
+             ps2_stubs::resetSifState();
+             std::memset(&ctx, 0, sizeof(ctx));
++            runtime.eeScheduler().bindMainContextForSyscall(ctx, rdram.data());
+         }
+     };
+ 

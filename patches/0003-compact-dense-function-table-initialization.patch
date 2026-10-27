@@ -1,0 +1,175 @@
+diff --git a/ps2xRecomp/src/lib/function_table_emitter.cpp b/ps2xRecomp/src/lib/function_table_emitter.cpp
+index b82b259..306595d 100644
+--- a/ps2xRecomp/src/lib/function_table_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_table_emitter.cpp
+@@ -150,7 +150,8 @@ namespace ps2recomp
+         ss << "#include <ps2_recompiled_functions.h>\n";
+         ss << "#include \"ps2_stubs.h\"\n";
+         ss << "#include <ps2_recompiled_stubs.h>\n";
+-        ss << "#include \"ps2_syscalls.h\"\n\n";
++        ss << "#include \"ps2_syscalls.h\"\n";
++        ss << "#include <algorithm>\n\n";
+ 
+         ss << "extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x" << std::hex << tableBase << "u;\n";
+         ss << "extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x" << std::hex << tableEnd << "u;\n";
+@@ -160,11 +161,28 @@ namespace ps2recomp
+         ss << "namespace {\n";
+         ss << "struct GeneratedFunctionTableInitializer {\n";
+         ss << "    GeneratedFunctionTableInitializer() {\n";
+-        for (const auto &[address, name] : entries)
++        for (size_t first = 0; first < entries.size();)
+         {
++            const auto &[address, name] = entries[first];
++            size_t end = first + 1;
++            while (end < entries.size() && entries[end].second == name &&
++                   static_cast<uint64_t>(entries[end - 1].first) + 4u == entries[end].first)
++            {
++                ++end;
++            }
+             const uint32_t slot = (address - tableBase) >> 2;
+-            ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = " << name
+-               << "; // 0x" << std::hex << address << std::dec << "\n";
++            if (end - first == 1u)
++            {
++                ss << "        g_ps2RecompiledFunctionTable[" << std::dec << slot << "] = " << name
++                   << "; // 0x" << std::hex << address << std::dec << "\n";
++            }
++            else
++            {
++                ss << "        std::fill_n(g_ps2RecompiledFunctionTable + " << std::dec << slot
++                   << "u, " << (end - first) << "u, " << name << "); // 0x" << std::hex
++                   << address << "..0x" << entries[end - 1].first << std::dec << "\n";
++            }
++            first = end;
+         }
+         ss << "    }\n";
+         ss << "};\n";
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 463b6cf..b9b0fb2 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -3,14 +3,44 @@
+ #include "ps2recomp/instructions.h"
+ #include "ps2recomp/ps2_recompiler.h"
+ #include "ps2recomp/types.h"
++#include <algorithm>
+ #include <filesystem>
+ #include <fstream>
+ #include <regex>
+ #include <sstream>
++#include <stdexcept>
+ #include <utility>
+ 
+ using namespace ps2recomp;
+ 
++// Interpret the emitted initializers by their C++ assignment/fill semantics so tests
++// can check every slot without depending on whether a span uses individual stores.
++static std::vector<std::string> registrationSlots(const std::string &source)
++{
++    std::smatch match;
++    if (!std::regex_search(source, match, std::regex("TableSlotCount = ([0-9]+)u;")))
++        throw std::runtime_error("missing generated table size");
++    std::vector<std::string> slots(std::stoul(match[1].str()));
++    const std::regex assignment("g_ps2RecompiledFunctionTable\\[([0-9]+)\\] = ([A-Za-z0-9_]+);");
++    const std::regex fill("std::fill_n\\(g_ps2RecompiledFunctionTable \\+ ([0-9]+)u, ([0-9]+)u, ([A-Za-z0-9_]+)\\);");
++    std::istringstream lines(source);
++    std::string line;
++    while (std::getline(lines, line))
++    {
++        if (std::regex_search(line, match, assignment))
++            slots.at(std::stoul(match[1].str())) = match[2].str();
++        else if (std::regex_search(line, match, fill))
++        {
++            const size_t first = std::stoul(match[1].str());
++            const size_t count = std::stoul(match[2].str());
++            if (first > slots.size() || count > slots.size() - first)
++                throw std::runtime_error("generated fill is outside the function table");
++            std::fill_n(slots.begin() + first, count, match[3].str());
++        }
++    }
++    return slots;
++}
++
+ static Instruction makeBranch(uint32_t address, uint32_t targetOffsetWords)
+ {
+     Instruction inst;
+@@ -263,9 +293,7 @@ void register_code_generator_tests()
+                                     std::vector<uint32_t>(analysis.resumeEntryPoints.begin(),
+                                                           analysis.resumeEntryPoints.end())}});
+         const std::string registration = gen.generateFunctionRegistration({func}, {});
+-        t.IsTrue(registration.find(
+-                     "g_ps2RecompiledFunctionTable[1] = syscall_resume_entry_0x9100; // 0x9104") !=
+-                     std::string::npos,
++        t.IsTrue(registrationSlots(registration).at(1) == "syscall_resume_entry_0x9100",
+                  "the syscall continuation must register to the owner wrapper");
+     });
+ 
+@@ -713,6 +741,46 @@ void register_code_generator_tests()
+                  "resume pc should force label emission for that instruction");
+     });
+ 
++    tc.Run("compact function registration preserves every fragmented table slot", [](TestCase &t) {
++        std::vector<Function> functions;
++        for (const auto &[address, name] : std::vector<std::pair<uint32_t, std::string>>{
++                 {0x1070u, "owner_c"}, {0x1000u, "owner_a"}, {0x1040u, "owner_b"}})
++        {
++            Function function;
++            function.name = name;
++            function.start = address;
++            function.end = address + 0x40u;
++            function.isRecompiled = true;
++            functions.push_back(function);
++        }
++        CodeGenerator gen({}, {});
++        gen.setRenamedFunctions({{0x1000u, "owner_a"}, {0x1040u, "owner_b"}, {0x1070u, "owner_c"}});
++        gen.setResumeEntryTargets({
++            {0x1000u, {0x1004u, 0x1008u, 0x1008u, 0x1010u, 0x1014u, 0x1020u, 0x103Cu, 0x1040u}},
++            {0x1040u, {0x1044u, 0x1048u, 0x1050u, 0x1060u}},
++            {0x1070u, {0x1074u, 0x1080u}},
++        });
++        const std::string source = gen.generateFunctionRegistration(functions, {});
++        const auto actual = registrationSlots(source);
++        std::vector<std::string> expected(33);
++        for (size_t slot : {0u, 1u, 2u, 4u, 5u, 8u, 15u})
++            expected[slot] = "owner_a";
++        for (size_t slot : {16u, 17u, 18u, 20u, 24u})
++            expected[slot] = "owner_b";
++        for (size_t slot : {28u, 29u, 32u})
++            expected[slot] = "owner_c";
++        t.Equals(actual.size(), expected.size(), "table bounds must be unchanged");
++        if (actual.size() == expected.size())
++            for (size_t slot = 0; slot < expected.size(); ++slot)
++                t.Equals(actual[slot], expected[slot],
++                         "coalescing must preserve holes, owners, duplicates and function-entry priority");
++        t.IsTrue(source.find("std::fill_n(") != std::string::npos,
++                 "contiguous same-owner slots should use compact initialization");
++        CodeGenerator emptyGenerator({}, {});
++        t.IsTrue(registrationSlots(emptyGenerator.generateFunctionRegistration({}, {})).empty(),
++                 "empty registration must retain an empty logical table");
++    });
++
+     tc.Run("resume entry targets register to the owner wrapper", [](TestCase &t) {
+         Function func;
+         func.name = "resume_owner";
+@@ -728,9 +796,10 @@ void register_code_generator_tests()
+         std::string registration = gen.generateFunctionRegistration({func}, {});
+         printGeneratedCode("resume entry targets register to the owner wrapper", registration);
+ 
+-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[2] = resume_owner_0x7000; // 0x7008") != std::string::npos,
++        const auto slots = registrationSlots(registration);
++        t.IsTrue(slots.at(2) == "resume_owner_0x7000",
+                  "resume entry pc should register to the owner wrapper");
+-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[3] = resume_owner_0x7000; // 0x700c") != std::string::npos,
++        t.IsTrue(slots.at(3) == "resume_owner_0x7000",
+                  "multiple resume pcs should register to the same owner wrapper");
+     });
+ 
+@@ -815,7 +884,7 @@ void register_code_generator_tests()
+         std::string registration = gen.generateFunctionRegistration({owner}, {});
+         printGeneratedCode("external mid-function entry can register to the owner wrapper", registration);
+ 
+-        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[1] = owner_0x5000; // 0x5004") != std::string::npos,
++        t.IsTrue(registrationSlots(registration).at(1) == "owner_0x5000",
+                  "mid-function external entry should register back to the owner wrapper");
+     });
+ 
