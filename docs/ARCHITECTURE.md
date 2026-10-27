@@ -56,8 +56,11 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0021` | Initialize and own the reserved IOP invocation stack once at reset, including its O32 argument home area. Physical RPC results retain the actual stack bytes; null pointers, unsupported aliases and unowned ranges remain errors. |
 | `0022` | Accept the optical driver's mode-zero read convention for explicit CD-ROM paths. Registered guest drivers retain priority; host and memory-card mode zero, writes and unmodeled option bits remain unsupported. |
 | `0023` | Include bounded IOP register, branch, pending-load and call-depth values in strict execution failures. Diagnostics read only the failed CPU state and do not access device memory or change execution. |
+| `0024` | Reuse freed IOP heap ranges without recycling lifetime identities; account separately for maximum contiguous and total free space. |
+| `0025` | Retire pending IOP loads before an import thunk enters a modeled service or original guest export. Arguments, results and return addresses retain their original instruction ordering. |
+| `0026` | Honor conventional optical open flags with existing read-only backing. Reject writes to owned read-only handles while preserving supplied guest exports for foreign handles. |
 
-The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly; its separate GS-cache CTest directory does not run that executable.
+The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly from the upstream source directory; its separate GS-cache CTest directory does not run that executable.
 
 The startup argument layout and syscall handoff were checked against the primary PS2SDK [startup header](https://ps2dev.github.io/ps2sdk/startup_8h_source.html) and [CRT source](https://ps2dev.github.io/ps2sdk/ee_2startup_2src_2crt0_8c_source.html), as well as the original executable's startup instructions. This supplies the default program name; a general multi-argument `ExecPS2` implementation is outside this correction.
 
