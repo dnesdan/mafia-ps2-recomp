@@ -1,0 +1,149 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -814,6 +814,17 @@
+ 
+             if (const auto import = imports.decode(cpu.pc))
+             {
++                // A linked IRX stub executes J <export> and its ordinal delay
++                // slot before entering the service. Retire a load from the
++                // caller's delay slot before replacing that thunk with either
++                // a modeled service or a jump to the actual guest export.
++                // https://ps2dev.github.io/ps2sdk/loadcore_8c_source.html (aLinkClient)
++                if (cpu.pendingLoad)
++                {
++                    if (cpu.pendingLoadReg != 0u)
++                        cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
++                    cpu.pendingLoad = false;
++                }
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 ++totalInstructions;
+                 ++totalCycles;
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -1259,6 +1259,113 @@
+                 "result write or cleanup corrupted a replacement allocation");
+     }
+ 
++    Irx importLoadProvider()
++    {
++        // Authored original guest export: return a0 + 1 immediately, so a
++        // delayed argument left pending by the import bridge is observable.
++        Irx image(0x20000u);
++        image.words(0u, {0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C040002u, 0x34840180u, jal(0x20114u), 0u,
++            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00001021u});
++        image.words(0x80u, {0x24820001u, 0x03E00008u, 0u});
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++            0x03E00008u, 0x24000006u, 0u, 0u});
++        image.words(0x180u, {0x41C00000u, 0u, 0x0101u, 0x69766572u, 0x00007765u,
++            0x20000u, 0x20000u, 0x20000u, 0x20080u, 0u});
++        return image;
++    }
++
++    uint32_t importLoadResult(bool delayed, uint32_t loadedRegister, bool guestExport)
++    {
++        Host host;
++        IopEmulator iop(host);
++        constexpr uint32_t sid = 0x34567890u;
++        if (guestExport)
++        {
++            const Irx provider = importLoadProvider();
++            require(iop.loadModuleImage("authored-load-provider", provider.bytes, nullptr, 0u).moduleId > 0,
++                    "authored import provider did not start");
++        }
++        Irx image = rpcServer(sid, 0u);
++        if (guestExport)
++            image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x69766572u, 0x00007765u,
++                0x03E00008u, 0x24000003u, 0u, 0u});
++        else
++            image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x63737973u, 0x0062696Cu,
++                0x03E00008u, 0x24000006u, 0u, 0u}); // sysclib:6, toupper
++        uint32_t pc = 0x300u;
++        emit(image, pc, 0x27BDFFE0u);
++        emit(image, pc, 0xAFBF001Cu);
++        constant(image, pc, 8u, 0x10450u);
++        constant(image, pc, 4u, loadedRegister == 4u ? uint32_t('x') : uint32_t('a'));
++        const uint32_t load = 0x8D000000u | (loadedRegister << 16u); // lw reg,0(t0)
++        if (delayed)
++        {
++            emit(image, pc, jal(0x10114u));
++            emit(image, pc, load);
++        }
++        else
++        {
++            emit(image, pc, load);
++            emit(image, pc, 0u);
++            emit(image, pc, jal(0x10114u));
++            emit(image, pc, 0u);
++        }
++        if (loadedRegister == 31u)
++        {
++            // The loaded link selects 0x10380 after the modeled service. A
++            // bridge that returns through stale RA runs this poison path.
++            constant(image, pc, 2u, 0xD00DF00Du);
++            emit(image, pc, 0x08000000u | (0x10380u >> 2u));
++            emit(image, pc, 0u);
++            pc = 0x380u;
++        }
++        constant(image, pc, 9u, 0x10400u);
++        emit(image, pc, 0xAD220000u); // sw v0,0(t1)
++        emit(image, pc, 0x01201021u); // return the actual reply buffer
++        emit(image, pc, 0x8FBF001Cu);
++        emit(image, pc, 0x27BD0020u);
++        emit(image, pc, 0x03E00008u);
++        emit(image, pc, 0u);
++        require(pc < 0x400u, "authored import callback overlaps its reply buffer");
++        image.words(0x450u, {loadedRegister == 31u ? 0x10380u :
++                            loadedRegister == 2u ? 0xD00DF00Du : uint32_t('a')});
++        require(iop.loadModuleImage("authored-import-load", image.bytes, nullptr, 0u).moduleId > 0,
++                "authored import consumer did not start");
++        uint32_t server = 0u, buffer = 0u, callback = 0u;
++        require(iop.getPacketRpcServer(sid, server, buffer, callback), "authored RPC server missing");
++        const auto result = iop.executePacketRpc(sid, server, 0u, {}, 4u);
++        return uint32_t(result[0]) | (uint32_t(result[1]) << 8u) |
++               (uint32_t(result[2]) << 16u) | (uint32_t(result[3]) << 24u);
++    }
++
++    void importPendingArgument()
++    {
++        require(importLoadResult(false, 4u, false) == uint32_t('A'), "ordinary import argument changed");
++        require(importLoadResult(true, 4u, false) == uint32_t('A'),
++                "modeled import observed a stale pending-load argument");
++    }
++
++    void importPendingResult()
++    {
++        require(importLoadResult(false, 2u, false) == uint32_t('A'), "ordinary modeled result changed");
++        require(importLoadResult(true, 2u, false) == uint32_t('A'),
++                "pending load overwrote the completed modeled import result");
++    }
++
++    void importPendingReturnAddress()
++    {
++        require(importLoadResult(true, 31u, false) == uint32_t('A'),
++                "modeled import returned through a stale pending-load link");
++    }
++
++    void importPendingGuestExport()
++    {
++        require(importLoadResult(false, 4u, true) == uint32_t('b'), "ordinary guest export argument changed");
++        require(importLoadResult(true, 4u, true) == uint32_t('b'),
++                "first guest export instruction observed a stale pending-load argument");
++    }
++
+     void returnDispositionAndCdvd()
+     {
+         for (uint16_t value : std::array<uint16_t, 5>{0u, 1u, 2u, 4u, 0xFFFFu})
+@@ -1291,6 +1398,10 @@
+         {"Arguments fail before RAM mutation", argumentPreflight},
+         {"Endless startup cannot become module success", nonReturningEntry},
+         {"Missing imports cannot become module success", missingImport},
++        {"Modeled imports retire pending argument loads before dispatch", importPendingArgument},
++        {"Modeled import results cannot be overwritten by an older pending load", importPendingResult},
++        {"Modeled imports return through the retired pending link register", importPendingReturnAddress},
++        {"Resolved guest exports observe loads retired by the import thunk", importPendingGuestExport},
+         {"Exceptions, bad PCs and yielding are not startup returns", exceptionAndBadPc},
+         {"Malformed ELF/relocations fail before commit; valid relocation executes", relocationAndImagePreflight},
+         {"ET_EXEC relocations and RELA reject unsupported semantics before commit", unsupportedRelocationForms},
