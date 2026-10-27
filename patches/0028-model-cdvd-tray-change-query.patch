@@ -1,0 +1,396 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -49,6 +49,11 @@
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_cdvd_tray_tests tests/iop_cdvd_tray_tests.cpp)
++    target_link_libraries(ps2_iop_cdvd_tray_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_cdvd_tray_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_cdvd_tray_tests COMMAND ps2_iop_cdvd_tray_tests)
++
+     add_executable(ps2_iop_ioman_file_tests tests/iop_ioman_file_tests.cpp)
+     target_link_libraries(ps2_iop_ioman_file_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_ioman_file_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -204,6 +204,7 @@
+             releaseFsvReadBuffer();
+             callback = {};
+             initialized = false;
++            trayChangePending = true;
+             readActive = false;
+             controllerReadError = false;
+             mediaMode = 0u;
+@@ -380,6 +381,16 @@
+                 // modes retain this service's initialized-media requirement.
+                 cpu.gpr[2] = a0 == 8u ? controllerReady() :
+                     !readActive && initialized && mediaAvailable() ? kCdvdReadyComplete : 6u;
++                return true;
++
++            case 14: // sceCdTrayReq(SCECdTrayCheck, u32 *change)
++                // Only the query is modeled. Opening/closing a physical tray
++                // requires controller transitions that this fixed-media device
++                // does not implement; keep those requests unresolved.
++                if (a0 != 2u)
++                    return false;
++                checkTrayChange(a1);
++                cpu.gpr[2] = 1u;
+                 return true;
+ 
+             case 24: // sceCdReadClock(sceCdCLOCK *)
+@@ -469,6 +480,25 @@
+         }
+ 
+     private:
++        void checkTrayChange(uint32_t destination)
++        {
++            const uint32_t segment = destination & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(destination);
++            if (destination == 0u || (destination & 3u) != 0u ||
++                (segment != 0u && segment != 0x80000000u && segment != 0xA0000000u) ||
++                physical >= IopMemory::RamSize || sizeof(uint32_t) > IopMemory::RamSize - physical ||
++                !memory.ownsRamRange(destination, sizeof(uint32_t)))
++                throw std::runtime_error("IOP CDVD tray-check destination is outside aligned complete owned RAM");
++
++            // PS2SDK cdvdman's mediactl(1) consumes observer 1's change latch.
++            // Its flags initialize to one; this is not a disc-present bit.
++            // The fixed-media model has no tray transitions between resets.
++            // Other observers (file search/read) must not consume this latch.
++            // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html#l06095
++            memory.write32(destination, trayChangePending ? 1u : 0u);
++            trayChangePending = false;
++        }
++
+         bool readClock(uint32_t destination)
+         {
+             constexpr size_t clockBytes = 8u;
+@@ -923,6 +953,7 @@
+         Callback callback;
+         std::optional<CompletionCallback> completionCallback;
+         bool initialized = false;
++        bool trayChangePending = true;
+         bool readActive = false;
+         bool controllerReadError = false;
+         uint32_t mediaMode = 0u;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -658,7 +658,11 @@
+             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 
+-            if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
++            // A supplied TrayReq export owns its own media-change observer and
++            // hardware behavior. The new modeled query is only its fallback.
++            if (iequals(call.library, "cdvdman") &&
++                (call.ordinal != 14u || imports.resolve(call.library, call.ordinal, call.version) == 0u) &&
++                cdvd.dispatchImport(call.ordinal, cpu))
+             {
+                 if (const auto callback = cdvd.takeCompletionCallback())
+                 {
+diff --git a/ps2xIOP/tests/iop_cdvd_tray_tests.cpp b/ps2xIOP/tests/iop_cdvd_tray_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_tray_tests.cpp
+@@ -0,0 +1,298 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/iop_emulator.h"
++#include "iop_compat_test_support.h"
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++
++    class TrayHost final : public IopHost
++    {
++    public:
++        explicit TrayHost(bool mounted = false) : present(mounted)
++        {
++            // A tiny authored sector image, never original disc data.
++            image[16u * 2048u] = 1u;
++            std::memcpy(image.data() + 16u * 2048u + 1u, "CD001", 5u);
++            image[16u * 2048u + 6u] = 1u;
++        }
++        bool readGuest(uint32_t, void *, size_t) const override { return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { ++guestWrites; return false; }
++        bool zeroGuest(uint32_t, size_t) override { ++guestWrites; return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind kind) const override
++        {
++            ++hostRequests;
++            return present && kind == HostPathKind::CdImage ? "authored-tray.iso" : std::string{};
++        }
++        std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            ++hostRequests;
++            return present && path == "authored-tray.iso" ? 1u : 0u;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            ++hostRequests;
++            size = image.size();
++            return present && handle == 1u;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination,
++                          size_t size, size_t &bytesRead) override
++        {
++            ++hostRequests;
++            bytesRead = 0u;
++            if (!present || handle != 1u || offset > image.size() || size > image.size() - offset)
++                return false;
++            std::memcpy(destination, image.data() + offset, size);
++            bytesRead = size;
++            return true;
++        }
++        void closeHostFile(uint64_t) override { ++hostRequests; }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        { return false; }
++        void log(LogLevel, std::string_view) override {}
++
++        bool present;
++        mutable size_t hostRequests = 0u;
++        size_t guestWrites = 0u;
++        std::array<uint8_t, 18u * 2048u> image{};
++    };
++
++    uint32_t call(IopCdvd &cdvd, uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u, uint32_t a2 = 0u)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[2] = 0xDEADBEEFu;
++        cpu.gpr[4] = a0;
++        cpu.gpr[5] = a1;
++        cpu.gpr[6] = a2;
++        require(cdvd.dispatchImport(ordinal, cpu), "authored CDVD import was unresolved");
++        return cpu.gpr[2];
++    }
++
++    void initialLatchConsumptionAndReset()
++    {
++        TrayHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        require(memory.zeroRam(0x10000u, 4u), "cannot initialize change output");
++        require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 1u,
++                "first check must consume the SDK's initial pending-change notification");
++        require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 0u,
++                "a second unchanged check must not repeat the change notification");
++        for (const uint32_t initMode : {0u, 5u})
++        {
++            (void)call(cdvd, 4u, initMode);
++            require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 0u,
++                    "driver initialization or exit must not manufacture a tray change");
++        }
++        cdvd.reset();
++        require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 1u,
++                "device reset did not restore the initial observer notification");
++        require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 0u,
++                "reset notification was not consumed exactly once");
++    }
++
++    void queryPreservesDiscControllerAndPendingCallback()
++    {
++        for (const bool mounted : {false, true})
++        {
++            TrayHost host(mounted);
++            IopMemory memory;
++            IopKernel kernel(memory);
++            IopCdvd cdvd(host, memory, kernel);
++            require(memory.zeroRam(0x10000u, 4u), "cannot initialize change output");
++            (void)call(cdvd, 4u);
++            require(call(cdvd, 12u) == (mounted ? 0x14u : 0u), "fixture backing has wrong disc type");
++            require(call(cdvd, 13u) == (mounted ? 2u : 6u), "fixture backing has wrong readiness");
++            (void)call(cdvd, 37u, 0x18000u);
++            (void)call(cdvd, 7u, 3u); // An existing completion must survive the tray query.
++            const uint32_t sector = memory.allocate(2048u);
++            require(sector != 0u && call(cdvd, 6u, 1000u, 1u, sector) == 0u,
++                    "authored out-of-image read did not establish a real controller error");
++            const uint32_t errorBefore = call(cdvd, 8u);
++            std::array<uint8_t, 3u> before{}, after{};
++            const std::array<uint32_t, 3u> ports{0x1F402005u, 0x1F40200Au, 0x1F40200Fu};
++            for (size_t i = 0u; i < ports.size(); ++i)
++                require(cdvd.readRegisterByte(ports[i], before[i]), "missing supported controller port");
++            const size_t hostRequests = host.hostRequests;
++            require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 1u &&
++                        host.hostRequests == hostRequests,
++                    "tray query inspected backing or confused notification with media presence");
++            for (size_t i = 0u; i < ports.size(); ++i)
++                require(cdvd.readRegisterByte(ports[i], after[i]), "controller port disappeared");
++            const auto callback = cdvd.takeCompletionCallback();
++            require(before == after && call(cdvd, 8u) == errorBefore && callback &&
++                        callback->address == 0x18000u && callback->reason == 4u &&
++                        !memory.takeDmaStart() && memory.interruptStatus() == 0u && host.guestWrites == 0u,
++                    "tray query changed controller/error/callback state or issued a transfer");
++            require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 0u,
++                    "unchanged media observer was rearmed by an unrelated read error");
++        }
++    }
++
++    void outputAliasesAndCanaries()
++    {
++        for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            TrayHost host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            IopCdvd cdvd(host, memory, kernel);
++            std::array<uint8_t, 8u> bytes{};
++            bytes.fill(0xA5u);
++            require(memory.writeRam(IopMemory::RamSize - bytes.size(), bytes.data(), bytes.size()),
++                    "cannot install final RAM canaries");
++            const uint32_t destination = IopMemory::RamSize - 4u;
++            require(call(cdvd, 14u, 2u, alias | destination) == 1u &&
++                        memory.read32(destination) == 1u && memory.read32(destination - 4u) == 0xA5A5A5A5u,
++                    "complete exact-end output alias was rejected or damaged adjacent storage");
++        }
++    }
++
++    void invalidOutputDoesNotConsumeOrPartiallyWrite()
++    {
++        for (const uint32_t address : {0u, 0x8000u, 0x10001u, 0x10010u, 0x200000u,
++                0x1FFFFDu, 0xA01FFFFFu, 0x20010000u, 0xC0010000u, 0xFFFFFFFFu,
++                0xBF800000u, 0xBF402005u, 0xBF801000u})
++        {
++            TrayHost host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            IopCdvd cdvd(host, memory, kernel);
++            require(memory.zeroRam(0x10000u, 8u) && memory.zeroRam(0x10010u, 3u) &&
++                        memory.zeroRam(IopMemory::RamSize - 8u, 8u), "cannot initialize output canaries");
++            const std::vector<uint8_t> before(memory.ram().begin(), memory.ram().end());
++            IopCpuState cpu{};
++            cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = 2u;
++            cpu.gpr[5] = address;
++            bool rejected = false;
++            try { (void)cdvd.dispatchImport(14u, cpu); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()).find("tray-check destination") != std::string_view::npos; }
++            require(rejected && cpu.gpr[2] == 0xDEADBEEFu && host.hostRequests == 0u &&
++                        std::equal(before.begin(), before.end(), memory.ram().begin()),
++                    "invalid output mutated RAM/return/device state or silently succeeded");
++            require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 1u,
++                    "failed validation consumed the pending change notification");
++        }
++    }
++
++    void unsupportedModesPreserveState()
++    {
++        TrayHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        require(memory.zeroRam(0x10000u, 4u), "cannot initialize query output");
++        for (const uint32_t mode : {0u, 1u, 3u, 0xFFFFFFFFu})
++        {
++            IopCpuState cpu{};
++            cpu.gpr[2] = 0xA1B2C3D4u;
++            cpu.gpr[4] = mode;
++            cpu.gpr[5] = 0xBF402005u; // No output access for unmodeled modes.
++            require(!cdvd.dispatchImport(14u, cpu) && cpu.gpr[2] == 0xA1B2C3D4u &&
++                        host.hostRequests == 0u && host.guestWrites == 0u,
++                    "unsupported tray motion or mode was consumed by the model");
++        }
++        require(call(cdvd, 14u, 2u, 0x10000u) == 1u && memory.read32(0x10000u) == 1u,
++                "unsupported request changed the query latch");
++    }
++
++    iop_test::Irx trayConsumer(uint32_t mode)
++    {
++        iop_test::Irx image;
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0x3C040000u | (mode >> 16u), 0x34840000u | (mode & 0xFFFFu),
++            0x3C050001u, 0x34A50400u, 0x0C004045u, 0u,
++            0x3C080001u, 0xAD020404u, 0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00001021u,
++        });
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x64766463u, 0x006E616Du,
++            0x03E00008u, 0x2400000Eu, 0u, 0u});
++        image.words(0x400u, {0xAABBCCDDu, 0x11223344u});
++        return image;
++    }
++
++    void authoredImportCompletesTheQuery()
++    {
++        TrayHost host;
++        IopEmulator iop(host);
++        const auto image = trayConsumer(2u);
++        const auto result = iop.loadModuleImage("authored-tray-check", image.bytes, nullptr, 0u);
++        std::array<uint32_t, 2u> reply{};
++        require(result.moduleId > 0 && result.startResult == 0 &&
++                    iop.readMemory(0x10400u, reply.data(), sizeof(reply)) && reply[0] == 1u && reply[1] == 1u,
++                "real authored MIPS import did not write initial change and successful completion");
++    }
++
++    void strictUnsupportedModesStillFault()
++    {
++        for (const uint32_t mode : {0u, 1u, 3u, 0xFFFFFFFFu})
++        {
++            TrayHost host;
++            IopEmulator iop(host);
++            const auto image = trayConsumer(mode);
++            bool rejected = false;
++            try { (void)iop.loadModuleImage("authored-unmodeled-tray", image.bytes, nullptr, 0u); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()).find("missing import cdvdman:14") != std::string_view::npos; }
++            require(rejected, "strict execution fabricated success for an unmodeled tray operation");
++        }
++    }
++
++    void suppliedExportKeepsPrecedence()
++    {
++        for (const uint32_t mode : {0u, 2u})
++        {
++            iop_test::Irx provider(0x20000u);
++            provider.words(0u, {0x27BDFFE0u, 0xAFBF001Cu, 0x3C040002u, 0x34840180u,
++                0x0C008045u, 0u, 0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00001021u});
++            provider.words(0x80u, {0x3C08C001u, 0x3508CAFEu, 0xACA80000u,
++                0x03E00008u, 0x24021234u});
++            provider.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++                0x03E00008u, 0x24000006u, 0u, 0u});
++            provider.words(0x180u, {0x41C00000u, 0u, 0x0101u, 0x64766463u, 0x006E616Du,
++                0x20000u, 0x20000u, 0x20000u, 0x20000u, 0x20000u, 0x20000u, 0x20000u,
++                0x20000u, 0x20000u, 0x20000u, 0x20000u, 0x20000u, 0x20000u, 0x20000u,
++                0x20080u, 0u});
++            TrayHost host;
++            IopEmulator iop(host);
++            const auto consumer = trayConsumer(mode);
++            require(iop.loadModuleImage("authored-tray-provider", provider.bytes, nullptr, 0u).moduleId > 0 &&
++                        iop.loadModuleImage("authored-tray-consumer", consumer.bytes, nullptr, 0u).moduleId > 0,
++                    "authored supplied export fixtures failed to start");
++            std::array<uint32_t, 2u> reply{};
++            require(iop.readMemory(0x10400u, reply.data(), sizeof(reply)) &&
++                        reply[0] == 0xC001CAFEu && reply[1] == 0x1234u,
++                    "modeled tray query shadowed the compatible supplied original export");
++        }
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Tray observer reports initial change once and resets with the device", initialLatchConsumptionAndReset},
++        {"Tray query preserves media controller errors and pending callbacks", queryPreservesDiscControllerAndPendingCallback},
++        {"Tray output accepts complete aligned RAM aliases without adjacent writes", outputAliasesAndCanaries},
++        {"Invalid tray output faults before writes or observer consumption", invalidOutputDoesNotConsumeOrPartiallyWrite},
++        {"Unmodeled tray modes leave arguments and observer state untouched", unsupportedModesPreserveState},
++        {"Authored IOP import returns the change notification and completion", authoredImportCompletesTheQuery},
++        {"Unmodeled tray operations remain strict missing imports", strictUnsupportedModesStillFault},
++        {"Compatible supplied tray exports retain actual guest execution", suppliedExportKeepsPrecedence},
++    };
++    return iop_test::run(tests);
++}

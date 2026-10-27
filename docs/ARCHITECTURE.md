@@ -60,6 +60,7 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0025` | Retire pending IOP loads before an import thunk enters a modeled service or original guest export. Arguments, results and return addresses retain their original instruction ordering. |
 | `0026` | Honor conventional optical open flags with existing read-only backing. Reject writes to owned read-only handles while preserving supplied guest exports for foreign handles. |
 | `0027` | Own EE callback stacks outside application stacks and heaps; preserve the original kernel-patch workspace, check aliases and declared ranges, and coordinate stack leases with scheduler reset and owner lifetime. |
+| `0028` | Implement the CDVDMAN mode-2 tray-change query with a consumed notification, validated output and original guest-export precedence. Physical tray motion remains unresolved. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly from the upstream source directory; its separate GS-cache CTest directory does not run that executable.
 
@@ -68,6 +69,16 @@ The startup argument layout and syscall handoff were checked against the primary
 The SIF boundary recognizes the published command route and `ERT | INT_O` framing defined by the PS2SDK [DMA header](https://ps2dev.github.io/ps2sdk/sifdma_8h_source.html) and [EE command implementation](https://ps2dev.github.io/ps2sdk/ee_2kernel_2src_2sifcmd_8c_source.html). It is scoped to that negotiated path. Patches after `0006` replace its diagnostic stop with supported transport: readiness follows endpoint/service initialization, and the original guest handler consumes replies and updates its own software registers.
 
 IOP reset is explicitly modeled. The runtime parses the supplied replacement image, resets its owned kernel/allocator and starts the original LOADFILE, CDVDFSV and FILEIO service modules. Their entry functions must return resident and register actual RPC servers within a bounded interval. This is not execution of a PS2 ROM boot sequence; neither a guessed firmware entry nor a host stub is reported as an executed original service. Strict loads retain original import and module-start failures as errors.
+
+The CDVDMAN tray check follows the original driver and the primary
+[PS2SDK implementation](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdman/src/cdvdman.c).
+Mode 2 consumes observer 1's change notification: the initial query writes one,
+later unchanged queries write zero, and a completed query returns one regardless
+of disc presence. Reset restores the notification; ordinary initialization,
+file reads and searches do not consume or rearm it. Output validation occurs
+before state changes. The modeled fixed-media device does not perform physical
+tray opening or closing; those modes retain the original export or strict
+unsupported path.
 
 ## Runtime and platform
 
