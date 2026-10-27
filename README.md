@@ -2,7 +2,7 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable, targeting Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: bring-up, not a playable release.** Read [the verified progress report](docs/PROGRESS.md) for the latest execution result. A successful parser, translation or synthetic test is never counted as successful game initialization.
+**Status: original-entry bring-up, not a playable release.** The complete translated program builds on Linux, loads the original ELF and reaches the original `main`; initialization stops with an explicit error at the missing upstream SIF/IOP packet path. The native host and runtime also build and pass synthetic application tests on ARM64 macOS. Read [the verified progress report](docs/PROGRESS.md) for exact execution evidence and remaining work.
 
 ## Build from your own disc
 
@@ -20,7 +20,7 @@ Bootstrap reads `SYSTEM.CNF`, verifies the boot ELF, extracts the disc locally, 
 
 The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA-256 in [the profile](profiles/slus-20671.json). Other builds fail with their observed hash so they can receive separate profiles. A matching filename is insufficient.
 
-`MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and testing it on Apple Silicon are separate milestones. F11 toggles fullscreen. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio; no substitute title scene is included.
+`MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and running the original game corpus on Apple Silicon remain separate milestones. F11 toggles fullscreen. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio; no substitute title scene is included.
 
 For a bounded headless run after building:
 
@@ -48,7 +48,7 @@ bash tools/test.sh
 
 `tools/recompile.sh` supports `--elf`, `--work`, `--upstream`, `--tools-build` and an optional external `--function-map`. By default it exports the retained function symbols plus reviewed boot-code boundaries. It uses PS2Recomp's CSV format without claiming that Ghidra was run. For a stripped executable, obtain reviewed boundaries with upstream's `ps2xRecomp/tools/ghidra/ExportPS2Functions.java` and create an exact build profile first.
 
-CI runs source-only Python/C++ tests and synthetic runtime contracts on Linux and ARM64 macOS. It never downloads or uploads commercial fixtures. Runtime tests exercise the actual PS2Recomp library; game milestones require separate evidence from the original program.
+CI runs source-only Python/C++ tests and synthetic runtime contracts on Linux and ARM64 macOS. Its separate `MafiaHostContract.app` compiles the real native host with an authored test ELF and checks ARM64 architecture, bundle metadata, input verification and entry dispatch. It never downloads or uploads commercial fixtures. Game milestones require separate evidence from the original program.
 
 ## Design and license
 

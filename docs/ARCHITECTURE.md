@@ -44,8 +44,15 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0001` | Unknown syscall/TODO services throw under `MissingFunctionPolicy::Stop`. R5900 ADD/SUB/DADD/DSUB/DADDI/DADDIU use defined unsigned arithmetic before overflow decisions. Two upstream fixtures bind the scheduler context they invoke; runtime assertions remain enabled. |
 | `0002` | `auto_bind_runtime_calls=false` disables implicit known-name stubs and relocation-based host calls. The default remains compatible with upstream. Explicit stub selection still works; actual SYSCALL routing remains intact. |
 | `0003` | Adjacent table slots with the same function are emitted as `std::fill_n`. Holes, precedence and owner transitions remain identical. This reduces the measured registration source from 52,745,043 to 3,983,745 bytes; every original slot was compared. |
+| `0004` | Strict return dispatch accepts the scheduler's zero return-address sentinel only for its active callback context. Invalid transfers are checked before a scheduler yield; unmapped invocation PCs remain errors. The original game's first syscall callback exposed this generic runtime inconsistency. |
+| `0005` | `SetupThread` supplies the default executable argument through the original 324-byte startup ABI. The guest path comes from configured CD/host roots; bounds, aliases, version suffixes and payload limits are checked before mutation. The game's original `argc == 1` assertion remains intact. |
+| `0006` | Strict mode rejects the negotiated guest SIF command path with packet and missing-transport diagnostics before any descriptor in the batch commits. Full physical RAM/scratchpad bounds prevent descriptor or payload wrapping; valid aliases and ordinary DMA remain supported. This exposes the missing IOP packet receiver, bootstrap RPC services and guest interrupt replies; it does not implement them. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly; its separate GS-cache CTest directory does not run that executable.
+
+The startup argument layout and syscall handoff were checked against the primary PS2SDK [startup header](https://ps2dev.github.io/ps2sdk/startup_8h_source.html) and [CRT source](https://ps2dev.github.io/ps2sdk/ee_2startup_2src_2crt0_8c_source.html), as well as the original executable's startup instructions. This supplies the default program name; a general multi-argument `ExecPS2` implementation is outside this correction.
+
+The SIF boundary recognizes the published command route and `ERT | INT_O` framing defined by the PS2SDK [DMA header](https://ps2dev.github.io/ps2sdk/sifdma_8h_source.html) and [EE command implementation](https://ps2dev.github.io/ps2sdk/ee_2kernel_2src_2sifcmd_8c_source.html). It is scoped to that negotiated path, not a detector for every custom DMA protocol. Readiness must eventually follow real IOP initialization and replies delivered through the original guest handler.
 
 ## Runtime and platform
 
@@ -59,6 +66,8 @@ macOS builds request `arm64`, reject Rosetta and verify the produced Mach-O arch
 
 ## Evidence
 
-The host reports input verification, ELF loading and actual original-entry invocation separately. Window presentations and hardware counters are diagnostic values, not proof of a correct game frame. Failures retain the stage, guest PC and error; `symbolize_report.py` resolves that PC against the exact input ELF.
+The host reports input verification, ELF loading and actual original-entry invocation separately. Window presentations and hardware counters are diagnostic values, not proof of a correct game frame. Failures retain the stage, guest PC, last branch source and error; `symbolize_report.py` resolves addresses against the exact input ELF.
 
 Tests use constructed input bytes. They cover malformed discs/ELFs, source provenance, real runtime memory/scheduling, missing dispatch and upstream instruction regressions. PCSX2 differential tests, visual/audio comparisons, mission completion and Apple Silicon performance measurements require the original game running in both environments; none is inferred from unit-test totals.
+
+`MafiaHostContract` compiles the same native application entry code with a small authored ELF and test function table. It checks input rejection, validation versus execution, strict-stop reports and the ARM64 `.app` bundle. It is a test executable, is not installed, and contains no game corpus.

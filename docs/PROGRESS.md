@@ -24,7 +24,7 @@ GNU `readelf`/`nm` and the checked Python parser inspected the actual ELF. LLVM 
 
 ## Static translation
 
-PS2Recomp revision: `e5636981a1c9de368f6b71e819c3dc188dfedbf4`, with the three reviewed generic patches in this repository.
+PS2Recomp revision: `e5636981a1c9de368f6b71e819c3dc188dfedbf4`, with the reviewed generic patches in this repository. Runtime-only corrections preserve the generated corpus; their provenance records explicitly distinguish them from a new translation.
 
 | Check | Result |
 | --- | --- |
@@ -37,7 +37,7 @@ PS2Recomp revision: `e5636981a1c9de368f6b71e819c3dc188dfedbf4`, with the three r
 | Named native SDK replacements / silent placeholders | 0 / 0 |
 | Manifest SHA-256 | `ae9f147aedbf649ab7f0dc4b862269a9d3085dd960724c3ed6938dbaaa8056a9` |
 
-The first unbounded analyzer attempt interpreted WAX data as code and implicitly replaced 296 functions. That diagnostic output was discarded. The final corpus uses verified symbol extents and explicit opt-out of automatic host bindings.
+The initial analyzer swept WAX data as code; the following diagnostic recompile also auto-bound 296 functions. That diagnostic output was excluded from the build. The final corpus uses verified symbol extents and explicit opt-out of automatic host bindings.
 
 Registration compaction preserved all 499,431 non-null function-table slots, the 1,004,839-slot table bounds, holes and owners. Expanding the compact representation yielded the same ordered mapping digest: `0e4c8288fc46962060fca25e307c5a127e6009d66d81f8866bac58913cbb6b02`.
 
@@ -45,25 +45,50 @@ Registration compaction preserved all 499,431 non-null function-table slots, the
 
 | Milestone | Current evidence |
 | --- | --- |
-| A — inspect actual ELF | Verified; runtime loading is pending completion of the native build. |
-| B — execute original entry | Pending. Synthetic scheduler entry tests are separate evidence. |
+| A — inspect and load actual ELF | Verified by the native Linux process after independent SHA-256/header checks. |
+| B — execute original entry | Verified: original `_start` at `0x00100008` executes and reaches original `main`. |
 | C — complete game initialization | Not verified. |
 | D — genuine game frame | Not verified. |
 | E–L — menus, missions, player, vehicles, objectives, saves and all modes | Not verified. |
 
-The full generated corpus is being compiled into the native Linux diagnostic host. This report will record its actual return status and guest PC before the milestone is finalized. macOS has an ARM64 CMake/app configuration and source-only CI; no macOS game binary or performance result is claimed.
+All 7,791 translated functions compiled and linked into the native Linux diagnostic executable (GCC 13.3, `-O0 -g0`, unity batches of 32). The complete original game corpus has not been built or run on macOS. ARM64 CI builds the pinned analyzer/recompiler and tests the actual runtime without commercial input.
+
+The first original execution exposed strict return dispatch rejecting the scheduler's callback-completion sentinel: `JR $ra` in `kFindAddress`, source `0x0040E288`, target zero. The runtime's own syscall override invocation supplies that zero return address. Patch `0004` accepts only the exact active invocation's Return-to-zero; it does not permit arbitrary zero branches or replace the game callback.
+
+After this correction, a bounded run reached `main` and exited 124 at the ten-second deadline, with guest PC `0x003773B4` and last branch source `0x003773AC`. Original instructions and string data identify the `argc == 1` assertion (`Main.cpp`, line 2756), followed by a deliberate infinite loop. `SetupThread` left the original argument block empty. Patch `0005` supplies the real configured executable argument through that syscall; the original assertion now passes without a game-code change.
+
+The next run with final patches `0001`–`0005` reached `sceSifInitRpc`, timing out at guest PC `0x00407DC8`; the recorded last branch `0x00407560` is the return from `sceSifGetSreg`. The original code sends `INIT_CMD` (`0x80000002`, option 1) and waits for software SREG 0 in guest RAM. This is an SIF/IOP initialization wait, not a graphics failure. DMA/GIF/GS/VIF hardware counters and presentations were zero; these counters do not count every high-level syscall transfer.
+
+The pinned upstream copies EE command data into IOP memory but does not consume these packets through `IopRpcBridge::onSifTransfer`. The return route does not deliver them through the original guest EE DMAC5 command handler. IOP bootstrap RPC providers for module loading and heap allocation are also absent after reset. A correct next implementation needs that transport, guest interrupt delivery and initialized providers before it may advertise RPC readiness. Directly setting the game's SREG word would conceal these missing paths. Initialization and a genuine frame remain unverified.
+
+Patch `0006` makes the unsupported negotiated command path fail before copying or acknowledging it. The final original-program run with all six patches produced a fresh report and exited 1 in 0.515 seconds, at the earlier `INIT_CMD` option 0 handshake:
+
+| Final run observation | Recorded value |
+| --- | --- |
+| Input / entry | Exact ELF hash verified; ELF loaded; original entry executed |
+| Last guest PC / symbol | `0x004057E8` / `sceSifSetDma` |
+| Last branch source / symbol | `0x004079E4` / `_sceSifSendCmd` |
+| SIF command | `cid=0x80000002`, `option=0`, `src=0x005366C0`, `dst=0`, `size=20`, `attr=0x44` |
+| Actual error | `Unsupported guest SIF command DMA`; missing IOP command receiver, packet-RPC/bootstrap services and replies through the guest EE DMAC handler |
+| Frame / gameplay | Zero presentations; neither verified |
+| Linux executable SHA-256 | `b99d73ed6a58b9bcdeb4131dfecd2d66d95d30d2a5d6b7fa8bbd09bc2103ca60` |
+
+The final executable is 223,758,376 bytes. Its local provenance records the six patch hashes, unchanged generated-source manifest, verified compiler binaries and build configuration. Runtime-only changes required a relink without retranslating or editing the original game functions. The new SIF regressions check failure before any batch mutation, packet framing, ordinary-DMA compatibility and full descriptor-list memory bounds. This is a diagnosed implementation gap, not completed SIF support.
 
 ## Executed checks
 
 | Suite | Observed result |
 | --- | --- |
-| Patched upstream `ps2x_tests` | 450 passed, 0 failed |
+| Patched upstream `ps2x_tests` | 465 passed, 0 failed, including callback/checkpoint, eight startup-argument regressions and four SIF command/range regressions |
 | Upstream GS-cache CTest suite | 45 passed, 0 failed |
 | Real emitted integer arithmetic with UBSan | 68 cases passed |
-| Python disc/ELF/profile/generation tests | 72 passed before the final build-provenance additions |
-| Native host contracts | SHA-256/ELF verification, actual runtime memory/scheduler/missing dispatch, generated-source integrity and bounded worker shutdown passed on Linux |
+| Python disc/ELF/profile/generation/report tests | 118 passed, 0 failed |
+| Native host/runtime contracts | Five CTests passed on Linux and ARM64 macOS, including the actual host entry with synthetic input |
+| ARM64 macOS tools / emitted arithmetic | Pinned analyzer/recompiler build and all 68 UBSan cases passed in GitHub Actions |
 
-Independent reviews found and fixed extraction races/traversal, incomplete ELF entry backing, section-boundary overreach, destructive report-path collisions, stale tool provenance, implicit SDK substitutions, silent generated placeholders, scheduler ownership, exception-path shutdown and ignored extra compiler inputs. New checks are being consolidated before publication.
+Three independent review passes covered correctness/architecture, memory/undefined behavior/portability and performance/maintainability/test coverage. Findings fixed include extraction races/traversal, incomplete ELF entry backing, section-boundary overreach, destructive report-path collisions, stale tool provenance, implicit SDK substitutions, silent generated placeholders, scheduler ownership, exception-path shutdown, ignored extra compiler inputs and SIF descriptor overreads.
+
+CI also exposed a macOS temporary-path alias in a fixture, optional libdwarf compression dependencies in the arithmetic harness and `mkdtemp` declaration visibility in the actual native host. All four Linux/ARM64 jobs passed in [Actions run 4](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40524142173), including the full synthetic host contract and patches `0001`–`0005`. The macOS runner was `macos-15-arm64`, macOS 15.7.9, Xcode 16.4; its test bundle was verified as ARM64. Patch `0006` additionally passed the full local upstream suite; its final CI status is recorded on the pull request.
 
 ## Reproduce and continue
 
@@ -78,4 +103,6 @@ bash tools/run_macos.sh --elf .work/extracted/SLUS_206.71 \
 python3 tools/symbolize_report.py .work/runtime.json --elf .work/extracted/SLUS_206.71
 ```
 
-Next milestones require actual original-entry execution, resolving its first genuine subsystem failure, complete disc access, verified initialization and first frame, then deterministic PCSX2 comparisons. Apple Silicon execution, media correctness, controller/gameplay behavior, save/load, all missions and performance are still open. No screenshots, FPS figures or gameplay success are inferred from compilation.
+The next runtime milestone is a real SIF command endpoint with initialization-derived readiness, packet RPC dispatch, replies through the armed EE SIF0 buffer and DMAC5 guest handler, and loadfile/heap RPC providers backed by the real module loader and allocator. Regressions must cover ordering, reset/reinitialization, queues, disabled or unregistered interrupts and bounded packets; guest SREG readiness must change through the original handler.
+
+Further milestones require complete disc access, verified initialization and a first frame, then deterministic PCSX2 comparisons. Apple Silicon game execution, media correctness, controller/gameplay behavior, save/load, all missions and performance are still open. No screenshots, FPS figures or gameplay success are inferred from compilation.

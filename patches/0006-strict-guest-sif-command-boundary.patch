@@ -1,0 +1,487 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975edb5ab723fe078ad8d4641079ec47aa82e5..fc19ba73d7d0d8504f595f288654db984c5932c8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -7,7 +7,8 @@
+ 
+ #include <algorithm>
+ #include <cstring>
+-#include <limits>
++#include <sstream>
++#include <stdexcept>
+ #include <vector>
+ 
+ namespace ps2_stubs
+@@ -81,9 +82,9 @@ namespace ps2_stubs
+         uint32_t g_sifSetRegLogCount = 0u;
+ 
+         constexpr uint32_t kSifRegBootStatus = 0x4u;
+-        constexpr uint32_t kSifRegMainAddr = 0x80000000u;
+-        constexpr uint32_t kSifRegSubAddr = 0x80000001u;
+-        constexpr uint32_t kSifRegMsCom = 0x80000002u;
++        constexpr uint32_t kSifSysregSubAddr = 0x80000000u;
++        constexpr uint32_t kSifSysregMainAddr = 0x80000001u;
++        constexpr uint32_t kSifSysregRpcInit = 0x80000002u;
+         constexpr uint32_t kSifBootReadyMask = 0x00020000u;
+ 
+         void seedDefaultSifRegsLocked()
+@@ -98,9 +99,9 @@ namespace ps2_stubs
+             g_sifSetRegLogCount = 0u;
+ 
+             g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
+-            g_sifRegs[kSifRegMainAddr] = 0u;
+-            g_sifRegs[kSifRegSubAddr] = 0u;
+-            g_sifRegs[kSifRegMsCom] = 0u;
++            g_sifRegs[kSifSysregSubAddr] = 0u;
++            g_sifRegs[kSifSysregMainAddr] = 0u;
++            g_sifRegs[kSifSysregRpcInit] = 0u;
+         }
+ 
+         bool shouldTraceSifReg(uint32_t reg)
+@@ -138,31 +139,6 @@ namespace ps2_stubs
+             return id;
+         }
+ 
+-        bool isCopyableGuestAddress(uint32_t addr)
+-        {
+-            if (Ps2AddressInRange(addr, PS2_SCRATCHPAD_BASE, PS2_SCRATCHPAD_SIZE))
+-            {
+-                return true;
+-            }
+-
+-            if (addr < PS2_EE_UNCACHED_RAM_MIRROR_BASE)
+-            {
+-                return true;
+-            }
+-
+-            if (Ps2IsUncachedRamMirrorAddress(addr))
+-            {
+-                return true;
+-            }
+-
+-            if (Ps2IsKseg01Address(addr))
+-            {
+-                return true;
+-            }
+-
+-            return false;
+-        }
+-
+         bool canAccessEeRange(const uint8_t *rdram, uint32_t address, uint32_t sizeBytes)
+         {
+             if (!rdram)
+@@ -173,19 +149,27 @@ namespace ps2_stubs
+             {
+                 return true;
+             }
+-            if (sizeBytes - 1u > std::numeric_limits<uint32_t>::max() - address)
++            // The generic guest pointer helper masks out-of-RAM addresses.
++            // Validate the whole physical range before using it so DMA cannot
++            // wrap across RAM/scratchpad boundaries or access hardware as RAM.
++            if (ps2IsScratchpadAddress(address))
+             {
+-                return false;
++                const uint32_t offset = ps2ScratchpadOffset(address);
++                return sizeBytes <= PS2_SCRATCHPAD_SIZE &&
++                       offset <= PS2_SCRATCHPAD_SIZE - sizeBytes &&
++                       ps2GetScratchpadHostPtr() != nullptr;
+             }
+-            for (uint32_t i = 0u; i < sizeBytes; ++i)
++
++            uint32_t physical = address;
++            if (Ps2IsUncachedRamMirrorAddress(address) || Ps2IsKseg01Address(address))
+             {
+-                const uint32_t byteAddress = address + i;
+-                if (!isCopyableGuestAddress(byteAddress) || getConstMemPtr(rdram, byteAddress) == nullptr)
+-                {
+-                    return false;
+-                }
++                physical = Ps2DirectMappedPhysicalAddress(address);
+             }
+-            return true;
++            else if (address >= PS2_RAM_SIZE)
++            {
++                return false;
++            }
++            return sizeBytes <= PS2_RAM_SIZE && physical <= PS2_RAM_SIZE - sizeBytes;
+         }
+ 
+         bool readEeRange(const uint8_t *rdram, uint32_t address, void *destination, uint32_t sizeBytes)
+@@ -203,6 +187,69 @@ namespace ps2_stubs
+             return true;
+         }
+ 
++        void rejectUnsupportedGuestCommandDma(const uint8_t *rdram, PS2Runtime *runtime,
++                                               const Ps2SifDmaTransfer &transfer)
++        {
++            if (!runtime || runtime->missingFunctionPolicy() != PS2Runtime::MissingFunctionPolicy::Stop)
++                return;
++
++            // PS2SDK ee/kernel/include/sifdma.h and ee/kernel/src/sifcmd.c:
++            // command packets use ERT (0x40) | INT_O (0x4) and the negotiated
++            // IOP command destination. An interrupt bit alone is not a command.
++            constexpr uint32_t kCommandAttributes = 0x44u;
++            if ((static_cast<uint32_t>(transfer.attr) & kCommandAttributes) != kCommandAttributes)
++                return;
++            {
++                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
++                const auto destination = g_sifRegs.find(kSifSysregSubAddr);
++                const auto commandData = g_sifRegs.find(kSifSysregMainAddr);
++                if (destination == g_sifRegs.end() || transfer.dest != destination->second ||
++                    commandData == g_sifRegs.end() || commandData->second == 0u)
++                    return;
++            }
++
++            std::array<uint8_t, 16> header{};
++            const bool readableHeader = transfer.size >= static_cast<int32_t>(header.size()) &&
++                                        readEeRange(rdram, transfer.src, header.data(), header.size());
++            const auto word = [&](size_t offset)
++            {
++                return static_cast<uint32_t>(header[offset]) |
++                       (static_cast<uint32_t>(header[offset + 1u]) << 8u) |
++                       (static_cast<uint32_t>(header[offset + 2u]) << 16u) |
++                       (static_cast<uint32_t>(header[offset + 3u]) << 24u);
++            };
++            const uint32_t packetSize = word(0u) & 0xFFu;
++            const uint32_t commandId = word(8u);
++            const uint32_t option = word(12u);
++            const char *malformed = nullptr;
++            if (!readableHeader)
++                malformed = "incomplete or unreadable 16-byte header";
++            else if (packetSize < 16u || packetSize > 112u || packetSize > static_cast<uint32_t>(transfer.size))
++                malformed = "packet size is outside 16..112 bytes or exceeds the DMA descriptor";
++            else if (static_cast<uint32_t>(transfer.size) > ((packetSize + 15u) & ~15u))
++                malformed = "DMA descriptor exceeds the packet and its quadword padding";
++            else if (!canAccessEeRange(rdram, transfer.src, static_cast<uint32_t>(transfer.size)))
++                malformed = "DMA source range is not readable EE memory";
++            else if (commandId == 0x80000002u && option == 0u && packetSize < 20u)
++                malformed = "INIT_CMD option 0 lacks its EE receive-buffer address";
++            else if (commandId == 0x80000001u && packetSize < 24u)
++                malformed = "SET_SREG lacks its register index/value";
++
++            std::ostringstream message;
++            message << (malformed ? "Malformed" : "Unsupported") << " guest SIF command DMA: cid=";
++            if (readableHeader)
++                message << "0x" << std::hex << commandId << " option=0x" << option;
++            else
++                message << "unavailable";
++            message << " src=0x" << std::hex << transfer.src << " dst=0x" << transfer.dest
++                    << " size=" << std::dec << transfer.size << " attr=0x" << std::hex << transfer.attr;
++            if (malformed)
++                message << "; " << malformed;
++            message << "; IOP command packet receiver, packet-RPC/bootstrap services, and replies through the guest EE DMAC handler are not implemented; "
++                       "the legacy host SIF stubs do not provide this packet path";
++            throw std::runtime_error(message.str());
++        }
++
+         bool writeEeRange(uint8_t *rdram, uint32_t address, const void *source, uint32_t sizeBytes)
+         {
+             if ((!source && sizeBytes != 0u) || !canAccessEeRange(rdram, address, sizeBytes))
+@@ -631,6 +678,13 @@ namespace ps2_stubs
+         const uint32_t dmatAddr = getRegU32(ctx, 4);
+         const uint32_t count = getRegU32(ctx, 5);
+ 
++        if (!dmatAddr || count == 0u || count > 32u ||
++            !canAccessEeRange(rdram, dmatAddr, count * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer))))
++        {
++            setReturnS32(ctx, 0);
++            return;
++        }
++
+         const uint32_t listAddr = getRegU32(ctx, 4);
+         PS2_IF_AGRESSIVE_LOGS({
+             std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
+@@ -641,44 +695,39 @@ namespace ps2_stubs
+ 
+             for (uint32_t i = 0; i < count; ++i)
+             {
+-                const uint32_t desc = listAddr + i * 16;
+-                const uint32_t src = READ32(desc + 0);
+-                const uint32_t dst = READ32(desc + 4);
+-                const uint32_t size = READ32(desc + 8);
+-                const uint32_t attr = READ32(desc + 12);
++                const uint32_t desc = listAddr + i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer));
++                Ps2SifDmaTransfer transfer{};
++                if (!readEeRange(rdram, desc, &transfer, sizeof(transfer)))
++                    break;
+ 
+                 std::cerr << "[sceSifSetDma:DESC] i=" << i
+-                          << " src=0x" << std::hex << src
+-                          << " dst=0x" << dst
+-                          << " size=0x" << size
+-                          << " attr=0x" << attr
++                          << " src=0x" << std::hex << transfer.src
++                          << " dst=0x" << transfer.dest
++                          << " size=0x" << transfer.size
++                          << " attr=0x" << transfer.attr
+                           << " pc=0x" << ctx->pc
+                           << " ra=0x" << getRegU32(ctx, 31)
+                           << std::dec << std::endl;
+             }
+         });
+ 
+-        if (!dmatAddr || count == 0u || count > 32u)
+-        {
+-            setReturnS32(ctx, 0);
+-            return;
+-        }
+-
+         std::array<Ps2SifDmaTransfer, 32u> pending{};
+         uint32_t pendingCount = 0u;
+         bool ok = true;
+         for (uint32_t i = 0; i < count; ++i)
+         {
+             const uint32_t entryAddr = dmatAddr + (i * static_cast<uint32_t>(sizeof(Ps2SifDmaTransfer)));
+-            const uint8_t *entry = getConstMemPtr(rdram, entryAddr);
+-            if (!entry)
++            Ps2SifDmaTransfer xfer{};
++            if (!readEeRange(rdram, entryAddr, &xfer, sizeof(xfer)))
+             {
+                 ok = false;
+                 break;
+             }
+ 
+-            Ps2SifDmaTransfer xfer{};
+-            std::memcpy(&xfer, entry, sizeof(xfer));
++            // Inspect the entire descriptor batch before copying any bytes or
++            // reporting completion. A later unsupported command cannot allow
++            // an earlier ordinary transfer to partially commit.
++            rejectUnsupportedGuestCommandDma(rdram, runtime, xfer);
+             if (xfer.size <= 0)
+             {
+                 continue;
+diff --git a/ps2xTest/src/ps2_sif_dma_tests.cpp b/ps2xTest/src/ps2_sif_dma_tests.cpp
+index f2a869fc33cb4f6c1fad8042db1178589b2879f5..e9b2dc9579f0ef40107dff67d88a4e8d05665e2f 100644
+--- a/ps2xTest/src/ps2_sif_dma_tests.cpp
++++ b/ps2xTest/src/ps2_sif_dma_tests.cpp
+@@ -10,6 +10,8 @@
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
++#include <stdexcept>
++#include <string>
+ #include <vector>
+ 
+ namespace ps2_stubs
+@@ -86,6 +88,40 @@ namespace
+         return value;
+     }
+ 
++    void configureGuestCommandRoute(TestEnv &env, uint32_t iopDestination)
++    {
++        // EE sceSifInitCmd publishes the IOP command destination and its own
++        // command-data pointer through these two system registers.
++        setRegU32(env.ctx, 4, 0x80000000u);
++        setRegU32(env.ctx, 5, iopDestination);
++        ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
++        setRegU32(env.ctx, 4, 0x80000001u);
++        setRegU32(env.ctx, 5, 0x00022000u);
++        ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
++    }
++
++    void writeCommandPacket(TestEnv &env, uint32_t source, uint32_t packetSize,
++                            uint32_t command = 0x80000002u, uint32_t option = 0u)
++    {
++        const std::array<uint32_t, 6> packet{packetSize, 0u, command, option, 0x00022100u, 0u};
++        std::memcpy(env.rdram.data() + source, packet.data(), sizeof(packet));
++    }
++
++    std::string submitDmaError(TestEnv &env, uint32_t descriptors, uint32_t count)
++    {
++        setRegU32(env.ctx, 4, descriptors);
++        setRegU32(env.ctx, 5, count);
++        try
++        {
++            ps2_stubs::sceSifSetDma(env.rdram.data(), &env.ctx, &env.runtime);
++        }
++        catch (const std::runtime_error &error)
++        {
++            return error.what();
++        }
++        return {};
++    }
++
+     uint32_t g_dmacHandlerWriteAddr = 0u;
+     uint32_t g_dmacHandlerValue = 0u;
+     uint32_t g_dmacHandlerLastCause = 0u;
+@@ -137,6 +173,180 @@ void register_ps2_sif_dma_tests()
+ {
+     MiniTest::Case("PS2SifDma", [](TestCase &tc)
+     {
++        tc.Run("strict guest SIF command fails before any descriptor in the batch commits", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            constexpr uint32_t kDescriptors = 0x00020000u;
++            constexpr uint32_t kOrdinarySource = 0x00020100u;
++            constexpr uint32_t kCommandSource = 0x00020200u;
++            constexpr uint32_t kOrdinaryDestination = 0x00030000u;
++            constexpr uint32_t kCommandDestination = 0x00031000u;
++            configureGuestCommandRoute(env, kCommandDestination);
++            // Calling the host-level initialization helpers does not create an
++            // IOP packet receiver or make the original SDK packet path work.
++            ps2_stubs::sceSifInitCmd(env.rdram.data(), &env.ctx, &env.runtime);
++            ps2_stubs::sceSifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            writeCommandPacket(env, kCommandSource, 20u);
++            std::memset(env.rdram.data() + kOrdinarySource, 0x11, 16u);
++            std::array<uint8_t, 32> sentinel{};
++            sentinel.fill(0xA5u);
++            t.IsTrue(env.runtime.writeIopMemory(kOrdinaryDestination, sentinel.data(), sentinel.size()), "prepare ordinary destination");
++            t.IsTrue(env.runtime.writeIopMemory(kCommandDestination, sentinel.data(), sentinel.size()), "prepare command destination");
++            const std::array<Ps2SifDmaTransfer, 2> descriptors{{
++                {kOrdinarySource, kOrdinaryDestination, 16, 0},
++                {kCommandSource, kCommandDestination, 20, 0x44},
++            }};
++            std::memcpy(env.rdram.data() + kDescriptors, descriptors.data(), sizeof(descriptors));
++            setRegU32(env.ctx, 2, 0x76543210u);
++            const std::string error = submitDmaError(env, kDescriptors, 2u);
++            for (const char *detail : {"Unsupported guest SIF command DMA", "cid=0x80000002", "src=0x20200",
++                                      "dst=0x31000", "size=20", "attr=0x44", "IOP command", "RPC", "host SIF stubs"})
++                t.IsTrue(error.find(detail) != std::string::npos, std::string("diagnostic must include ") + detail);
++            std::array<uint8_t, 32> ordinary{}, command{};
++            t.IsTrue(env.runtime.readIopMemory(kOrdinaryDestination, ordinary.data(), ordinary.size()) && ordinary == sentinel,
++                     "an earlier ordinary descriptor must not partially commit");
++            t.IsTrue(env.runtime.readIopMemory(kCommandDestination, command.data(), command.size()) && command == sentinel,
++                     "unsupported command bytes must not be copied or acknowledged");
++            t.Equals(::getRegU32(&env.ctx, 2), 0x76543210u, "failed dispatch must not fabricate a successful transfer id");
++            t.Equals(readGuestU32(env.rdram.data(), 0x00022100u), 0u, "diagnostics must not fabricate guest readiness");
++        });
++
++        tc.Run("strict guest SIF command validates header and command-specific bounds", [](TestCase &t)
++        {
++            struct PacketCase { uint32_t packetSize; int32_t copiedSize; uint32_t command; uint32_t option; };
++            const PacketCase cases[] = {
++                {20u, -1, 0x80000002u, 0u}, // invalid signed descriptor size
++                {20u, 0, 0x80000002u, 0u},  // no command header
++                {20u, 12, 0x80000002u, 0u}, // incomplete header
++                {8u, 20, 0x80000002u, 0u},  // psize below header size
++                {128u, 128, 0x80000002u, 0u}, // psize above protocol limit
++                {20u, 16, 0x80000002u, 0u}, // psize extends beyond copied bytes
++                {20u, 128, 0x80000002u, 0u}, // descriptor is larger than packet/padding
++                {16u, 16, 0x80000002u, 0u}, // INIT_CMD opt0 lacks receive address
++                {16u, 16, 0x80000001u, 0u}, // SET_SREG lacks index/value
++            };
++            for (const PacketCase &packet : cases)
++            {
++                TestEnv env;
++                env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                configureGuestCommandRoute(env, 0u); // also cover the upstream false-ready zero endpoint
++                writeCommandPacket(env, 0x00020200u, packet.packetSize, packet.command, packet.option);
++                const Ps2SifDmaTransfer descriptor{0x00020200u, 0u, packet.copiedSize, 0x44};
++                std::memcpy(env.rdram.data() + 0x00020000u, &descriptor, sizeof(descriptor));
++                const std::string error = submitDmaError(env, 0x00020000u, 1u);
++                t.IsTrue(error.find("Malformed guest SIF command DMA") != std::string::npos,
++                         "malformed framed commands must be identified explicitly");
++                uint32_t untouched = 0xFFFFFFFFu;
++                t.IsTrue(env.runtime.readIopMemory(0u, &untouched, sizeof(untouched)) && untouched == 0u,
++                         "malformed command must not reach IOP memory");
++            }
++            for (uint32_t command : {0x80000002u, 0x00000123u})
++            {
++                TestEnv env;
++                env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                configureGuestCommandRoute(env, 0u);
++                writeCommandPacket(env, 0x00020200u, 16u, command, 1u);
++                const Ps2SifDmaTransfer descriptor{0x00020200u, 0u, 16, 0x44};
++                std::memcpy(env.rdram.data() + 0x00020000u, &descriptor, sizeof(descriptor));
++                const std::string error = submitDmaError(env, 0x00020000u, 1u);
++                t.IsTrue(error.find("Unsupported guest SIF command DMA") != std::string::npos,
++                         "valid RPC-init and user packets must not be mistaken for malformed data");
++            }
++        });
++
++        tc.Run("strict ordinary SIF DMA and legacy command copies retain their existing behavior", [](TestCase &t)
++        {
++            struct TransferCase { bool strict; bool configured; uint32_t destination; int32_t attributes; };
++            const TransferCase cases[] = {
++                {true, true, 0x00031000u, 0}, {true, true, 0x00031000u, 0x2},
++                {true, true, 0x00031000u, 0x4}, {true, true, 0x00031000u, 0x40},
++                {true, true, 0x00032000u, 0x44}, {true, false, 0x00031000u, 0x44},
++                {false, true, 0x00031000u, 0x44},
++            };
++            for (const TransferCase &transfer : cases)
++            {
++                TestEnv env;
++                if (transfer.strict)
++                    env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                if (transfer.configured)
++                    configureGuestCommandRoute(env, 0x00031000u);
++                writeCommandPacket(env, 0x00020200u, 20u);
++                const Ps2SifDmaTransfer descriptor{0x00020200u, transfer.destination, 20, transfer.attributes};
++                std::memcpy(env.rdram.data() + 0x00020000u, &descriptor, sizeof(descriptor));
++                t.Equals(submitDmaError(env, 0x00020000u, 1u), std::string{}, "ordinary or legacy DMA must not be misclassified");
++                t.IsTrue(getRegS32(env.ctx, 2) > 0, "supported byte-copy path must keep its transfer id");
++                std::array<uint8_t, 20> copied{};
++                t.IsTrue(env.runtime.readIopMemory(transfer.destination, copied.data(), copied.size()) &&
++                             std::memcmp(copied.data(), env.rdram.data() + 0x00020200u, copied.size()) == 0,
++                         "supported byte-copy path must still copy into distinct IOP RAM");
++            }
++        });
++
++        tc.Run("SIF DMA descriptor lists require a complete bounded range before parsing", [](TestCase &t)
++        {
++            struct ScratchpadBinding
++            {
++                std::array<uint8_t, PS2_SCRATCHPAD_SIZE> bytes{};
++                ScratchpadBinding() { ps2SetScratchpadHostPtr(bytes.data()); }
++                ~ScratchpadBinding() { ps2SetScratchpadHostPtr(nullptr); }
++            };
++            struct ListCase { uint32_t address; uint32_t count; };
++            const ListCase invalid[] = {
++                {PS2_RAM_SIZE - 24u, 2u}, {0x80000000u + PS2_RAM_SIZE - 24u, 2u},
++                {0x20000000u + PS2_RAM_SIZE - 24u, 2u}, {0xA0000000u + PS2_RAM_SIZE - 24u, 2u},
++                {PS2_RAM_SIZE - 8u, 1u}, {0xFFFFFFF0u, 2u},
++                {PS2_SCRATCHPAD_BASE + PS2_SCRATCHPAD_SIZE - 24u, 2u},
++                {PS2_SCRATCHPAD_ALIAS_BASE + PS2_SCRATCHPAD_SIZE - 8u, 1u},
++                {0x10000000u, 1u}, {0x90000000u, 1u}, {0x02000000u, 1u},
++                {0x00020000u, 33u}, {0x00020000u, 0xFFFFFFFFu},
++            };
++            for (const ListCase &list : invalid)
++            {
++                TestEnv env;
++                ScratchpadBinding scratchpad;
++                env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                constexpr uint32_t source = 0x00020100u, destination = 0x00030000u;
++                std::memset(env.rdram.data() + source, 0x11, 16u);
++                std::array<uint8_t, 16> sentinel{};
++                sentinel.fill(0xA5u);
++                t.IsTrue(env.runtime.writeIopMemory(destination, sentinel.data(), sentinel.size()), "prepare list-boundary sentinel");
++                const Ps2SifDmaTransfer first{source, destination, 16, 0};
++                if (ps2IsScratchpadAddress(list.address))
++                {
++                    const uint32_t offset = ps2ScratchpadOffset(list.address);
++                    if (offset <= PS2_SCRATCHPAD_SIZE - sizeof(first))
++                        std::memcpy(scratchpad.bytes.data() + offset, &first, sizeof(first));
++                }
++                else
++                {
++                    const uint32_t physical = list.address & 0x1FFFFFFFu;
++                    if (physical <= PS2_RAM_SIZE - sizeof(first))
++                        std::memcpy(env.rdram.data() + physical, &first, sizeof(first));
++                }
++                t.Equals(submitDmaError(env, list.address, list.count), std::string{}, "invalid list keeps the normal DMA failure result");
++                t.Equals(getRegS32(env.ctx, 2), 0, "truncated, wrapping and oversized lists must fail");
++                std::array<uint8_t, 16> readback{};
++                t.IsTrue(env.runtime.readIopMemory(destination, readback.data(), readback.size()) && readback == sentinel,
++                         "a readable first descriptor must not commit before a truncated later descriptor");
++            }
++            for (uint32_t alias : {0u, 0x20000000u, 0x80000000u, 0xA0000000u,
++                                   PS2_SCRATCHPAD_BASE, PS2_SCRATCHPAD_ALIAS_BASE})
++            {
++                TestEnv env;
++                ScratchpadBinding scratchpad;
++                env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                const Ps2SifDmaTransfer complete{0x00020100u, 0x00030000u, 16, 0};
++                const bool scratch = ps2IsScratchpadAddress(alias);
++                const uint32_t regionSize = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++                uint8_t *const backing = scratch ? scratchpad.bytes.data() : env.rdram.data();
++                std::memcpy(backing + regionSize - sizeof(complete), &complete, sizeof(complete));
++                t.Equals(submitDmaError(env, alias + regionSize - sizeof(complete), 1u), std::string{},
++                         "a complete descriptor ending exactly at its memory region end must remain valid");
++                t.IsTrue(getRegS32(env.ctx, 2) > 0, "valid final descriptor must retain successful DMA behavior");
++            }
++        });
++
+         tc.Run("sceSifSetDma copies payload and sceSifDmaStat reports complete", [](TestCase &t)
+         {
+             TestEnv env;
