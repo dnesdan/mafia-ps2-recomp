@@ -1,0 +1,254 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 252c5cf..3e7a6d2 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -48,7 +48,6 @@ namespace ps2x::iop::detail
+         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
+         m_hardware.clear();
+         m_allocations.clear();
+-        m_heapCursor = HeapBase;
+         m_interruptStatus = 0;
+         m_interruptMask = 0;
+         m_interruptControl = 1;
+@@ -357,9 +356,13 @@ namespace ps2x::iop::detail
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
++        // Search live allocations from the heap base. A previous allocation's
++        // high-water mark must not consume space after that allocation is freed.
++        uint32_t candidate = alignUp(HeapBase, alignment);
+         for (;;)
+         {
++            if (candidate > HeapLimit || size > HeapLimit - candidate)
++                return 0u;
+             bool overlap = false;
+             for (const auto &block : m_allocations)
+             {
+@@ -373,11 +376,8 @@ namespace ps2x::iop::detail
+             if (!overlap)
+                 break;
+         }
+-        if (candidate > HeapLimit || size > HeapLimit - candidate)
+-            return 0u;
+         m_allocations.push_back({candidate, size, m_nextAllocationIdentity++});
+         markOwned(candidate, size);
+-        m_heapCursor = std::max(m_heapCursor, candidate + size);
+         return candidate;
+     }
+ 
+@@ -406,7 +406,34 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
++        // Fixed allocations can be inserted in any order. Account for every
++        // live range, including holes, without changing allocation identities.
++        auto blocks = m_allocations;
++        std::sort(blocks.begin(), blocks.end(), [](const Allocation &left, const Allocation &right)
++                  { return left.address < right.address; });
++        uint32_t cursor = HeapBase;
++        uint32_t maximum = 0u;
++        const auto considerGap = [&](uint32_t end)
++        {
++            const uint32_t start = alignUp(cursor, 16u);
++            if (start < end)
++                maximum = std::max(maximum, (end - start) & ~15u);
++        };
++        for (const auto &block : blocks)
++        {
++            considerGap(block.address);
++            cursor = block.address + block.size;
++        }
++        considerGap(HeapLimit);
++        return maximum;
++    }
++
++    uint32_t IopMemory::totalFreeMemory() const
++    {
++        uint32_t free = HeapLimit - HeapBase;
++        for (const auto &block : m_allocations)
++            free -= block.size;
++        return free;
+     }
+ 
+     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index f995f84..a6d117d 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -76,6 +76,7 @@ namespace ps2x::iop::detail
+         // allocation subsequently reuses the same guest address and size.
+         [[nodiscard]] bool freeAllocation(uint32_t address, uint64_t identity);
+         [[nodiscard]] uint32_t maxFreeMemory() const;
++        [[nodiscard]] uint32_t totalFreeMemory() const;
+         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+ 
+         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
+@@ -103,7 +104,6 @@ namespace ps2x::iop::detail
+         std::weak_ptr<IopCdvdRegisters> m_cdvdRegisters;
+         std::vector<Allocation> m_allocations;
+         uint64_t m_nextAllocationIdentity = 1u; // survives RAM reset and ordinary staged copies
+-        uint32_t m_heapCursor = HeapBase;
+         uint32_t m_interruptStatus = 0;
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 42e6cb1..0842546 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -53,9 +53,11 @@ namespace ps2x::iop::detail
+             setV0(IopMemory::RamSize);
+             return true;
+         case 7: // QueryMaxFreeMemSize
+-        case 8: // QueryTotalFreeMemSize
+             setV0(m_memory.maxFreeMemory());
+             return true;
++        case 8: // QueryTotalFreeMemSize
++            setV0(m_memory.totalFreeMemory());
++            return true;
+         case 9: // QueryBlockTopAddress
+             if (const auto block = m_memory.allocationContaining(a0))
+                 setV0(block->address);
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 616e5fa..39521c8 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -5,6 +5,7 @@
+ #include "emulator/imports/iop_imports.h"
+ #include "emulator/imports/iop_intrman.h"
+ #include "emulator/imports/iop_loadcore.h"
++#include "emulator/imports/iop_sysmem.h"
+ #include "emulator/imports/iop_timrman.h"
+ #include "emulator/services/iop_rpc.h"
+ #include "ps2x/iop/iop_host.h"
+@@ -658,6 +659,118 @@ namespace
+                       "post-reset release did not require the matching allocation lifetime");
+     }
+ 
++    bool testIopHeapReusesFreedStorage()
++    {
++        IopMemory memory;
++        const uint32_t live = memory.allocate(32u);
++        memory.write32(live, 0x13579BDFu);
++        uint32_t reusable = 0u;
++        uint64_t previousIdentity = 0u;
++        for (unsigned iteration = 0u; iteration < 8u; ++iteration)
++        {
++            // Cumulative traffic exceeds the heap; only this block and the
++            // sentinel remain live. Freeing must restore allocatable capacity.
++            const uint32_t address = memory.allocate(256u * 1024u);
++            if (!expect(address != 0u, "temporary allocation history exhausted an otherwise free heap"))
++                return false;
++            const auto allocation = memory.allocationContaining(address);
++            if (!expect(allocation && allocation->identity != previousIdentity,
++                        "reused heap storage kept its old lifetime identity") ||
++                !expect(reusable == 0u || address == reusable, "first-fit allocation skipped freed storage") ||
++                !expect(previousIdentity == 0u || !memory.freeAllocation(address, previousIdentity),
++                        "stale lifetime released a replacement allocation") ||
++                !expect(memory.ownsRamRange(address, 256u * 1024u), "replacement storage is not owned"))
++                return false;
++            reusable = address;
++            previousIdentity = allocation->identity;
++            if (!expect(memory.freeAllocation(address, allocation->identity) &&
++                        !memory.ownsRamRange(address, 256u * 1024u),
++                        "free did not release the complete temporary range"))
++                return false;
++        }
++        return expect(memory.read32(live) == 0x13579BDFu && memory.ownsRamRange(live, 32u),
++                      "temporary allocation reuse changed a live neighbor");
++    }
++
++    bool testIopHeapCoalescesFreeGaps()
++    {
++        IopMemory memory;
++        const uint32_t base = IopMemory::HeapBase;
++        constexpr uint32_t blockSize = 0x100u;
++        const uint32_t first = memory.allocate(blockSize);
++        const uint32_t second = memory.allocate(blockSize);
++        const uint32_t live = memory.allocate(blockSize);
++        const uint32_t remaining = IopMemory::HeapLimit - base - 3u * blockSize;
++        const uint32_t tail = memory.allocate(remaining);
++        if (!expect(first == base && second == base + blockSize && live == base + 2u * blockSize &&
++                    tail == base + 3u * blockSize && memory.allocate(1u) == 0u,
++                    "authored full-heap layout was not allocated"))
++            return false;
++        memory.write32(live, 0x2468ACE0u);
++        if (!expect(memory.freeAllocation(first) && memory.freeAllocation(second), "could not free adjacent ranges") ||
++            !expect(memory.maxFreeMemory() == 2u * blockSize, "adjacent free ranges were not counted together"))
++            return false;
++        const uint32_t combined = memory.allocate(2u * blockSize);
++        return expect(combined == base && memory.read32(live) == 0x2468ACE0u &&
++                      memory.ownsRamRange(tail, remaining) && memory.allocate(1u) == 0u,
++                      "coalesced allocation missed the free gap or overlapped live storage");
++    }
++
++    bool testIopHeapRespectsFixedRangesAndAlignment()
++    {
++        IopMemory memory;
++        const uint32_t base = IopMemory::HeapBase;
++        // Insert reservations out of address order, including a four-byte
++        // aligned allocation. Automatic allocations remain sixteen-byte based.
++        const uint32_t high = memory.allocate(0x100u, 16u, base + 0x200u);
++        const uint32_t low = memory.allocate(16u, 4u, base + 4u);
++        const uint32_t tail = memory.allocate(IopMemory::HeapLimit - base - 0x300u, 16u, base + 0x300u);
++        if (!expect(high != 0u && low != 0u && tail != 0u, "fixed reservation fixture failed"))
++            return false;
++        memory.write32(high, 0x10203040u);
++        memory.write32(low, 0x50607080u);
++        const uint32_t beforeMax = memory.maxFreeMemory();
++        const uint32_t tooLarge = memory.allocate(0x200u, 64u);
++        const uint32_t aligned = memory.allocate(0x100u, 64u);
++        if (!expect(beforeMax == 0x1E0u && tooLarge == 0u && aligned == base + 0x40u,
++                    "aligned allocation ignored a reservation or failed to reuse an available gap") ||
++            !expect(memory.read32(high) == 0x10203040u && memory.read32(low) == 0x50607080u,
++                    "failed or aligned allocation modified fixed storage"))
++            return false;
++        if (!expect(memory.freeAllocation(aligned), "could not release aligned allocation"))
++            return false;
++        const uint32_t maximum = memory.maxFreeMemory();
++        const uint32_t entireGap = memory.allocate(maximum);
++        return expect(maximum == 0x1E0u && entireGap == base + 0x20u && memory.maxFreeMemory() == 0u,
++                      "maximum-free query did not describe an allocatable aligned range");
++    }
++
++    bool testIopHeapFreeMemoryQueries()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopSysmem sysmem(host, memory);
++        const uint32_t base = IopMemory::HeapBase;
++        // Two free holes have different sizes; total capacity is not the
++        // largest request that can be satisfied without moving live blocks.
++        const uint32_t boundary = memory.allocate(0x100u, 16u, base + 0x200u);
++        const uint32_t tail = memory.allocate(IopMemory::HeapLimit - base - 0x600u, 16u, base + 0x600u);
++        if (!expect(boundary != 0u && tail != 0u, "fragmented query fixture failed"))
++            return false;
++        IopCpuState cpu{};
++        if (!expect(sysmem.dispatchImport(7u, cpu) && cpu.gpr[2] == 0x300u,
++                    "QueryMaxFreeMemSize ignored fixed allocations or interior gaps") ||
++            !expect(sysmem.dispatchImport(8u, cpu) && cpu.gpr[2] == 0x500u,
++                    "QueryTotalFreeMemSize returned a contiguous maximum instead of all free bytes"))
++            return false;
++        if (!expect(memory.freeAllocation(boundary) && memory.freeAllocation(tail), "query cleanup failed"))
++            return false;
++        const uint32_t capacity = IopMemory::HeapLimit - IopMemory::HeapBase;
++        return expect(sysmem.dispatchImport(7u, cpu) && cpu.gpr[2] == capacity &&
++                      sysmem.dispatchImport(8u, cpu) && cpu.gpr[2] == capacity,
++                      "free queries did not restore full capacity after all allocations were freed");
++    }
++
+     bool testTimrmanPeriodicCallback()
+     {
+         IopMemory memory;
+@@ -719,7 +832,9 @@ int main()
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() ||
+         !testCdvdControllerWithoutMedia() || !testCdvdControllerReadLifecycle() || !testCdvdSearchFile() ||
+         !testCdvdFsvBuffer() || !testCdvdFsvBufferFailure() || !testCdvdFsvAllocationIdentity() ||
+-        !testIopAllocationBoundsAndIdentity() || !testTimrmanPeriodicCallback())
++        !testIopAllocationBoundsAndIdentity() || !testIopHeapReusesFreedStorage() ||
++        !testIopHeapCoalescesFreeGaps() || !testIopHeapRespectsFixedRangesAndAlignment() ||
++        !testIopHeapFreeMemoryQueries() || !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
