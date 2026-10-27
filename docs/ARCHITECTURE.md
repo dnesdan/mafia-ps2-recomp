@@ -55,6 +55,7 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0020` | Own host image-file handles immediately and close them exactly once on read, size, allocation or parsing failures. Cleanup preserves the original exception even if the host close callback throws. |
 | `0021` | Initialize and own the reserved IOP invocation stack once at reset, including its O32 argument home area. Physical RPC results retain the actual stack bytes; null pointers, unsupported aliases and unowned ranges remain errors. |
 | `0022` | Accept the optical driver's mode-zero read convention for explicit CD-ROM paths. Registered guest drivers retain priority; host and memory-card mode zero, writes and unmodeled option bits remain unsupported. |
+| `0023` | Include bounded IOP register, branch, pending-load and call-depth values in strict execution failures. Diagnostics read only the failed CPU state and do not access device memory or change execution. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly; its separate GS-cache CTest directory does not run that executable.
 

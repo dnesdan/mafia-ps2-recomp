@@ -1,0 +1,20 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 85886ca9a648b4b724976e4f0832a11ed59ad1da..3dad57725bed1a7a27e3351557fb25f1df2c1d6d 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -487,7 +487,14 @@ namespace ps2x::iop::detail
+         {
+             std::ostringstream out;
+             out << "Strict IOP execution: " << reason << " pc=0x" << std::hex << cpu.pc
+-                << " cause=0x" << cpu.cop0[13] << " epc=0x" << cpu.cop0[14];
++                << " cause=0x" << cpu.cop0[13] << " epc=0x" << cpu.cop0[14]
++                << " ra=0x" << cpu.gpr[31] << " sp=0x" << cpu.gpr[29] << " gp=0x" << cpu.gpr[28]
++                << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5]
++                << " a2=0x" << cpu.gpr[6] << " a3=0x" << cpu.gpr[7]
++                << " v0=0x" << cpu.gpr[2] << " t9=0x" << cpu.gpr[25]
++                << " branchPending=" << cpu.branchPending << " branchTarget=0x" << cpu.branchTarget
++                << " pendingLoad=" << cpu.pendingLoad << " pendingLoadReg=0x" << cpu.pendingLoadReg
++                << " pendingLoadValue=0x" << cpu.pendingLoadValue << " callDepth=" << std::dec << callDepth;
+             rememberExecutionFailure(out.str());
+             throw std::runtime_error(lastError);
+         }
