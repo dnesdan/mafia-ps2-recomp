@@ -1,0 +1,1238 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index bb612bad8ce698cdfd2e3f3b1173a90aa3e2e948..867f044fbace914e12e6721b0c21bfea04832814 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -49,6 +49,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_ioman_file_tests tests/iop_ioman_file_tests.cpp)
++    target_link_libraries(ps2_iop_ioman_file_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_ioman_file_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_ioman_file_tests COMMAND ps2_iop_ioman_file_tests)
++
+     add_executable(ps2_iop_mailbox_tests tests/iop_mailbox_tests.cpp)
+     target_link_libraries(ps2_iop_mailbox_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_mailbox_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/core/iop_mailbox.cpp b/ps2xIOP/src/emulator/core/iop_mailbox.cpp
+index c322a583092c3ad00d264133a87b70632558a6fc..281f295c9ccd6dcf7278d79046c80dbfbfc369f3 100644
+--- a/ps2xIOP/src/emulator/core/iop_mailbox.cpp
++++ b/ps2xIOP/src/emulator/core/iop_mailbox.cpp
+@@ -41,7 +41,7 @@ namespace ps2x::iop::detail
+                     throw std::runtime_error(std::string("IOP mailbox ") + purpose + " crosses an allocation boundary");
+                 return owner->identity;
+             }
+-            if (physical >= IopMemory::HeapBase && physical < IopMemory::HeapLimit)
++            if (physical < IopMemory::HeapLimit && uint64_t(physical) + size > IopMemory::HeapBase)
+                 throw std::runtime_error(std::string("IOP mailbox ") + purpose + " has no live heap allocation");
+             return 0u;
+         }
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index cbec548092fd3595626fe3168e858d8620330970..22e520e818c4ecfc695d6b186243644a57e78f9a 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -4,9 +4,14 @@
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
+ #include "../services/iop_rpc.h"
++#include "ps2x/iop/iop_host.h"
++#include "ps2x/iop/ps2_path.h"
+ 
+ #include <algorithm>
+ #include <array>
++#include <exception>
++#include <filesystem>
++#include <limits>
+ #include <stdexcept>
+ #include <string_view>
+ 
+@@ -61,16 +66,133 @@ namespace ps2x::iop::detail
+                    std::all_of(device.begin() + static_cast<std::ptrdiff_t>(name.size()), device.end(),
+                                [](char value) { return value == '0'; });
+         }
++
++        uint64_t fileBufferOwner(const IopMemory &memory, uint32_t address, size_t size)
++        {
++            const uint32_t segment = address & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            if (address == 0u ||
++                (segment != 0u && segment != 0x80000000u && segment != 0xA0000000u) ||
++                physical >= IopMemory::RamSize || size > IopMemory::RamSize - physical ||
++                !memory.ownsRamRange(address, size))
++                throw std::runtime_error("IOP IOMAN file buffer is outside complete owned RAM");
++            const auto allocation = memory.allocationContaining(physical);
++            if (allocation)
++            {
++                if (size > allocation->size - (physical - allocation->address))
++                    throw std::runtime_error("IOP IOMAN file buffer crosses a live allocation boundary");
++                return allocation->identity;
++            }
++            if (physical < IopMemory::HeapLimit && uint64_t(physical) + size > IopMemory::HeapBase)
++                throw std::runtime_error("IOP IOMAN file buffer has no live heap allocation");
++            return 0u;
++        }
++
++        std::string filePath(const IopMemory &memory, uint32_t address)
++        {
++            const uint64_t owner = fileBufferOwner(memory, address, 1u);
++            std::string path;
++            for (uint32_t i = 0u; i < 1024u; ++i)
++            {
++                if (fileBufferOwner(memory, address + i, 1u) != owner)
++                    throw std::runtime_error("IOP IOMAN path crosses an allocation boundary");
++                const char value = static_cast<char>(memory.read8(address + i));
++                if (value == '\0')
++                    return path;
++                path.push_back(value);
++            }
++            throw std::runtime_error("IOP IOMAN path is not terminated within 1024 bytes");
++        }
++
++        std::string deviceName(std::string_view path)
++        {
++            const size_t colon = path.find(':');
++            if (colon == std::string_view::npos)
++                return {};
++            std::string name(path.substr(0u, colon));
++            while (!name.empty() && name.back() >= '0' && name.back() <= '9')
++                name.pop_back();
++            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char value)
++                { return static_cast<char>(value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value); });
++            return name;
++        }
++
++        std::string mountedFilePath(const IopHost &host, std::string_view path)
++        {
++            const ParsedPs2Path parsed = parsePs2Path(path);
++            HostPathKind kind;
++            switch (parsed.device)
++            {
++            case Ps2PathDevice::Cdrom: kind = HostPathKind::CdRoot; break;
++            case Ps2PathDevice::Host: kind = HostPathKind::HostRoot; break;
++            case Ps2PathDevice::MemoryCard0: kind = HostPathKind::MemoryCardRoot; break;
++            default: return {};
++            }
++            if (path.find(':') == std::string_view::npos || parsed.path.empty() ||
++                parsed.path.find(':') != std::string::npos || parsed.path.find(';') != std::string::npos ||
++                std::any_of(path.begin(), path.end(), [](unsigned char value)
++                    { return value < 0x20u || value == 0x7Fu; }))
++                return {};
++            const std::filesystem::path relative(parsed.path);
++            if (relative.is_absolute() || relative.has_root_name() ||
++                std::any_of(relative.begin(), relative.end(), [](const auto &part) { return part == ".."; }))
++                return {};
++            const std::string root = host.hostPath(kind);
++            if (root.empty() || root.find('\0') != std::string::npos)
++                return {};
++            const std::string translated = host.translateGuestPath(path);
++            if (translated.empty() || translated.find('\0') != std::string::npos)
++                return {};
++
++            // Translation may apply host-specific case rules. Check the actual
++            // target after resolving existing symlinks, before opening it.
++            std::error_code error;
++            const auto canonicalRoot = std::filesystem::weakly_canonical(root, error);
++            if (error || canonicalRoot.empty())
++                return {};
++            const auto canonicalTarget = std::filesystem::weakly_canonical(translated, error);
++            if (error || canonicalTarget.empty())
++                return {};
++            const auto contained = canonicalTarget.lexically_relative(canonicalRoot);
++            if (contained.empty() || contained == "." || contained.is_absolute() ||
++                std::any_of(contained.begin(), contained.end(), [](const auto &part) { return part == ".."; }))
++                return {};
++            return canonicalTarget.string();
++        }
+     }
+ 
+-    IopIoman::IopIoman(IopMemory &memory, IopCdvd &cdvd) noexcept
+-        : m_memory(memory), m_cdvd(cdvd)
++    IopIoman::IopIoman(IopHost &host, IopMemory &memory, IopCdvd &cdvd) noexcept
++        : m_host(host), m_memory(memory), m_cdvd(cdvd)
+     {
+     }
+ 
++    IopIoman::~IopIoman()
++    {
++        for (const File &file : m_files)
++        {
++            if (file.handle != 0u)
++            {
++                try { m_host.closeHostFile(file.handle); }
++                catch (...) {} // Destruction cannot propagate a host cleanup failure.
++            }
++        }
++    }
++
+     void IopIoman::reset()
+     {
++        const auto files = m_files;
++        m_files = {};
+         m_devices.clear();
++        std::exception_ptr failure;
++        for (const File &file : files)
++        {
++            if (file.handle == 0u)
++                continue;
++            try { m_host.closeHostFile(file.handle); }
++            catch (...) { if (!failure) failure = std::current_exception(); }
++        }
++        if (failure)
++            std::rethrow_exception(failure);
+     }
+ 
+     bool IopIoman::dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor)
+@@ -84,6 +206,165 @@ namespace ps2x::iop::detail
+ 
+         switch (ordinal)
+         {
++        case 4: // open(name, flags[, mode])
++        {
++            // This modeled service provides read-only mounted files. Preserve
++            // original registered drivers and leave unsupported modes strict.
++            // https://ps2dev.github.io/ps2sdk/ioman_8h_source.html
++            // https://ps2dev.github.io/ps2sdk/io__common_8h_source.html
++            if (cpu.gpr[5] != 1u) // FIO_O_RDONLY
++                return false;
++            const std::string path = filePath(m_memory, a0);
++            const std::string device = deviceName(path);
++            if (std::any_of(m_devices.begin(), m_devices.end(),
++                            [&](const Device &entry)
++                            {
++                                return entry.name.size() == device.size() &&
++                                    std::equal(entry.name.begin(), entry.name.end(), device.begin(),
++                                        [](unsigned char first, unsigned char second)
++                                        {
++                                            return (first >= 'A' && first <= 'Z' ? first + ('a' - 'A') : first) == second;
++                                        });
++                            }))
++                return false;
++            const std::string translated = mountedFilePath(m_host, path);
++            if (translated.empty())
++            {
++                // No ROM device exists in the explicitly modeled reset. A
++                // normal absent-device error lets the original caller decide
++                // whether its request is optional; no ROM bytes are invented.
++                m_host.log(LogLevel::Debug, "[IOP:ioman] no mounted file route for '" + path + "'");
++                setV0(static_cast<uint32_t>(-19)); // ENODEV.
++                return true;
++            }
++            const auto slot = std::find_if(m_files.begin(), m_files.end(),
++                                           [](const File &file) { return file.identity == 0u; });
++            if (slot == m_files.end())
++            {
++                setV0(static_cast<uint32_t>(-24)); // EMFILE.
++                return true;
++            }
++            if (m_nextFileIdentity == std::numeric_limits<uint64_t>::max())
++                throw std::runtime_error("IOP IOMAN descriptor lifetime identities exhausted");
++            const uint64_t identity = m_nextFileIdentity++;
++            *slot = {0u, 0u, 0u, identity};
++            struct FileGuard
++            {
++                IopHost &host;
++                File &slot;
++                uint64_t identity;
++                uint64_t handle = 0u;
++                bool committed = false;
++                ~FileGuard()
++                {
++                    if (!committed && slot.identity == identity)
++                        slot = {};
++                    if (handle == 0u)
++                        return;
++                    try { host.closeHostFile(handle); }
++                    catch (...) {} // Preserve an original query/entry failure during cleanup.
++                }
++            } guard{m_host, *slot, identity};
++            guard.handle = m_host.openHostFile(translated);
++            if (slot->identity != identity)
++                throw std::runtime_error("IOP IOMAN pending open lifetime changed during host open");
++            if (guard.handle == 0u)
++            {
++                setV0(static_cast<uint32_t>(-2)); // ENOENT.
++                return true;
++            }
++            uint64_t size = 0u;
++            const bool hasSize = m_host.hostFileSize(guard.handle, size);
++            if (slot->identity != identity)
++                throw std::runtime_error("IOP IOMAN pending open lifetime changed during host size query");
++            if (!hasSize)
++            {
++                setV0(static_cast<uint32_t>(-5)); // EIO.
++                return true;
++            }
++            *slot = {guard.handle, size, 0u, identity};
++            guard.committed = true;
++            guard.handle = 0u;
++            setV0(static_cast<uint32_t>(slot - m_files.begin()));
++            return true;
++        }
++        case 5: // close(fd)
++        case 6: // read(fd, IOP destination, size)
++        case 8: // lseek(fd, signed offset, whence)
++        {
++            if (a0 >= m_files.size() || m_files[a0].handle == 0u)
++            {
++                setV0(static_cast<uint32_t>(-9)); // EBADF.
++                return true;
++            }
++            File &file = m_files[a0];
++            if (ordinal == 5u)
++            {
++                const uint64_t handle = file.handle;
++                file = {};
++                m_host.closeHostFile(handle);
++                setV0(0u);
++                return true;
++            }
++            if (ordinal == 8u)
++            {
++                const uint32_t whence = cpu.gpr[6];
++                const uint64_t base = whence == 1u ? file.position : whence == 2u ? file.size : 0u;
++                if (whence > 2u || base > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
++                {
++                    setV0(static_cast<uint32_t>(-22)); // EINVAL.
++                    return true;
++                }
++                const int64_t offset = static_cast<int32_t>(cpu.gpr[5]);
++                if (offset > 0 && base > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - offset))
++                {
++                    setV0(static_cast<uint32_t>(-22));
++                    return true;
++                }
++                const int64_t position = static_cast<int64_t>(base) + offset;
++                if (position < 0 || position > std::numeric_limits<int32_t>::max())
++                {
++                    setV0(static_cast<uint32_t>(-22));
++                    return true;
++                }
++                file.position = static_cast<uint64_t>(position);
++                setV0(static_cast<uint32_t>(position));
++                return true;
++            }
++
++            const uint32_t destination = cpu.gpr[5], requested = cpu.gpr[6];
++            if (requested == 0u)
++            {
++                setV0(0u);
++                return true;
++            }
++            const uint64_t owner = fileBufferOwner(m_memory, destination, requested);
++            if (file.position >= file.size)
++            {
++                setV0(0u);
++                return true;
++            }
++            const size_t count = static_cast<size_t>(std::min<uint64_t>(requested, file.size - file.position));
++            std::vector<uint8_t> bytes(count);
++            const File before = file;
++            size_t actual = 0u;
++            if (!m_host.readHostFile(before.handle, before.position, bytes.data(), count, actual))
++            {
++                setV0(static_cast<uint32_t>(-5)); // EIO; no guest bytes or position committed.
++                return true;
++            }
++            if (actual > count)
++                throw std::runtime_error("IOP IOMAN host read returned more bytes than requested");
++            if (file.identity != before.identity || file.handle != before.handle ||
++                file.position != before.position || file.size != before.size ||
++                fileBufferOwner(m_memory, destination, requested) != owner)
++                throw std::runtime_error("IOP IOMAN file or destination lifetime changed during host read");
++            if (actual != 0u && !m_memory.writeRam(destination, bytes.data(), actual))
++                throw std::runtime_error("IOP IOMAN could not commit the validated file read");
++            file.position += actual;
++            setV0(static_cast<uint32_t>(actual));
++            return true;
++        }
+         case 20: // AddDrv
+         {
+             if (a0 == 0u || m_devices.size() >= kMaxDevices)
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.h b/ps2xIOP/src/emulator/imports/iop_ioman.h
+index bf44ab9b9b8ba4fc7bfba4c58b648776a5fa4796..5b5c21204b012e6592f3c4799e3acd1a6a250a2a 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.h
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.h
+@@ -1,9 +1,15 @@
+ #pragma once
+ 
++#include <array>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+ 
++namespace ps2x::iop
++{
++    class IopHost;
++}
++
+ namespace ps2x::iop::detail
+ {
+     struct IopCpuState;
+@@ -14,7 +20,10 @@ namespace ps2x::iop::detail
+     class IopIoman
+     {
+     public:
+-        IopIoman(IopMemory &memory, IopCdvd &cdvd) noexcept;
++        IopIoman(IopHost &host, IopMemory &memory, IopCdvd &cdvd) noexcept;
++        ~IopIoman();
++        IopIoman(const IopIoman &) = delete;
++        IopIoman &operator=(const IopIoman &) = delete;
+ 
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+@@ -27,8 +36,19 @@ namespace ps2x::iop::detail
+             std::string name;
+         };
+ 
++        struct File
++        {
++            uint64_t handle = 0u;
++            uint64_t size = 0u;
++            uint64_t position = 0u;
++            uint64_t identity = 0u;
++        };
++
++        IopHost &m_host;
+         IopMemory &m_memory;
+         IopCdvd &m_cdvd;
+         std::vector<Device> m_devices;
++        std::array<File, 16u> m_files{};
++        uint64_t m_nextFileIdentity = 1u;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 75d417004ad277cbd915b0e029a6b03c0911f8f0..ea61ec4e84bde2f6659c10ff8a8c55ba2c726dc2 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -353,7 +353,7 @@ namespace ps2x::iop::detail
+               heaplib(memory),
+               intrman(memory),
+               timrman(),
+-              ioman(memory, cdvd),
++              ioman(host, memory, cdvd),
+               cpuCore(memory),
+               imports(memory),
+               loadcore(memory, imports)
+diff --git a/ps2xIOP/tests/iop_ioman_devctl_tests.cpp b/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
+index beb99945bcb2d92ef7302865f22dc59a880fc684..8cb55aca874a17258d1b9616007acfd175643554 100644
+--- a/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
+@@ -29,7 +29,7 @@ namespace
+         IopMemory memory;
+         IopKernel kernel{memory};
+         IopCdvd cdvd{host, memory, kernel};
+-        IopIoman ioman{memory, cdvd};
++        IopIoman ioman{host, memory, cdvd};
+         NoGuestCallback executor;
+ 
+         void path(uint32_t address, const std::string &value = "cdrom0:")
+diff --git a/ps2xIOP/tests/iop_ioman_file_tests.cpp b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cb028344f3ae373ff4393efa01bf90e201600991
+--- /dev/null
++++ b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+@@ -0,0 +1,782 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/imports/iop_ioman.h"
++#include "emulator/iop_emulator.h"
++#include "emulator/services/iop_rpc.h"
++#include "iop_compat_test_support.h"
++#include "ps2x/iop/ps2_path.h"
++
++#include <atomic>
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <iterator>
++#include <limits>
++#include <map>
++#include <memory>
++#include <optional>
++#include <set>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++    namespace fs = std::filesystem;
++
++    constexpr uint32_t marker = 0xD00DF00Du;
++    const std::vector<uint8_t> content{0x00u, 0x7Fu, 0x80u, 0xFFu, 0x31u,
++                                       0x32u, 0x33u, 0x34u, 0x35u, 0x00u};
++
++    struct TemporaryTree
++    {
++        fs::path root;
++
++        TemporaryTree()
++        {
++            static std::atomic<uint64_t> sequence{0u};
++            const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++            for (unsigned attempt = 0u; attempt < 20u; ++attempt)
++            {
++                root = fs::temp_directory_path() /
++                       ("ps2x-ioman-test-" + std::to_string(stamp) + "-" +
++                        std::to_string(sequence.fetch_add(1u)));
++                if (fs::create_directory(root))
++                    break;
++                root.clear();
++            }
++            require(!root.empty(), "could not create a private authored-file fixture");
++            for (const char *directory : {"cd", "host", "mc", "outside"})
++                fs::create_directory(root / directory);
++            write(root / "cd" / "DATA" / "TEST.BIN", content);
++            write(root / "host" / "TEST.BIN", content);
++            write(root / "mc" / "TEST.BIN", content);
++            write(root / "outside" / "SECRET.BIN", {0xBAu, 0xADu});
++            write(root / "cd" / "EMPTY.BIN", {});
++        }
++
++        ~TemporaryTree()
++        {
++            std::error_code ignored;
++            fs::remove_all(root, ignored);
++        }
++
++        static void write(const fs::path &path, const std::vector<uint8_t> &bytes)
++        {
++            fs::create_directories(path.parent_path());
++            std::ofstream stream(path, std::ios::binary);
++            stream.write(reinterpret_cast<const char *>(bytes.data()),
++                         static_cast<std::streamsize>(bytes.size()));
++            require(static_cast<bool>(stream), "could not write authored file bytes");
++        }
++    };
++
++    class FileHost final : public IopHost
++    {
++    public:
++        explicit FileHost(const TemporaryTree &tree)
++            : roots{(tree.root / "cd").string(), (tree.root / "host").string(),
++                    (tree.root / "mc").string()} {}
++
++        bool readGuest(uint32_t, void *, size_t) const override { ++guestReads; return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { ++guestWrites; return false; }
++        bool zeroGuest(uint32_t, size_t) override { ++guestWrites; return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 0u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        int32_t memoryCard(const MemoryCardRequest &) override { return -1; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        { return false; }
++        void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
++
++        std::string hostPath(HostPathKind kind) const override
++        {
++            if (kind == HostPathKind::CdRoot) return roots[0];
++            if (kind == HostPathKind::HostRoot) return roots[1];
++            if (kind == HostPathKind::MemoryCardRoot) return roots[2];
++            return {};
++        }
++
++        std::string translateGuestPath(std::string_view path) const override
++        {
++            ++translations;
++            if (translationOverride)
++                return *translationOverride;
++            const auto parsed = parsePs2Path(path);
++            size_t index = 0u;
++            if (parsed.device == Ps2PathDevice::Host) index = 1u;
++            else if (parsed.device == Ps2PathDevice::MemoryCard0) index = 2u;
++            else if (parsed.device != Ps2PathDevice::Cdrom) return {};
++            return (fs::path(roots[index]) / parsed.path).string();
++        }
++
++        uint64_t openHostFile(std::string_view path) override
++        {
++            ++opens;
++            openedPaths.emplace_back(path);
++            std::ifstream stream(std::string(path), std::ios::binary);
++            if (!stream)
++                return 0u;
++            std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(stream),
++                                       std::istreambuf_iterator<char>()};
++            const uint64_t handle = reuseHandle ? 1u : nextHandle++;
++            require(!handles.contains(handle), "authored host reused a live handle");
++            handles.emplace(handle, std::move(bytes));
++            if (openHook)
++                openHook();
++            return handle;
++        }
++
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            ++sizes;
++            if (throwSize)
++                throw std::runtime_error("authored size exception");
++            const auto file = handles.find(handle);
++            if (failSize || file == handles.end())
++                return false;
++            size = advertisedSize.value_or(file->second.size());
++            if (sizeHook)
++                sizeHook();
++            return true;
++        }
++
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size,
++                          size_t &actual) override
++        {
++            ++reads;
++            offsets.push_back(offset);
++            const auto file = handles.find(handle);
++            require(file != handles.end(), "read used a closed host handle");
++            actual = offset >= file->second.size() ? 0u :
++                std::min({size, maximumRead, file->second.size() - static_cast<size_t>(offset)});
++            if (actual != 0u)
++                std::memcpy(destination, file->second.data() + offset, actual);
++            if (readHook)
++                readHook();
++            if (throwRead)
++                throw std::runtime_error("authored read exception");
++            if (overReport)
++                actual = size + 1u;
++            return !failRead;
++        }
++
++        void closeHostFile(uint64_t handle) override
++        {
++            ++closes;
++            require(handles.erase(handle) == 1u, "host handle was closed twice or never opened");
++            if (throwClose)
++                throw std::runtime_error("authored close exception");
++        }
++
++        std::array<std::string, 3u> roots;
++        std::optional<std::string> translationOverride;
++        std::map<uint64_t, std::vector<uint8_t>> handles;
++        std::vector<std::string> openedPaths, logs;
++        std::vector<uint64_t> offsets;
++        std::function<void()> openHook, sizeHook, readHook;
++        std::optional<uint64_t> advertisedSize;
++        size_t maximumRead = std::numeric_limits<size_t>::max();
++        uint64_t nextHandle = 1u;
++        size_t opens = 0u, reads = 0u, closes = 0u, guestWrites = 0u;
++        mutable size_t sizes = 0u, translations = 0u, guestReads = 0u;
++        bool failSize = false, throwSize = false, failRead = false, throwRead = false;
++        bool overReport = false, throwClose = false, reuseHandle = false;
++    };
++
++    class NoDeviceCallback final : public IopGuestExecutor
++    {
++    public:
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override
++        { throw std::runtime_error("unexpected original driver callback"); }
++    };
++
++    struct Fixture
++    {
++        TemporaryTree tree;
++        FileHost host{tree};
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopCdvd cdvd{host, memory, kernel};
++        std::unique_ptr<IopIoman> ioman = std::make_unique<IopIoman>(host, memory, cdvd);
++        NoDeviceCallback executor;
++
++        uint32_t call(uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u,
++                      uint32_t a2 = 0u)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[2] = marker;
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            cpu.gpr[6] = a2;
++            require(ioman->dispatchImport(ordinal, cpu, executor), "expected IOMAN import is absent");
++            return cpu.gpr[2];
++        }
++
++        int32_t open(std::string_view path = "cdrom0:\\DATA\\TEST.BIN;1")
++        {
++            const std::string terminated(path);
++            require(memory.writeRam(0x10000u, terminated.c_str(), terminated.size() + 1u),
++                    "could not install authored file path");
++            return static_cast<int32_t>(call(4u, 0x10000u, 1u));
++        }
++
++        void fill(uint32_t address, size_t size, uint8_t value = 0xCAu)
++        {
++            const std::vector<uint8_t> bytes(size, value);
++            require(memory.writeRam(address, bytes.data(), bytes.size()), "could not install IOP canaries");
++        }
++
++        std::vector<uint8_t> bytes(uint32_t address, size_t count) const
++        {
++            std::vector<uint8_t> result(count);
++            require(memory.readRam(address, result.data(), result.size()), "could not inspect IOP file bytes");
++            return result;
++        }
++
++        uint32_t position(uint32_t fd) { return call(8u, fd, 0u, 1u); }
++    };
++
++    void sequentialBytesAndIndependentPositions()
++    {
++        Fixture f;
++        const auto first = static_cast<uint32_t>(f.open());
++        const auto second = static_cast<uint32_t>(f.open());
++        require(first < 16u && second < 16u && first != second, "opens did not own independent descriptors");
++        f.fill(0x11000u, 32u);
++        require(f.call(6u, first, 0x11000u, 3u) == 3u &&
++                    f.bytes(0x11000u, 4u) == std::vector<uint8_t>({0u, 0x7Fu, 0x80u, 0xCAu}) &&
++                    f.position(first) == 3u && f.position(second) == 0u,
++                "first read did not copy exact binary bytes or kept a shared position");
++        require(f.call(6u, second, 0x11008u, 4u) == 4u &&
++                    f.bytes(0x11008u, 4u) == std::vector<uint8_t>(content.begin(), content.begin() + 4),
++                "independent descriptor did not start at the first file byte");
++        require(f.call(8u, first, static_cast<uint32_t>(-1), 1u) == 2u &&
++                    f.call(6u, first, 0x11010u, 2u) == 2u &&
++                    f.bytes(0x11010u, 3u) == std::vector<uint8_t>({0x80u, 0xFFu, 0xCAu}),
++                "signed SEEK_CUR did not affect the next read exactly");
++        require(f.call(8u, first, static_cast<uint32_t>(-2), 2u) == 8u &&
++                    f.call(6u, first, 0x11010u, 16u) == 2u &&
++                    f.bytes(0x11010u, 3u) == std::vector<uint8_t>({0x35u, 0u, 0xCAu}) &&
++                    f.position(first) == content.size(),
++                "EOF short read overwrote the tail or advanced by the requested count");
++        const size_t reads = f.host.reads;
++        require(f.call(6u, first, 0x11010u, 16u) == 0u &&
++                    f.call(8u, first, 20u, 0u) == 20u &&
++                    f.call(6u, first, 0x11010u, 16u) == 0u &&
++                    f.call(6u, second, 0u, 0u) == 0u && f.host.reads == reads,
++                "EOF, seek past EOF or zero-byte read performed a host read");
++        require(f.call(5u, first) == 0u && f.host.handles.size() == 1u &&
++                    f.position(second) == 4u && f.host.guestWrites == 0u && f.host.guestReads == 0u,
++                "closing one file affected another descriptor or touched EE RAM");
++        const auto empty = static_cast<uint32_t>(f.open("cdrom0:EMPTY.BIN"));
++        require(empty < 16u && f.call(6u, empty, 0x11000u, 4u) == 0u,
++                "an existing empty file was treated as absent");
++    }
++
++    void aliasesAndLiveHeapBuffers()
++    {
++        for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Fixture f;
++            const auto fd = static_cast<uint32_t>(f.open());
++            const uint32_t destination = alias | (IopMemory::RamSize - 8u);
++            f.fill(destination - 1u, 9u);
++            require(f.call(6u, fd, destination, 8u) == 8u &&
++                        f.bytes(destination, 8u) == std::vector<uint8_t>(content.begin(), content.begin() + 8) &&
++                        f.memory.read8(destination - 1u) == 0xCAu,
++                    "exact-end RAM alias read failed or overwrote a prefix canary");
++            const uint32_t allocation = f.memory.allocate(32u);
++            require(allocation != 0u, "could not allocate authored live buffer");
++            f.fill(allocation, 32u);
++            require(f.call(8u, fd, 0u, 0u) == 0u &&
++                        f.call(6u, fd, alias | (allocation + 5u), 10u) == content.size() &&
++                        f.bytes(allocation + 5u, content.size()) == content &&
++                        f.memory.read8(allocation + 4u) == 0xCAu &&
++                        f.memory.read8(allocation + 15u) == 0xCAu,
++                    "live allocation interior or unaligned byte read was rejected or widened");
++        }
++    }
++
++    void descriptorAndSeekErrorsPreservePosition()
++    {
++        Fixture f;
++        const auto fd = static_cast<uint32_t>(f.open());
++        for (const uint32_t bad : {16u, 0xFFFFFFFFu})
++            for (const uint16_t ordinal : {5u, 6u, 8u})
++                require(static_cast<int32_t>(f.call(ordinal, bad, 0u, 0u)) == -9,
++                        "invalid descriptor did not return EBADF before inspecting arguments");
++        require(f.call(8u, fd, 5u, 0u) == 5u, "could not position authored file");
++        for (const auto [offset, whence] : std::array<std::pair<uint32_t, uint32_t>, 4u>{
++                 {{static_cast<uint32_t>(-6), 1u}, {static_cast<uint32_t>(-1), 0u},
++                  {0u, 3u}, {0u, 0xFFFFFFFFu}}})
++            require(static_cast<int32_t>(f.call(8u, fd, offset, whence)) == -22 && f.position(fd) == 5u,
++                    "invalid signed seek changed the descriptor position");
++        require(f.call(8u, fd, 0x7FFFFFFFu, 0u) == 0x7FFFFFFFu &&
++                    static_cast<int32_t>(f.call(8u, fd, 1u, 1u)) == -22 &&
++                    f.position(fd) == 0x7FFFFFFFu,
++                "32-bit seek overflow changed position or became a negative success");
++        f.host.advertisedSize = std::numeric_limits<uint64_t>::max();
++        const auto huge = static_cast<uint32_t>(f.open());
++        require(huge < 16u && static_cast<int32_t>(f.call(8u, huge, 0u, 2u)) == -22 &&
++                    f.position(huge) == 0u, "unrepresentable file size overflowed SEEK_END");
++        require(f.call(5u, fd) == 0u && static_cast<int32_t>(f.call(5u, fd)) == -9,
++                "closed descriptor was accepted or closed its host handle twice");
++    }
++
++    void supportedMountsAndAbsentRoutes()
++    {
++        Fixture f;
++        for (const std::string path : {"host:TEST.BIN", "host0:TEST.BIN", "mc0:TEST.BIN"})
++        {
++            const int32_t fd = f.open(path);
++            require(fd >= 0 && f.call(5u, static_cast<uint32_t>(fd)) == 0u,
++                    "explicit mounted read-only route was unavailable");
++        }
++        const size_t opens = f.host.opens;
++        for (const std::string path : {"rom0:ROMVER", "cdrom1:DATA/TEST.BIN", "mc1:TEST.BIN",
++                                      "DATA/TEST.BIN", "/tmp/TEST.BIN", "cdrom0:",
++                                      "cdrom0:../outside/SECRET.BIN", "cdrom0:DATA/../../outside/SECRET.BIN",
++                                      "cdrom0:DATA/TEST.BIN;BAD", "cdrom0:DATA/C:TEST.BIN", "cdrom0:BAD\nNAME"})
++            require(f.open(path) == -19 && f.host.opens == opens,
++                    "absent or disallowed device route reached the host filesystem");
++        require(f.open("cdrom0:DOES_NOT_EXIST.BIN") == -2 && f.host.opens == opens + 1u,
++                "missing file did not return ENOENT through the mounted route");
++        f.host.roots[0].clear();
++        require(f.open() == -19 && f.host.opens == opens + 1u,
++                "unmounted CD device fell back to a native host path");
++    }
++
++    void canonicalContainmentAndDriverPrecedence()
++    {
++        Fixture f;
++        for (const fs::path &target : {f.tree.root / "outside" / "SECRET.BIN", f.tree.root / "cd",
++                                       f.tree.root / "cd-other" / "TEST.BIN"})
++        {
++            f.host.translationOverride = target.string();
++            require(f.open() == -19 && f.host.opens == 0u,
++                    "translation escaped its mount or opened the mount directory");
++        }
++        f.host.translationOverride.reset();
++        fs::create_directory_symlink(f.tree.root / "outside", f.tree.root / "cd" / "escape");
++        require(f.open("cdrom0:escape/SECRET.BIN") == -19 && f.host.opens == 0u,
++                "existing symlink escaped the mounted root");
++        fs::create_directory_symlink(f.tree.root / "cd" / "DATA", f.tree.root / "cd" / "inside");
++        const int32_t inside = f.open("cdrom0:inside/TEST.BIN");
++        require(inside >= 0 && f.call(5u, static_cast<uint32_t>(inside)) == 0u,
++                "contained symlink did not resolve to its authored file");
++
++        require(f.memory.writeRam(0x13000u, "cdrom", 6u) &&
++                    f.memory.zeroRam(0x13100u, 24u) && f.memory.zeroRam(0x13200u, 8u),
++                "could not install authored driver metadata");
++        f.memory.write32(0x13100u, 0x13000u);
++        f.memory.write32(0x13110u, 0x13200u);
++        require(f.call(20u, 0x13100u) == 0u, "could not register authored CD driver");
++        const size_t opens = f.host.opens;
++        for (const std::string path : {"cdrom0:DATA/TEST.BIN", "CDROM0:DATA/TEST.BIN"})
++        {
++            require(f.memory.writeRam(0x10000u, path.c_str(), path.size() + 1u), "could not install driver path");
++            IopCpuState cpu{};
++            cpu.gpr[2] = marker;
++            cpu.gpr[4] = 0x10000u;
++            cpu.gpr[5] = 1u;
++            require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
++                        f.host.opens == opens,
++                    "modeled mounted open shadowed a registered original driver");
++        }
++    }
++
++    void unsupportedOperationsStayStrict()
++    {
++        Fixture f;
++        (void)f.open();
++        const size_t opens = f.host.opens;
++        for (const uint32_t flags : {0u, 2u, 3u, 0x11u, 0x101u, 0x201u, 0x401u, 0x8001u})
++        {
++            IopCpuState cpu{};
++            cpu.gpr[2] = marker;
++            cpu.gpr[4] = 0x10000u;
++            cpu.gpr[5] = flags;
++            require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
++                        f.host.opens == opens,
++                    "unsupported access mode invented an open result");
++        }
++        for (const uint16_t ordinal : {7u, 9u, 10u, 30u})
++        {
++            IopCpuState cpu{};
++            cpu.gpr[2] = marker;
++            require(!f.ioman->dispatchImport(ordinal, cpu, f.executor) && cpu.gpr[2] == marker,
++                    "unsupported write, metadata or 64-bit operation fabricated success");
++        }
++    }
++
++    void malformedPathsFailBeforeHostActivity()
++    {
++        using Alter = std::function<uint32_t(Fixture &)>;
++        const Alter examples[] = {
++            [](Fixture &) { return 0u; },
++            [](Fixture &) { return 0x8000u; },
++            [](Fixture &) { return 0xC0010000u; },
++            [](Fixture &f) { f.memory.write8(IopMemory::RamSize - 1u, 'x'); return 0xA01FFFFFu; },
++            [](Fixture &f) { f.fill(0x10000u, 1024u, 'x'); return 0x10000u; },
++            [](Fixture &f)
++            {
++                const uint32_t address = f.memory.allocate(32u);
++                f.fill(address, 32u, 'x');
++                require(f.memory.freeAllocation(address), "could not free authored path");
++                return address;
++            },
++            [](Fixture &f)
++            {
++                const uint32_t address = f.memory.allocate(16u);
++                require(f.memory.allocate(16u) == address + 16u, "authored allocations are not adjacent");
++                f.fill(address, 16u, 'x');
++                f.memory.write8(address + 16u, 0u);
++                return address;
++            },
++        };
++        for (const auto &alter : examples)
++        {
++            Fixture f;
++            const uint32_t address = alter(f);
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            IopCpuState cpu{};
++            cpu.gpr[2] = marker;
++            cpu.gpr[4] = address;
++            cpu.gpr[5] = 1u;
++            bool rejected = false;
++            try { (void)f.ioman->dispatchImport(4u, cpu, f.executor); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && cpu.gpr[2] == marker && f.host.opens == 0u &&
++                        f.host.translations == 0u &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "malformed path changed RAM, returned a result or reached host translation");
++        }
++    }
++
++    void malformedReadSpansFailBeforeMutation()
++    {
++        using Alter = std::function<std::pair<uint32_t, uint32_t>(Fixture &)>;
++        const Alter examples[] = {
++            [](Fixture &) { return std::pair{0u, 4u}; },
++            [](Fixture &) { return std::pair{0x8000u, 4u}; },
++            [](Fixture &) { return std::pair{0xC0011000u, 4u}; },
++            [](Fixture &) { return std::pair{0x20011000u, 4u}; },
++            [](Fixture &) { return std::pair{IopMemory::ScratchBase, 4u}; },
++            [](Fixture &) { return std::pair{0x11000u, 0xFFFFFFFFu}; },
++            [](Fixture &f) { f.fill(0x1FFFFCu, 4u); return std::pair{0xA01FFFFCu, 8u}; },
++            [](Fixture &f) { f.fill(0x14000u, 4u); return std::pair{0x14000u, 8u}; },
++            [](Fixture &f)
++            {
++                const uint32_t address = f.memory.allocate(16u);
++                require(f.memory.allocate(16u) == address + 16u, "authored allocations are not adjacent");
++                f.fill(address, 32u);
++                return std::pair{address, 32u};
++            },
++            [](Fixture &f)
++            {
++                const uint32_t address = f.memory.allocate(16u);
++                f.fill(address - 8u, 24u);
++                return std::pair{address - 8u, 16u};
++            },
++            [](Fixture &f)
++            {
++                const uint32_t address = f.memory.allocate(16u);
++                f.fill(address, 16u);
++                require(f.memory.freeAllocation(address), "could not free authored destination");
++                return std::pair{address, 16u};
++            },
++        };
++        for (const auto &alter : examples)
++        {
++            Fixture f;
++            const auto fd = static_cast<uint32_t>(f.open());
++            f.fill(0x11000u, 16u);
++            const auto [address, size] = alter(f);
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            bool rejected = false;
++            try { (void)f.call(6u, fd, address, size); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && f.host.reads == 0u && f.position(fd) == 0u &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "invalid complete read span touched host data, changed RAM or advanced position");
++        }
++    }
++
++    void partialAndFailedHostReadsAreTransactional()
++    {
++        Fixture f;
++        const auto fd = static_cast<uint32_t>(f.open());
++        f.fill(0x11000u, 16u);
++        f.host.maximumRead = 2u;
++        require(f.call(6u, fd, 0x11000u, 8u) == 2u && f.position(fd) == 2u &&
++                    f.bytes(0x11000u, 3u) == std::vector<uint8_t>({0u, 0x7Fu, 0xCAu}),
++                "legitimate host short read was widened or advanced by the requested size");
++        const auto before = f.bytes(0x11000u, 16u);
++        f.host.failRead = true;
++        require(static_cast<int32_t>(f.call(6u, fd, 0x11000u, 8u)) == -5 &&
++                    f.bytes(0x11000u, 16u) == before && f.position(fd) == 2u,
++                "backend failure committed staged bytes or file position");
++        f.host.failRead = false;
++        for (const bool excessive : {true, false})
++        {
++            f.host.overReport = excessive;
++            f.host.throwRead = !excessive;
++            bool rejected = false;
++            try { (void)f.call(6u, fd, 0x11000u, 8u); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && f.bytes(0x11000u, 16u) == before && f.position(fd) == 2u,
++                    "invalid or throwing host read committed data or advanced the file");
++        }
++    }
++
++    void readLifetimeChangesCannotCommit()
++    {
++        {
++            Fixture f;
++            const auto fd = static_cast<uint32_t>(f.open());
++            const uint32_t destination = f.memory.allocate(32u);
++            f.fill(destination, 32u);
++            f.host.readHook = [&]
++            {
++                require(f.memory.freeAllocation(destination), "could not free pending read destination");
++                require(f.memory.allocate(32u, 16u, destination) == destination,
++                        "could not replace pending read allocation");
++                f.fill(destination, 32u, 0x5Au);
++            };
++            bool rejected = false;
++            try { (void)f.call(6u, fd, destination, 8u); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && f.bytes(destination, 32u) == std::vector<uint8_t>(32u, 0x5Au) &&
++                        f.position(fd) == 0u,
++                    "read wrote into a replacement allocation at the same address");
++        }
++        {
++            Fixture f;
++            f.host.reuseHandle = true;
++            const auto fd = static_cast<uint32_t>(f.open());
++            f.fill(0x11000u, 16u);
++            f.host.readHook = [&]
++            {
++                f.ioman->reset();
++                require(f.open() == static_cast<int32_t>(fd), "could not replace reset descriptor");
++            };
++            bool rejected = false;
++            try { (void)f.call(6u, fd, 0x11000u, 8u); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && f.bytes(0x11000u, 16u) == std::vector<uint8_t>(16u, 0xCAu) &&
++                        f.position(fd) == 0u && f.host.handles.size() == 1u,
++                    "read committed through reset/reopen with a reused host handle");
++        }
++    }
++
++    void tableCapacityResetAndDestructionCloseOwnedHandles()
++    {
++        Fixture f;
++        std::set<uint32_t> descriptors;
++        for (unsigned i = 0u; i < 16u; ++i)
++        {
++            const int32_t fd = f.open();
++            require(fd >= 0 && descriptors.insert(static_cast<uint32_t>(fd)).second,
++                    "descriptor table reused a live entry");
++        }
++        require(f.open() == -24 && f.host.opens == 16u && f.host.handles.size() == 16u,
++                "full table opened an unowned host handle or failed to return EMFILE");
++        const uint32_t released = *descriptors.begin();
++        require(f.call(5u, released) == 0u && f.open() == static_cast<int32_t>(released),
++                "closed descriptor slot was not reusable");
++        f.ioman->reset();
++        require(f.host.handles.empty() && f.host.closes == 17u,
++                "reset leaked or double-closed an owned host handle");
++        for (const uint32_t fd : descriptors)
++            require(static_cast<int32_t>(f.call(5u, fd)) == -9,
++                    "descriptor survived reset");
++        require(f.open() >= 0 && f.open() >= 0, "could not open files after reset");
++        f.ioman.reset();
++        require(f.host.handles.empty() && f.host.closes == 19u,
++                "IOMAN destruction did not close its remaining owned host handles");
++    }
++
++    void pendingOpenReservationsAreNotOverwritten()
++    {
++        for (const bool duringSize : {false, true})
++        {
++            Fixture f;
++            bool entered = false;
++            int32_t nested = -1;
++            const auto callback = [&]
++            {
++                if (entered)
++                    return;
++                entered = true;
++                require(static_cast<int32_t>(f.call(5u, 0u)) == -9 &&
++                            static_cast<int32_t>(f.call(6u, 0u, 0u, 0u)) == -9,
++                        "pending descriptor exposed an uncommitted host handle");
++                nested = f.open("host:TEST.BIN");
++            };
++            if (duringSize) f.host.sizeHook = callback;
++            else f.host.openHook = callback;
++            const int32_t outer = f.open();
++            require(outer >= 0 && nested >= 0 && outer != nested &&
++                        f.host.handles.size() == 2u && f.host.opens == 2u && f.host.sizes == 2u,
++                    "nested host callback open replaced an outer descriptor reservation");
++            require(f.call(5u, static_cast<uint32_t>(outer)) == 0u &&
++                        f.call(5u, static_cast<uint32_t>(nested)) == 0u &&
++                        f.host.handles.empty() && f.host.closes == 2u,
++                    "nested open leaked or aliased a committed host handle");
++        }
++        for (const bool duringSize : {false, true})
++        {
++            Fixture f;
++            bool entered = false;
++            int32_t replacement = -1;
++            const auto callback = [&]
++            {
++                if (entered)
++                    return;
++                entered = true;
++                f.ioman->reset();
++                replacement = f.open("host:TEST.BIN");
++            };
++            if (duringSize) f.host.sizeHook = callback;
++            else f.host.openHook = callback;
++            bool rejected = false;
++            try { (void)f.open(); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && replacement >= 0 && f.host.handles.size() == 1u &&
++                        f.host.closes == 1u &&
++                        f.position(static_cast<uint32_t>(replacement)) == 0u,
++                    "reset during open committed an old reservation or removed its replacement");
++            require(f.call(5u, static_cast<uint32_t>(replacement)) == 0u &&
++                        f.host.handles.empty() && f.host.closes == 2u,
++                    "reset/reopen failed to preserve exactly the replacement handle");
++        }
++    }
++
++    void failedOpenAndThrowingCleanupDoNotLeak()
++    {
++        {
++            Fixture f;
++            f.host.failSize = true;
++            f.host.throwClose = true;
++            require(f.open() == -5 && f.host.handles.empty() && f.host.closes == 1u,
++                    "failed size query leaked its opened handle or propagated cleanup failure");
++            f.host.failSize = false;
++            f.host.throwSize = true;
++            bool rejected = false;
++            try { (void)f.open(); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()) == "authored size exception"; }
++            require(rejected && f.host.handles.empty() && f.host.closes == 2u,
++                    "throwing open cleanup hid the original exception or leaked its handle");
++        }
++        {
++            Fixture f;
++            const auto first = static_cast<uint32_t>(f.open());
++            const auto second = static_cast<uint32_t>(f.open());
++            const auto third = static_cast<uint32_t>(f.open());
++            f.host.throwClose = true;
++            try { f.ioman->reset(); }
++            catch (const std::runtime_error &) {}
++            require(f.host.handles.empty() && f.host.closes == 3u &&
++                        static_cast<int32_t>(f.call(5u, first)) == -9 &&
++                        static_cast<int32_t>(f.call(5u, second)) == -9 &&
++                        static_cast<int32_t>(f.call(5u, third)) == -9,
++                    "one throwing close prevented reset from clearing every descriptor");
++            require(f.open() >= 0 && f.open() >= 0, "could not open destruction cleanup fixtures");
++            f.ioman.reset();
++            require(f.host.handles.empty() && f.host.closes == 5u,
++                    "throwing destructor cleanup skipped remaining handles");
++        }
++    }
++
++    iop_test::Irx authoredFileImports(uint32_t flags = 1u)
++    {
++        iop_test::Irx image(0x10000u, 0x600u);
++        // Authored MIPS executes the import stubs, consumes bytes in IOP RAM,
++        // seeks relative to the actual read position and closes the descriptor.
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u, 0xAFB10014u,
++            0x3C100001u, 0x26040400u, 0x34050000u | flags, 0x00003021u,
++            0x0C004085u, 0u, 0x00408821u, 0xAE020480u,
++            0x02202021u, 0x26050440u, 0x24060005u, 0x0C004089u, 0u,
++            0xAE020484u, 0x02202021u, 0x2405FFFEu, 0x24060001u,
++            0x0C00408Bu, 0u, 0xAE020488u,
++            0x02202021u, 0x26050448u, 0x24060004u, 0x0C004089u, 0u,
++            0xAE02048Cu, 0x02202021u, 0x0C004087u, 0u, 0xAE020490u,
++            0x8E080440u, 0u, 0xAE080498u, 0x92080444u, 0u, 0xAE08049Cu,
++            0x8FB10014u, 0x8FB00018u, 0x8FBF001Cu, 0x27BD0020u,
++            0x03E00008u, 0x00001021u,
++        });
++        image.words(0x200u, {
++            0x41E00000u, 0u, 0x0104u, 0x616D6F69u, 0x0000006Eu,
++            0x03E00008u, 0x24000004u,
++            0x03E00008u, 0x24000005u,
++            0x03E00008u, 0x24000006u,
++            0x03E00008u, 0x24000008u, 0u, 0u,
++        });
++        const std::string path = "cdrom0:\\DATA\\TEST.BIN;1";
++        std::memcpy(image.bytes.data() + 0x100u + 0x400u, path.c_str(), path.size() + 1u);
++        return image;
++    }
++
++    void authoredMipsImportsConsumeActualIopBytes()
++    {
++        TemporaryTree tree;
++        FileHost host(tree);
++        IopEmulator iop(host);
++        const auto image = authoredFileImports();
++        const auto loaded = iop.loadModuleImage("authored-file-imports", image.bytes, nullptr, 0u);
++        std::array<uint32_t, 8u> results{};
++        std::array<uint8_t, 12u> data{};
++        require(loaded.moduleId > 0 && loaded.startResult == 0 &&
++                    iop.readMemory(0x10480u, results.data(), sizeof(results)) &&
++                    iop.readMemory(0x10440u, data.data(), data.size()) &&
++                    results[0] < 16u && results[1] == 5u && results[2] == 3u &&
++                    results[3] == 4u && results[4] == 0u &&
++                    results[6] == 0xFF807F00u && results[7] == 0x31u &&
++                    std::equal(content.begin(), content.begin() + 5, data.begin()) &&
++                    std::equal(content.begin() + 3, content.begin() + 7, data.begin() + 8),
++                "actual IOP imports did not preserve open/read/seek/close ABI and binary bytes");
++        require(host.opens == 1u && host.reads == 2u && host.closes == 1u &&
++                    host.handles.empty() && host.guestWrites == 0u && host.guestReads == 0u,
++                "authored imported file path leaked a handle or directly touched EE RAM");
++
++        FileHost unsupportedHost(tree);
++        IopEmulator unsupported(unsupportedHost);
++        const auto writeMode = authoredFileImports(2u);
++        bool rejected = false;
++        try { (void)unsupported.loadModuleImage("authored-write-mode", writeMode.bytes, nullptr, 0u); }
++        catch (const std::runtime_error &error)
++        { rejected = std::string_view(error.what()).find("missing import ioman:4") != std::string_view::npos; }
++        require(rejected && unsupportedHost.opens == 0u && unsupportedHost.guestWrites == 0u,
++                "unsupported imported write-open did not remain a strict missing operation");
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Mounted files return exact bytes with independent offsets and EOF", sequentialBytesAndIndependentPositions},
++        {"Read accepts complete RAM aliases and live allocation interiors", aliasesAndLiveHeapBuffers},
++        {"Bad descriptors and signed seek errors preserve file position", descriptorAndSeekErrorsPreservePosition},
++        {"Explicit mounts distinguish absent devices from absent files", supportedMountsAndAbsentRoutes},
++        {"Canonical paths remain contained and original drivers take precedence", canonicalContainmentAndDriverPrecedence},
++        {"Unsupported file modes and operations remain strict", unsupportedOperationsStayStrict},
++        {"Malformed paths fail before host or guest side effects", malformedPathsFailBeforeHostActivity},
++        {"Malformed complete read spans fail before host or guest mutation", malformedReadSpansFailBeforeMutation},
++        {"Partial reads and backend failures preserve exact commit semantics", partialAndFailedHostReadsAreTransactional},
++        {"Read cannot commit across allocation or descriptor replacement", readLifetimeChangesCannotCommit},
++        {"Descriptor capacity, reset and destruction preserve host ownership", tableCapacityResetAndDestructionCloseOwnedHandles},
++        {"Pending open reservations survive nested calls and reject reset", pendingOpenReservationsAreNotOverwritten},
++        {"Failed open and throwing cleanup cannot leak remaining handles", failedOpenAndThrowingCleanupDoNotLeak},
++        {"Authored MIPS file imports consume real IOP bytes without EE writes", authoredMipsImportsConsumeActualIopBytes},
++    };
++    return iop_test::run(tests);
++}
+diff --git a/ps2xIOP/tests/iop_mailbox_tests.cpp b/ps2xIOP/tests/iop_mailbox_tests.cpp
+index 100bc26749cfe56f84ecfd640cd3d8e8ded03f0c..d99ff72beb3af2ae393694463e7b4f107056975d 100644
+--- a/ps2xIOP/tests/iop_mailbox_tests.cpp
++++ b/ps2xIOP/tests/iop_mailbox_tests.cpp
+@@ -247,6 +247,17 @@ namespace
+         require(!f.kernel.dispatchMailboxImport(10u, direct), "unknown ordinal became a supported operation");
+         f.kernel.reset();
+         require(f.call(9u, 0x10900u, box) == -410 && f.create() == 1, "reset retained mailbox state");
++
++        // A packet cannot begin in static RAM and borrow the first word of an
++        // adjacent heap object: the complete packet needs one valid owner.
++        const uint32_t firstHeap = f.memory.allocate(16u);
++        require(firstHeap == IopMemory::HeapBase && f.memory.zeroRam(firstHeap - 4u, 4u),
++                "heap boundary fixture unavailable");
++        const std::vector<uint8_t> boundaryBefore(f.memory.ram().begin(), f.memory.ram().end());
++        bool crossed = false;
++        try { (void)f.call(6u, 1u, firstHeap - 4u); } catch (const std::runtime_error &) { crossed = true; }
++        require(crossed && std::equal(boundaryBefore.begin(), boundaryBefore.end(), f.memory.ram().begin()),
++                "packet crossing from static RAM into a live heap allocation was accepted");
+     }
+ 
+     void interruptScopeIsRealAndExceptionSafe()

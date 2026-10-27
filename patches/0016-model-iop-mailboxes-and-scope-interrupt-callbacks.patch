@@ -1,0 +1,1165 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 5e62a716d1949ec8e96c05587272215ba8714f9d..bb612bad8ce698cdfd2e3f3b1173a90aa3e2e948 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -14,6 +14,7 @@ add_library(ps2_iop STATIC
+     src/emulator/iop_emulator.cpp
+     src/emulator/core/iop_cpu.cpp
+     src/emulator/core/iop_kernel.cpp
++    src/emulator/core/iop_mailbox.cpp
+     src/emulator/core/iop_memory.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+@@ -48,6 +49,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_mailbox_tests tests/iop_mailbox_tests.cpp)
++    target_link_libraries(ps2_iop_mailbox_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_mailbox_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_mailbox_tests COMMAND ps2_iop_mailbox_tests)
++
+     add_executable(ps2_iop_ioman_devctl_tests tests/iop_ioman_devctl_tests.cpp)
+     target_link_libraries(ps2_iop_ioman_devctl_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_ioman_devctl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f5ba4e4ce4915a3921f5acd931dd51d457..8b1707bf880a0719de0a4141cc8151193bc2d116 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -28,9 +28,12 @@ namespace ps2x::iop::detail
+         m_threads.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
++        m_mailboxes.clear();
+         m_nextThreadId = 1;
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
++        m_nextMailboxId = 1;
++        m_nextMailboxWaitOrder = 1u;
+         m_currentThread = nullptr;
+     }
+ 
+@@ -98,6 +101,10 @@ namespace ps2x::iop::detail
+             thread.cpu.gpr[28] = cpu.gpr[28];
+             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+             thread.cpu.gpr[31] = kThreadReturnSentinel;
++            thread.waitId = 0;
++            thread.waitResultAddress = 0u;
++            thread.mailboxWaitOrder = 0u;
++            thread.mailboxWaitOwner = 0u;
+             thread.state = IopThreadState::Ready;
+             setV0(0);
+             return true;
+@@ -161,7 +168,18 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
+-            if (it->second.state == IopThreadState::Sleep ||
++            if (it->second.state == IopThreadState::Mailbox ||
++                it->second.state == IopThreadState::MailboxSuspended)
++            {
++                it->second.state = it->second.state == IopThreadState::MailboxSuspended ?
++                    IopThreadState::Suspended : IopThreadState::Ready;
++                it->second.cpu.gpr[2] = static_cast<uint32_t>(-418); // KE_RELEASE_WAIT.
++                it->second.waitId = 0;
++                it->second.waitResultAddress = 0u;
++                it->second.mailboxWaitOrder = 0u;
++                it->second.mailboxWaitOwner = 0u;
++            }
++            else if (it->second.state == IopThreadState::Sleep ||
+                 it->second.state == IopThreadState::Delay ||
+                 it->second.state == IopThreadState::Semaphore ||
+                 it->second.state == IopThreadState::EventFlag)
+@@ -233,7 +251,9 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
+-            it->second.state = IopThreadState::Suspended;
++            it->second.state = (it->second.state == IopThreadState::Mailbox ||
++                                it->second.state == IopThreadState::MailboxSuspended) ?
++                IopThreadState::MailboxSuspended : IopThreadState::Suspended;
+             if (m_currentThread == &it->second)
+                 cpu.yielded = true;
+             setV0(0);
+@@ -251,6 +271,8 @@ namespace ps2x::iop::detail
+             }
+             if (it->second.state == IopThreadState::Suspended)
+                 it->second.state = IopThreadState::Ready;
++            else if (it->second.state == IopThreadState::MailboxSuspended)
++                it->second.state = IopThreadState::Mailbox;
+             setV0(0);
+             return true;
+         }
+@@ -322,8 +344,12 @@ namespace ps2x::iop::detail
+         case IopThreadState::Delay:
+         case IopThreadState::Semaphore:
+         case IopThreadState::EventFlag:
++        case IopThreadState::Mailbox:
+             status = 0x04u;
+             break;
++        case IopThreadState::MailboxSuspended:
++            status = 0x0Cu;
++            break;
+         case IopThreadState::Suspended:
+             status = 0x08u;
+             break;
+@@ -344,6 +370,7 @@ namespace ps2x::iop::detail
+         m_memory.write32(outputAddress + 36u, thread.state == IopThreadState::Sleep ? 1u : thread.state == IopThreadState::Delay   ? 2u
+                                                                                        : thread.state == IopThreadState::Semaphore ? 3u
+                                                                                        : thread.state == IopThreadState::EventFlag ? 4u
++                                                                                       : (thread.state == IopThreadState::Mailbox || thread.state == IopThreadState::MailboxSuspended) ? 5u
+                                                                                                                                    : 0u);
+         m_memory.write32(outputAddress + 40u, static_cast<uint32_t>(thread.waitId));
+         m_memory.write32(outputAddress + 44u, static_cast<uint32_t>(thread.wakeupCount));
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 49771024477e7655269f39e2b79c455c0cb693f4..d09bb3c36477b484cfcf894d59ea3fb76c3d971e 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -19,6 +20,8 @@ namespace ps2x::iop::detail
+         Delay,
+         Semaphore,
+         EventFlag,
++        Mailbox,
++        MailboxSuspended,
+         Suspended,
+         Dead,
+     };
+@@ -40,6 +43,8 @@ namespace ps2x::iop::detail
+         uint32_t waitBits = 0;
+         uint32_t waitMode = 0;
+         uint32_t waitResultAddress = 0;
++        uint64_t mailboxWaitOrder = 0u;
++        uint64_t mailboxWaitOwner = 0u;
+         int wakeupCount = 0;
+     };
+ 
+@@ -53,6 +58,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
+         [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] bool dispatchMailboxImport(uint16_t ordinal, IopCpuState &cpu, bool interruptContext = false);
+ 
+         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
+         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
+@@ -86,6 +92,19 @@ namespace ps2x::iop::detail
+             uint32_t option = 0;
+         };
+ 
++        struct MailboxMessage
++        {
++            uint32_t address = 0u;
++            uint64_t ownerIdentity = 0u;
++        };
++
++        struct Mailbox
++        {
++            uint32_t attr = 0u;
++            uint32_t option = 0u;
++            std::vector<MailboxMessage> messages;
++        };
++
+         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
+         void wakeOneSemaphore(int id);
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+@@ -95,9 +114,12 @@ namespace ps2x::iop::detail
+         std::map<int, IopThread> m_threads;
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
++        std::map<int, Mailbox> m_mailboxes;
+         uint32_t m_nextThreadId = 1;
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
++        uint32_t m_nextMailboxId = 1;
++        uint64_t m_nextMailboxWaitOrder = 1u;
+         IopThread *m_currentThread = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_mailbox.cpp b/ps2xIOP/src/emulator/core/iop_mailbox.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c322a583092c3ad00d264133a87b70632558a6fc
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_mailbox.cpp
+@@ -0,0 +1,242 @@
++#include "iop_kernel.h"
++#include "iop_memory.h"
++
++#include <algorithm>
++#include <limits>
++#include <stdexcept>
++#include <string>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        // ABI, queue ordering and errors are documented by PS2SDK thmsgbx.h,
++        // thmsgbx.c and kerr.h. Guest messages remain caller-owned memory.
++        // https://ps2dev.github.io/ps2sdk/thmsgbx_8h_source.html
++        // https://ps2dev.github.io/ps2sdk/thmsgbx_8c_source.html
++        // https://ps2dev.github.io/ps2sdk/kerr_8h_source.html
++        constexpr uint32_t kThreadPriority = 0x1u;
++        constexpr uint32_t kMessagePriority = 0x4u;
++
++        bool waiting(const IopThread &thread, int id)
++        {
++            return thread.waitId == id && (thread.state == IopThreadState::Mailbox ||
++                                            thread.state == IopThreadState::MailboxSuspended);
++        }
++
++        uint64_t checkedMemory(const IopMemory &memory, uint32_t address, size_t size,
++                               const char *purpose)
++        {
++            const uint32_t segment = address & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            if (address == 0u || (address & 3u) != 0u ||
++                (segment != 0u && segment != 0x80000000u && segment != 0xA0000000u) ||
++                physical >= IopMemory::RamSize || size > IopMemory::RamSize - physical ||
++                !memory.ownsRamRange(address, size))
++                throw std::runtime_error(std::string("IOP mailbox ") + purpose + " is outside aligned owned RAM");
++            const auto owner = memory.allocationContaining(physical);
++            if (owner)
++            {
++                if (size > owner->size - (physical - owner->address))
++                    throw std::runtime_error(std::string("IOP mailbox ") + purpose + " crosses an allocation boundary");
++                return owner->identity;
++            }
++            if (physical >= IopMemory::HeapBase && physical < IopMemory::HeapLimit)
++                throw std::runtime_error(std::string("IOP mailbox ") + purpose + " has no live heap allocation");
++            return 0u;
++        }
++
++        void checkLifetime(const IopMemory &memory, uint32_t address, size_t size,
++                           uint64_t identity, const char *purpose)
++        {
++            if (checkedMemory(memory, address, size, purpose) != identity)
++                throw std::runtime_error(std::string("IOP mailbox ") + purpose + " allocation was replaced while queued");
++        }
++
++        void release(IopThread &thread, int32_t result)
++        {
++            thread.state = thread.state == IopThreadState::MailboxSuspended ?
++                IopThreadState::Suspended : IopThreadState::Ready;
++            thread.cpu.gpr[2] = static_cast<uint32_t>(result);
++            thread.waitId = 0;
++            thread.waitResultAddress = 0u;
++            thread.mailboxWaitOrder = 0u;
++            thread.mailboxWaitOwner = 0u;
++        }
++    }
++
++    bool IopKernel::dispatchMailboxImport(uint16_t ordinal, IopCpuState &cpu, bool interruptContext)
++    {
++        if (ordinal != 4u && ordinal != 5u && ordinal != 6u && ordinal != 7u &&
++            ordinal != 8u && ordinal != 9u && ordinal != 11u && ordinal != 12u)
++            return false;
++        const auto result = [&](int32_t value) { cpu.gpr[2] = static_cast<uint32_t>(value); };
++        const bool interruptCall = ordinal == 7u || ordinal == 12u;
++        if (interruptCall != interruptContext)
++        {
++            result(-100); // KE_ILLEGAL_CONTEXT.
++            return true;
++        }
++
++        if (ordinal == 4u)
++        {
++            const uint32_t descriptor = cpu.gpr[4];
++            (void)checkedMemory(m_memory, descriptor, 8u, "descriptor");
++            const uint32_t attr = m_memory.read32(descriptor);
++            if ((attr & ~(kThreadPriority | kMessagePriority)) != 0u)
++            {
++                result(-401); // KE_ILLEGAL_ATTR.
++                return true;
++            }
++            if (m_nextMailboxId > static_cast<uint32_t>(std::numeric_limits<int>::max()))
++            {
++                result(-400); // KE_NO_MEMORY; handle space exhausted.
++                return true;
++            }
++            const int id = static_cast<int>(m_nextMailboxId);
++            Mailbox mailbox;
++            mailbox.attr = attr;
++            mailbox.option = m_memory.read32(descriptor + 4u);
++            m_mailboxes.emplace(id, std::move(mailbox));
++            ++m_nextMailboxId;
++            result(id);
++            return true;
++        }
++
++        // Receive/Poll use (void **out, int id), unlike Send(id, message).
++        const bool receive = ordinal == 8u || ordinal == 9u;
++        const int id = static_cast<int>(cpu.gpr[receive ? 5u : 4u]);
++        const auto found = m_mailboxes.find(id);
++        if (found == m_mailboxes.end())
++        {
++            result(-410); // KE_UNKNOWN_MBXID.
++            return true;
++        }
++        Mailbox &mailbox = found->second;
++        const auto checkQueue = [&]
++        {
++            for (size_t i = 0u; i < mailbox.messages.size(); ++i)
++            {
++                const MailboxMessage &message = mailbox.messages[i];
++                checkLifetime(m_memory, message.address, 8u, message.ownerIdentity, "queued message");
++                const uint32_t expectedNext = mailbox.messages[(i + 1u) % mailbox.messages.size()].address;
++                if (m_memory.read32(message.address) != expectedNext)
++                    throw std::runtime_error("IOP mailbox circular message links changed while queued");
++            }
++        };
++
++        if (ordinal == 5u)
++        {
++            // Deletion never dereferences or frees the caller's messages.
++            for (auto &[threadId, thread] : m_threads)
++                if (waiting(thread, id))
++                    release(thread, -425); // KE_WAIT_DELETE.
++            m_mailboxes.erase(found);
++            result(0);
++            return true;
++        }
++
++        if (ordinal == 6u || ordinal == 7u)
++        {
++            const uint32_t address = cpu.gpr[5];
++            const uint64_t owner = checkedMemory(m_memory, address, 8u, "message");
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            for (const auto &[boxId, box] : m_mailboxes)
++                for (const auto &queued : box.messages)
++                    if (IopMemory::physicalAddress(queued.address) == physical)
++                        throw std::runtime_error("IOP mailbox message is already queued");
++
++            IopThread *selected = nullptr;
++            for (auto &[threadId, thread] : m_threads)
++            {
++                if (!waiting(thread, id))
++                    continue;
++                const bool byPriority = (mailbox.attr & kThreadPriority) != 0u;
++                if (selected == nullptr ||
++                    (byPriority && thread.priority < selected->priority) ||
++                    ((!byPriority || thread.priority == selected->priority) &&
++                     thread.mailboxWaitOrder < selected->mailboxWaitOrder))
++                    selected = &thread;
++            }
++            if (selected != nullptr)
++            {
++                checkLifetime(m_memory, selected->waitResultAddress, 4u,
++                              selected->mailboxWaitOwner, "waiting result");
++                m_memory.write32(selected->waitResultAddress, address);
++                release(*selected, 0);
++                // Direct delivery does not write the caller's message header.
++                result(0);
++                return true;
++            }
++
++            checkQueue();
++            auto updated = mailbox.messages; // Allocate before changing guest links.
++            auto position = updated.end();
++            if ((mailbox.attr & kMessagePriority) != 0u)
++            {
++                const uint8_t priority = m_memory.read8(address + 4u);
++                position = std::find_if(updated.begin(), updated.end(), [&](const MailboxMessage &message)
++                    { return m_memory.read8(message.address + 4u) > priority; });
++            }
++            updated.insert(position, {address, owner});
++            for (size_t i = 0u; i < updated.size(); ++i)
++                m_memory.write32(updated[i].address, updated[(i + 1u) % updated.size()].address);
++            mailbox.messages.swap(updated);
++            result(0);
++            return true;
++        }
++
++        if (receive)
++        {
++            const uint32_t output = cpu.gpr[4];
++            const uint64_t owner = checkedMemory(m_memory, output, 4u, "receive output");
++            if (mailbox.messages.empty())
++            {
++                if (ordinal == 9u)
++                    result(-424); // KE_MBOX_NOMSG; leave output untouched.
++                else
++                {
++                    if (m_currentThread == nullptr || &cpu != &m_currentThread->cpu)
++                        throw std::runtime_error("IOP mailbox ReceiveMbx cannot suspend a direct guest callback");
++                    if (m_nextMailboxWaitOrder == std::numeric_limits<uint64_t>::max())
++                        throw std::runtime_error("IOP mailbox wait ordering exhausted");
++                    m_currentThread->state = IopThreadState::Mailbox;
++                    m_currentThread->waitId = id;
++                    m_currentThread->waitResultAddress = output;
++                    m_currentThread->mailboxWaitOwner = owner;
++                    m_currentThread->mailboxWaitOrder = m_nextMailboxWaitOrder++;
++                    cpu.yielded = true;
++                    // The result becomes valid only when Send/Delete/Release
++                    // actually wakes the thread. No message is fabricated.
++                }
++                return true;
++            }
++
++            checkQueue();
++            const uint32_t message = mailbox.messages.front().address;
++            if (mailbox.messages.size() > 1u)
++                m_memory.write32(mailbox.messages.back().address, mailbox.messages[1u].address);
++            mailbox.messages.erase(mailbox.messages.begin());
++            m_memory.write32(output, message);
++            result(0);
++            return true;
++        }
++
++        // ReferMbxStatus writes the five documented fields. The final two
++        // reserved words in the 28-byte public structure remain untouched.
++        const uint32_t output = cpu.gpr[5];
++        (void)checkedMemory(m_memory, output, 20u, "status output");
++        checkQueue();
++        uint32_t waiters = 0u;
++        for (const auto &[threadId, thread] : m_threads)
++            if (waiting(thread, id))
++                ++waiters;
++        m_memory.write32(output, mailbox.attr);
++        m_memory.write32(output + 4u, mailbox.option);
++        m_memory.write32(output + 8u, waiters);
++        m_memory.write32(output + 12u, static_cast<uint32_t>(mailbox.messages.size()));
++        m_memory.write32(output + 16u, mailbox.messages.empty() ? 0u : mailbox.messages.front().address);
++        result(0);
++        return true;
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+index da3be3b48b443e44642ee56b6f96e901fe9d7966..f25516d9ded92afa94c9d20448a7a3a6f35b16f2 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -15,6 +15,7 @@ namespace ps2x::iop::detail
+     {
+         m_handlers.clear();
+         m_enabled.clear();
++        m_interruptDepth = 0u;
+     }
+ 
+     bool IopIntrman::dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor)
+@@ -70,13 +71,15 @@ namespace ps2x::iop::detail
+             return true;
+         case 15:
+         case 16:
+-        case 23:
+         case 24:
+         case 25:
+         case 28:
+         case 30:
+             setV0(0u);
+             return true;
++        case 23: // QueryIntrContext
++            setV0(inInterruptContext() ? 1u : 0u);
++            return true;
+         case 17:
+             if (a0 != 0u)
+                 m_memory.write32(a0, m_memory.interruptControl());
+@@ -101,13 +104,21 @@ namespace ps2x::iop::detail
+         if (handler == m_handlers.end() || handler->second.function == 0u)
+             return false;
+ 
+-        (void)executor.executeGuestFunctionWithBudget(handler->second.function,
+-                                                      handler->second.argument,
+-                                                      0u,
+-                                                      0u,
+-                                                      0u,
+-                                                      handler->second.gp,
+-                                                      100000u);
++        (void)executeInterruptCallback(handler->second.function, handler->second.argument,
++                                       handler->second.gp, executor);
+         return true;
+     }
++
++    uint32_t IopIntrman::executeInterruptCallback(uint32_t function, uint32_t argument,
++                                                 uint32_t gp, IopGuestExecutor &executor) const
++    {
++        struct InterruptScope
++        {
++            uint32_t &depth;
++            uint32_t previous;
++            explicit InterruptScope(uint32_t &value) : depth(value), previous(value) { ++depth; }
++            ~InterruptScope() { depth = previous; }
++        } scope(m_interruptDepth);
++        return executor.executeGuestFunctionWithBudget(function, argument, 0u, 0u, 0u, gp, 100000u);
++    }
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.h b/ps2xIOP/src/emulator/imports/iop_intrman.h
+index 48fdb145c19b2713fc2b3c05764f3b6e967bd96d..9bdde40f459067b0630c32cb49dee137ccdfc28f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.h
+@@ -17,6 +17,11 @@ namespace ps2x::iop::detail
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
++        [[nodiscard]] bool inInterruptContext() const noexcept { return m_interruptDepth != 0u; }
++        // Hard-timer callbacks execute through the same interrupt context as
++        // registered hardware IRQ handlers.
++        [[nodiscard]] uint32_t executeInterruptCallback(uint32_t function, uint32_t argument,
++                                                        uint32_t gp, IopGuestExecutor &executor) const;
+ 
+     private:
+         struct Handler
+@@ -29,5 +34,6 @@ namespace ps2x::iop::detail
+         IopMemory &m_memory;
+         std::map<int, Handler> m_handlers;
+         std::map<int, bool> m_enabled;
++        mutable uint32_t m_interruptDepth = 0u;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.cpp b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+index 3d80897c2d68cfa393a58cadc132e846ebf7ad65..cc73d7e8992ca5dd4b87f4dcc05b579fe24751ed 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_timrman.h"
++#include "iop_intrman.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../services/iop_rpc.h"
+@@ -414,7 +415,7 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
+-    void IopTimrman::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor)
++    void IopTimrman::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
+     {
+         if (m_servicing)
+             return;
+@@ -439,13 +440,8 @@ namespace ps2x::iop::detail
+             timer.compareCycle = UINT64_MAX;
+             timer.overflowCycle = UINT64_MAX;
+             const uint32_t result = callback.function != 0u
+-                                        ? executor.executeGuestFunctionWithBudget(callback.function,
+-                                                                                  callback.common,
+-                                                                                  0u,
+-                                                                                  0u,
+-                                                                                  0u,
+-                                                                                  callback.gp,
+-                                                                                  100000u)
++                                        ? intrman.executeInterruptCallback(callback.function, callback.common,
++                                                                           callback.gp, executor)
+                                         : 0u;
+             if (!timer.running)
+                 continue;
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.h b/ps2xIOP/src/emulator/imports/iop_timrman.h
+index 11b53b6020390b834207bf05a47add1cb8ff675c..9336df44fff263be4bc8559a4197170bbb8d328e 100644
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.h
+@@ -8,6 +8,7 @@ namespace ps2x::iop::detail
+ {
+     struct IopCpuState;
+     class IopGuestExecutor;
++    class IopIntrman;
+ 
+     class IopTimrman
+     {
+@@ -15,7 +16,7 @@ namespace ps2x::iop::detail
+         void reset() noexcept;
+ 
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
+-        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor);
++        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman);
+         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+ 
+     private:
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 5bc13ce1e9329db3f6b63445b1d28772414d57b5..75d417004ad277cbd915b0e029a6b03c0911f8f0 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -200,6 +200,14 @@ namespace ps2x::iop::detail
+                     throw std::runtime_error("Strict IOP loader: allocated section is outside load segments");
+                 if (type != 4u && type != 9u)
+                     continue;
++                // The legacy relocation engine handles Sony REL image offsets.
++                // ET_EXEC needs virtual-address r_offset semantics, and RELA
++                // needs explicit addends for every relocation kind. Reject these
++                // unsupported forms before staging or committing guest memory.
++                if (size != 0u && kind == 2u)
++                    throw std::runtime_error("Strict IOP loader: ET_EXEC relocations are unsupported");
++                if (size != 0u && type == 4u)
++                    throw std::runtime_error("Strict IOP loader: RELA relocations are unsupported");
+                 const uint32_t entrySize = type == 4u ? 12u : 8u;
+                 const uint32_t declaredSize = imageWord(image, sh + 36u);
+                 const uint32_t target = imageWord(image, sh + 28u), symbols = imageWord(image, sh + 24u);
+@@ -673,6 +681,12 @@ namespace ps2x::iop::detail
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+             }
++            if (iequals(call.library, "thmsgbx"))
++            {
++                return kernel.dispatchMailboxImport(call.ordinal, cpu, intrman.inInterruptContext())
++                           ? ImportDisposition::Handled
++                           : ImportDisposition::Missing;
++            }
+             if (iequals(call.library, "sifcmd") && rpc.dispatchSifCmdImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
+@@ -1001,7 +1015,7 @@ namespace ps2x::iop::detail
+                 {
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+-                    timrman.serviceDue(totalCycles, *this);
++                    timrman.serviceDue(totalCycles, *this, intrman);
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index e9529cf3e395846beb535e4f6c13daa06b39efd5..616e5fabe3ba9d0aece606d1e4e0b68de45e78e4 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "emulator/core/iop_memory.h"
+ #include "emulator/imports/iop_cdvd.h"
+ #include "emulator/imports/iop_imports.h"
++#include "emulator/imports/iop_intrman.h"
+ #include "emulator/imports/iop_loadcore.h"
+ #include "emulator/imports/iop_timrman.h"
+ #include "emulator/services/iop_rpc.h"
+@@ -659,6 +660,8 @@ namespace
+ 
+     bool testTimrmanPeriodicCallback()
+     {
++        IopMemory memory;
++        IopIntrman intrman(memory);
+         IopTimrman timrman;
+         timrman.reset();
+         IopCpuState cpu{};
+@@ -699,10 +702,10 @@ namespace
+ 
+         RecordingExecutor executor;
+         executor.callbackResult = 100u;
+-        timrman.serviceDue(199u, executor);
++        timrman.serviceDue(199u, executor, intrman);
+         if (!expect(executor.calls == 0u, "timer callback ran too early"))
+             return false;
+-        timrman.serviceDue(200u, executor);
++        timrman.serviceDue(200u, executor, intrman);
+         return expect(executor.calls == 1u, "timer callback did not run") &&
+                expect(executor.lastAddress == 0x12340u, "timer called the wrong handler") &&
+                expect(executor.lastArgument == 0x45670u, "timer passed the wrong common argument") &&
+diff --git a/ps2xIOP/tests/iop_mailbox_tests.cpp b/ps2xIOP/tests/iop_mailbox_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..100bc26749cfe56f84ecfd640cd3d8e8ded03f0c
+--- /dev/null
++++ b/ps2xIOP/tests/iop_mailbox_tests.cpp
+@@ -0,0 +1,422 @@
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_intrman.h"
++#include "emulator/imports/iop_timrman.h"
++#include "emulator/iop_emulator.h"
++#include "emulator/services/iop_rpc.h"
++#include "iop_compat_test_support.h"
++
++#include <functional>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++
++    struct Fixture
++    {
++        IopMemory memory;
++        IopKernel kernel{memory};
++        Fixture() { require(memory.zeroRam(0x10000u, 0x1000u), "fixture RAM"); }
++        int32_t call(uint16_t ordinal, uint32_t a0, uint32_t a1 = 0u, bool interrupt = false)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            require(kernel.dispatchMailboxImport(ordinal, cpu, interrupt), "mailbox import absent");
++            return static_cast<int32_t>(cpu.gpr[2]);
++        }
++        int create(uint32_t attr = 0u)
++        {
++            memory.write32(0x10000u, attr);
++            memory.write32(0x10004u, 255u);
++            return call(4u, 0x10000u);
++        }
++        void message(uint32_t address, uint8_t priority = 0u)
++        {
++            require(memory.zeroRam(address, 16u), "message fixture");
++            memory.write32(address, 0xDEADC0DEu);
++            memory.write32(address + 4u, 0xCACACA00u | priority);
++            memory.write32(address + 8u, 0x12345678u);
++        }
++        int thread(uint32_t priority)
++        {
++            memory.write32(0x10100u, 0u);
++            memory.write32(0x10104u, 0u);
++            memory.write32(0x10108u, 0x10400u);
++            memory.write32(0x1010Cu, 0x1000u);
++            memory.write32(0x10110u, priority);
++            IopCpuState cpu{};
++            cpu.gpr[4] = 0x10100u;
++            require(kernel.dispatchThreadImport(4u, cpu, 0u) && static_cast<int32_t>(cpu.gpr[2]) > 0,
++                    "thread create failed");
++            const int id = static_cast<int>(cpu.gpr[2]);
++            cpu.gpr[4] = static_cast<uint32_t>(id);
++            cpu.gpr[5] = 0u;
++            require(kernel.dispatchThreadImport(6u, cpu, 0u), "thread start failed");
++            return id;
++        }
++        IopThread *block(int box, uint32_t output)
++        {
++            IopThread *next = kernel.beginNextReady(0u);
++            require(next != nullptr, "no ready receiver");
++            memory.write32(output, 0xBADC0FFEu);
++            next->cpu.gpr[2] = 0xDEADBEEFu;
++            next->cpu.gpr[4] = output;
++            next->cpu.gpr[5] = static_cast<uint32_t>(box);
++            require(kernel.dispatchMailboxImport(8u, next->cpu) && next->cpu.yielded &&
++                        next->state == IopThreadState::Mailbox && next->cpu.gpr[2] == 0xDEADBEEFu &&
++                        memory.read32(output) == 0xBADC0FFEu,
++                    "empty receive did not block without fabricating a message/result");
++            kernel.endTimeslice(*next, 0xFFFF0000u);
++            return next;
++        }
++        void threadCall(uint16_t ordinal, int id)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = static_cast<uint32_t>(id);
++            require(kernel.dispatchThreadImport(ordinal, cpu, 0u), "thread control absent");
++        }
++    };
++
++    void queuedFifoAndPriority()
++    {
++        for (const uint32_t attr : {0u, 4u})
++        {
++            Fixture f;
++            const int box = f.create(attr);
++            const uint32_t a = 0x10200u, b = 0x80010220u, c = 0xA0010240u;
++            f.message(a, 4u); f.message(b, 1u); f.message(c, 4u);
++            for (uint32_t message : {a, b, c})
++                require(f.call(6u, box, message) == 0, "queued send failed");
++            const std::array<uint32_t, 3u> order = attr == 0u ?
++                std::array<uint32_t, 3u>{a, b, c} : std::array<uint32_t, 3u>{b, a, c};
++            for (size_t i = 0u; i < order.size(); ++i)
++                require(f.memory.read32(order[i]) == order[(i + 1u) % order.size()], "message links are not circular");
++            require(f.memory.read32(a + 4u) == 0xCACACA04u && f.memory.read32(a + 8u) == 0x12345678u,
++                    "send changed message priority/payload");
++            require(f.memory.zeroRam(0x10800u, 28u), "status fixture");
++            f.memory.write32(0x10814u, 0xA5A5A5A5u); f.memory.write32(0x10818u, 0x5A5A5A5Au);
++            require(f.call(11u, box, 0x10800u) == 0 && f.memory.read32(0x10800u) == attr &&
++                        f.memory.read32(0x10804u) == 255u && f.memory.read32(0x10808u) == 0u &&
++                        f.memory.read32(0x1080Cu) == 3u && f.memory.read32(0x10810u) == order[0] &&
++                        f.memory.read32(0x10814u) == 0xA5A5A5A5u && f.memory.read32(0x10818u) == 0x5A5A5A5Au,
++                    "mailbox status layout or reserved bytes are wrong");
++            for (uint32_t expected : order)
++                require(f.call(9u, 0x10900u, box) == 0 && f.memory.read32(0x10900u) == expected,
++                        "poll order or ABI is wrong");
++            f.memory.write32(0x10900u, 0xBAD0BAD0u);
++            require(f.call(9u, 0x10900u, box) == -424 && f.memory.read32(0x10900u) == 0xBAD0BAD0u,
++                    "empty poll fabricated a message");
++            // Dequeued next pointers remain nonzero and must not prevent reuse.
++            require(f.call(6u, box, a) == 0 && f.call(9u, 0x10900u, box) == 0 &&
++                        f.memory.read32(0x10900u) == a, "a received packet could not be sent again");
++        }
++    }
++
++    void actualWaitOrderAndPriority()
++    {
++        for (const uint32_t attr : {0u, 1u})
++        {
++            Fixture f;
++            const int box = f.create(attr);
++            const int firstId = f.thread(60u), secondId = f.thread(20u);
++            IopThread *first = f.block(box, 0x10800u);
++            IopThread *second = f.block(box, 0x10810u);
++            require(first->id == secondId && second->id == firstId, "fixture did not reverse creation/enqueue order");
++            // Priority ordering uses live thread priority; FIFO keeps enqueue order.
++            second->priority = 10u;
++            f.message(0x10200u);
++            require(f.call(6u, box, 0x10200u) == 0, "waiting send failed");
++            IopThread *delivered = attr == 0u ? first : second;
++            IopThread *waitingThread = attr == 0u ? second : first;
++            const uint32_t output = attr == 0u ? 0x10800u : 0x10810u;
++            require(delivered->state == IopThreadState::Ready && delivered->cpu.gpr[2] == 0u &&
++                        waitingThread->state == IopThreadState::Mailbox && f.memory.read32(output) == 0x10200u &&
++                        f.memory.read32(0x10200u) == 0xDEADC0DEu,
++                    "direct delivery picked wrong waiter or changed message links");
++            require(f.call(5u, box) == 0 && waitingThread->state == IopThreadState::Ready &&
++                        static_cast<int32_t>(waitingThread->cpu.gpr[2]) == -425,
++                    "delete did not wake pending receiver with KE_WAIT_DELETE");
++            require(f.call(5u, box) == -410, "deleted mailbox remained live");
++        }
++    }
++
++    void releaseSuspendAndDeletedThreads()
++    {
++        Fixture f;
++        const int box = f.create();
++        const int id = f.thread(40u);
++        IopThread *receiver = f.block(box, 0x10800u);
++        f.threadCall(29u, id);
++        require(receiver->state == IopThreadState::MailboxSuspended, "suspend lost mailbox wait");
++        f.message(0x10200u);
++        require(f.call(6u, box, 0x10200u) == 0 && receiver->state == IopThreadState::Suspended &&
++                    f.memory.read32(0x10800u) == 0x10200u && f.kernel.beginNextReady(0u) == nullptr,
++                "suspended receiver ran early or lost its delivery");
++        f.threadCall(31u, id);
++        receiver = f.block(box, 0x10800u);
++        f.threadCall(18u, id);
++        require(receiver->state == IopThreadState::Ready && static_cast<int32_t>(receiver->cpu.gpr[2]) == -418 &&
++                    f.memory.read32(0x10800u) == 0xBADC0FFEu,
++                "release-wait fabricated delivery or left the mailbox wait active");
++        receiver = f.block(box, 0x10800u);
++        f.threadCall(29u, id);
++        f.threadCall(31u, id);
++        require(receiver->state == IopThreadState::Mailbox, "resume incorrectly completed a pending receive");
++        f.threadCall(10u, id);
++        require(f.call(6u, box, 0x10200u) == 0 && f.memory.read32(0x10800u) == 0xBADC0FFEu,
++                "terminated waiter received a stale output write");
++        f.threadCall(5u, id);
++        require(f.call(9u, 0x10900u, box) == 0 && f.memory.read32(0x10900u) == 0x10200u,
++                "thread deletion lost a queued message");
++    }
++
++    void malformedRangesAndLifetime()
++    {
++        for (const uint32_t invalid : {0u, 0x10201u, 0xC0010200u, 0x20010200u, 0xBFFFFFFCu,
++                                       0xA01FFFFCu, 0x8000u})
++        {
++            Fixture f;
++            const int box = f.create();
++            f.message(0x10200u);
++            require(f.call(6u, box, 0x10200u) == 0, "prepare queued message");
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            bool rejected = false;
++            try { (void)f.call(6u, box, invalid); } catch (const std::runtime_error &) { rejected = true; }
++            require(rejected && std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "bad message mutated queue/RAM");
++            require(f.call(9u, 0x10900u, box) == 0 && f.memory.read32(0x10900u) == 0x10200u,
++                    "bad message consumed the valid queue");
++        }
++        Fixture f;
++        const int box = f.create();
++        const uint32_t owned = f.memory.allocate(16u);
++        f.message(owned);
++        require(f.call(6u, box, owned) == 0, "owned message send");
++        bool duplicate = false;
++        try { (void)f.call(6u, box, 0x80000000u | owned); } catch (const std::runtime_error &) { duplicate = true; }
++        require(duplicate, "aliased duplicate packet entered the queue twice");
++        require(f.memory.freeAllocation(owned) && f.memory.allocate(16u, 16u, owned) == owned, "reuse message allocation");
++        const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++        bool stale = false;
++        try { (void)f.call(9u, 0x10900u, box); } catch (const std::runtime_error &) { stale = true; }
++        require(stale && std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                "queued pointer wrote a replacement allocation");
++        require(f.call(5u, box) == 0 && f.memory.allocationContaining(owned).has_value(),
++                "mailbox deletion freed caller memory");
++
++        const int waitingBox = f.create();
++        const uint32_t output = f.memory.allocate(16u);
++        (void)f.thread(20u);
++        IopThread *receiver = f.block(waitingBox, output);
++        require(f.memory.freeAllocation(output) && f.memory.allocate(16u, 16u, output) == output, "reuse output allocation");
++        f.memory.write32(output, 0xAABBCCDDu);
++        f.message(0x10200u);
++        bool invalidOutput = false;
++        try { (void)f.call(6u, waitingBox, 0x10200u); } catch (const std::runtime_error &) { invalidOutput = true; }
++        require(invalidOutput && receiver->state == IopThreadState::Mailbox && f.memory.read32(output) == 0xAABBCCDDu,
++                "delayed delivery wrote to a replacement output allocation");
++        require(f.call(5u, waitingBox) == 0 && static_cast<int32_t>(receiver->cpu.gpr[2]) == -425,
++                "invalid output prevented mailbox deletion cleanup");
++    }
++
++    void exactEndsContextAndReset()
++    {
++        Fixture f;
++        require(f.create(2u) == -401 && f.create(0u) == 1, "invalid attributes consumed an object id");
++        const int box = 1;
++        require(f.call(4u, 0xFFFFFFFFu, 0u, true) == -100 && f.call(7u, box, 0xFFFFFFFFu) == -100,
++                "context checks occurred after unsafe argument access");
++        const uint32_t message = 0xA0000000u | (IopMemory::RamSize - 8u);
++        require(f.memory.zeroRam(message, 8u), "exact-end message fixture");
++        require(f.call(7u, box, message, true) == 0, "interrupt send exact-end message");
++        require(f.call(9u, 0x10900u, box) == 0 && f.memory.read32(0x10900u) == message,
++                "exact-end message alias failed");
++        f.message(0x10200u);
++        require(f.call(6u, box, 0x10200u) == 0, "prepare exact-end output");
++        const uint32_t output = 0x80000000u | (IopMemory::RamSize - 4u);
++        require(f.call(9u, output, box) == 0 && f.memory.read32(output) == 0x10200u,
++                "exact-end output alias failed");
++        IopCpuState direct{};
++        direct.gpr[4] = 0x10900u; direct.gpr[5] = box; direct.gpr[2] = 0x1234u;
++        bool rejected = false;
++        try { (void)f.kernel.dispatchMailboxImport(8u, direct); } catch (const std::runtime_error &) { rejected = true; }
++        require(rejected && direct.gpr[2] == 0x1234u && !direct.yielded,
++                "empty direct callback receive pretended to block/complete");
++        require(!f.kernel.dispatchMailboxImport(10u, direct), "unknown ordinal became a supported operation");
++        f.kernel.reset();
++        require(f.call(9u, 0x10900u, box) == -410 && f.create() == 1, "reset retained mailbox state");
++    }
++
++    void interruptScopeIsRealAndExceptionSafe()
++    {
++        struct Executor : IopGuestExecutor
++        {
++            Fixture &fixture;
++            IopIntrman &intrman;
++            int box;
++            bool fail = false;
++            Executor(Fixture &f, IopIntrman &i, int b) : fixture(f), intrman(i), box(b) {}
++            uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override
++            {
++                IopCpuState query{};
++                require(intrman.dispatchImport(23u, query, *this) && query.gpr[2] == 1u,
++                        "QueryIntrContext does not reflect actual interrupt dispatch");
++                require(fixture.call(6u, box, 0xFFFFFFFFu, intrman.inInterruptContext()) == -100,
++                        "ordinary send was accepted inside an interrupt");
++                if (fail) throw std::runtime_error("authored interrupt failure");
++                require(fixture.call(7u, box, 0x10200u, intrman.inInterruptContext()) == 0,
++                        "interrupt mailbox send failed");
++                return 1u;
++            }
++        };
++        Fixture f;
++        const int box = f.create(); f.message(0x10200u);
++        IopIntrman intrman(f.memory);
++        Executor executor(f, intrman, box);
++        IopCpuState registration{};
++        registration.gpr[4] = 2u; registration.gpr[6] = 0x10400u;
++        require(intrman.dispatchImport(4u, registration, executor) && intrman.dispatchImport(6u, registration, executor),
++                "interrupt registration failed");
++        require(intrman.dispatchInterrupt(2, executor) && !intrman.inInterruptContext(), "interrupt scope leaked");
++        require(f.call(9u, 0x10900u, box) == 0, "interrupt message was not queued");
++        executor.fail = true;
++        bool failed = false;
++        try { (void)intrman.dispatchInterrupt(2, executor); } catch (const std::runtime_error &) { failed = true; }
++        require(failed && !intrman.inInterruptContext(), "exception leaked interrupt context");
++
++        // timrman invokes hard-timer handlers directly rather than through the
++        // registered IRQ map, but those handlers still run in interrupt context.
++        IopTimrman timrman;
++        timrman.reset();
++        IopCpuState timer{};
++        timer.gpr[4] = 1u; timer.gpr[5] = 32u; timer.gpr[6] = 1u;
++        require(timrman.dispatchImport(4u, timer, 0u) && static_cast<int32_t>(timer.gpr[2]) > 0,
++                "hard timer allocation failed");
++        const uint32_t timerId = timer.gpr[2];
++        timer.gpr[4] = timerId; timer.gpr[5] = 10u; timer.gpr[6] = 0x10400u; timer.gpr[7] = 0u;
++        require(timrman.dispatchImport(20u, timer, 0u) && timer.gpr[2] == 0u, "hard timer handler failed");
++        timer.gpr[4] = timerId; timer.gpr[5] = 1u; timer.gpr[6] = 0u; timer.gpr[7] = 1u;
++        require(timrman.dispatchImport(22u, timer, 0u) && timer.gpr[2] == 0u, "hard timer setup failed");
++        timer.gpr[4] = timerId;
++        require(timrman.dispatchImport(23u, timer, 0u) && timer.gpr[2] == 0u, "hard timer start failed");
++        executor.fail = false;
++        timrman.serviceDue(10u, executor, intrman);
++        require(!intrman.inInterruptContext() && f.call(9u, 0x10900u, box) == 0 &&
++                    f.memory.read32(0x10900u) == 0x10200u, "timer interrupt context or message was lost");
++        executor.fail = true;
++        failed = false;
++        try { timrman.serviceDue(11u, executor, intrman); } catch (const std::runtime_error &) { failed = true; }
++        require(failed && !intrman.inInterruptContext(), "timer exception leaked interrupt context");
++    }
++
++    void authoredBlockedMailboxThreads()
++    {
++        using iop_test::require;
++        using ps2x::iop::detail::IopEmulator;
++        iop_test::Irx image;
++        // Entry creates a FIFO mailbox, starts receiver priority20 and sender40,
++        // then returns resident. No guest threads run until runEeCycles below.
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u, 0x3C100001u,
++            0x26040440u, 0x0C004065u, 0u, 0xAE020450u,
++            0x26040400u, 0x0C004045u, 0u, 0x00402021u,
++            0x00002821u, 0x0C004047u, 0u,
++            0x26040420u, 0x0C004045u, 0u, 0x00402021u,
++            0x00002821u, 0x0C004047u, 0u,
++            0x8FBF001Cu, 0x8FB00018u, 0x27BD0020u, 0x03E00008u, 0x00001021u,
++        });
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x61626874u, 0x00006573u,
++            0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++        image.words(0x180u, {0x41E00000u, 0u, 0x0101u, 0x736D6874u, 0x00786267u,
++            0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u,
++            0x03E00008u, 0x24000008u, 0u, 0u});
++        // Receiver must suspend at ReceiveMbx, resume at the following store,
++        // retain its original stack/return address, and return exactly once.
++        image.words(0x200u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u, 0x3C100001u,
++            0x8E050450u, 0x26040480u, 0x0C004069u, 0u,
++            0xAE020488u, 0x8E080484u, 0u, 0x25080001u, 0xAE080484u,
++            0x8FBF001Cu, 0x8FB00018u, 0x27BD0020u, 0x03E00008u, 0u,
++        });
++        // Sender observes the untouched result slot and no receiver continuation
++        // before sending the actual packet. This fails if empty Receive fabricated
++        // a result or returned rather than blocking in the real instruction loop.
++        image.words(0x300u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u, 0x3C100001u,
++            0x8E080484u, 0u, 0xAE08048Cu,
++            0x8E080480u, 0u, 0xAE080494u,
++            0x8E040450u, 0x26050460u, 0x0C004067u, 0u, 0xAE020490u,
++            0x8FBF001Cu, 0x8FB00018u, 0x27BD0020u, 0x03E00008u, 0u,
++        });
++        image.words(0x400u, {0u, 0u, 0x10200u, 0x1000u, 20u});
++        image.words(0x420u, {0u, 0u, 0x10300u, 0x1000u, 40u});
++        image.words(0x440u, {0u, 255u});
++        image.words(0x460u, {0xDEADC0DEu, 0xCACACA00u, 0x12345678u, 0u});
++        image.words(0x480u, {0xBADC0FFEu, 0u, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu});
++        iop_test::Host host;
++        IopEmulator emulator(host);
++        const auto loaded = emulator.loadModuleImage("authored-blocked-mailbox", image.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0 && loaded.startResult == 0 && emulator.threadCount() == 2u,
++                "authored mailbox module did not start two actual workers");
++        emulator.runEeCycles(100000u);
++        emulator.checkExecutionFailure();
++        std::array<uint32_t, 6u> result{};
++        require(emulator.readMemory(0x10480u, result.data(), sizeof(result)), "thread results unavailable");
++        require(result[0] == 0x10460u && result[1] == 1u && result[2] == 0u &&
++                    result[3] == 0u && result[4] == 0u && result[5] == 0xBADC0FFEu,
++                "ReceiveMbx did not block/resume once with the actual message and successful result");
++        uint32_t nextWord = 0u;
++        require(emulator.readMemory(0x10460u, &nextWord, sizeof(nextWord)) && nextWord == 0xDEADC0DEu && host.guestWrites == 0u,
++                "actual worker direct delivery changed message links or wrote EE memory");
++    }
++
++    void authoredImportExecution()
++    {
++        iop_test::Irx image;
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u,
++            0x3C040001u, 0x34840400u, 0x0C004045u, 0u, 0x00408021u,
++            0x02002021u, 0x3C050001u, 0x34A50420u, 0x0C004047u, 0u,
++            0x3C040001u, 0x34840440u, 0x02002821u, 0x0C004049u, 0u,
++            0x3C080001u, 0xAD020444u, 0x8FBF001Cu, 0x8FB00018u,
++            0x27BD0020u, 0x03E00008u, 0x00001021u,
++        });
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x736D6874u, 0x00786267u,
++            0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u,
++            0x03E00008u, 0x24000009u, 0u, 0u});
++        image.words(0x400u, {0u, 255u});
++        image.words(0x420u, {0xDEADC0DEu, 5u, 0x12345678u, 0u});
++        iop_test::Host host;
++        IopEmulator emulator(host);
++        const auto loaded = emulator.loadModuleImage("authored-mailbox", image.bytes, nullptr, 0u);
++        std::array<uint32_t, 2u> result{};
++        require(loaded.moduleId > 0 && loaded.startResult == 0 &&
++                    emulator.readMemory(0x10440u, result.data(), sizeof(result)) &&
++                    result[0] == 0x10420u && result[1] == 0u && host.guestWrites == 0u,
++                "authored mailbox imports did not preserve actual message identity");
++        image.words(0x118u, {0x2400000Au});
++        IopEmulator unsupported(host);
++        bool rejected = false;
++        try { (void)unsupported.loadModuleImage("authored-unknown-mailbox", image.bytes, nullptr, 0u); }
++        catch (const std::runtime_error &error)
++        { rejected = std::string_view(error.what()).find("missing import thmsgbx:10") != std::string_view::npos; }
++        require(rejected, "unknown mailbox import silently succeeded");
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"FIFO and stable message priorities retain circular guest links", queuedFifoAndPriority},
++        {"Real blocked receivers obey enqueue order and thread priority", actualWaitOrderAndPriority},
++        {"Release, suspend and thread deletion preserve mailbox wait lifetime", releaseSuspendAndDeletedThreads},
++        {"Malformed and replaced message/output storage fails before mutation", malformedRangesAndLifetime},
++        {"Exact-end aliases, contexts, direct callbacks and reset are bounded", exactEndsContextAndReset},
++        {"Interrupt mailbox variants use actual exception-safe context", interruptScopeIsRealAndExceptionSafe},
++        {"Actual IOP workers block and resume ReceiveMbx with original packet identity", authoredBlockedMailboxThreads},
++        {"Authored guest imports send and receive actual message pointers", authoredImportExecution},
++    };
++    return iop_test::run(tests);
++}
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index e1b53a39cfc36ad3ccd12323ce6705e7f7c07dc4..bdacd9cead51721b91c8f568b428cf3dedb734dc 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -431,13 +431,23 @@ namespace
+         return image;
+     }
+ 
++    Irx sonyRelocationImage(uint32_t type)
++    {
++        Irx image = relocationImage(type);
++        put16(image.bytes, 16u, 0xFF80u);
++        put32(image.bytes, 24u, 0u);
++        put32(image.bytes, 60u, 0u);
++        put32(image.bytes, 0x634u, 0u);
++        return image;
++    }
++
+     void relocationAndImagePreflight()
+     {
+         for (uint32_t type : {7u, 5u, 0x102u})
+         {
+             Host host;
+             IopEmulator iop(host);
+-            const Irx image = relocationImage(type);
++            const Irx image = sonyRelocationImage(type);
+             rejects([&] { (void)iop.loadModuleImage("bad-reloc", image.bytes, nullptr, 0u); }, "relocation");
+             require(word(iop, 0x10000u) == 0u && iop.loadedModuleCount() == 0u,
+                     "rejected relocation changed real RAM");
+@@ -457,16 +467,41 @@ namespace
+         }
+         Host host;
+         IopEmulator iop(host);
+-        Irx good = relocationImage(2u);
+-        put16(good.bytes, 16u, 0xFF80u);
+-        put32(good.bytes, 24u, 0u);
+-        put32(good.bytes, 60u, 0u);
+-        put32(good.bytes, 0x634u, 0u);
++        Irx good = sonyRelocationImage(2u);
+         put32(good.bytes, 0x140u, 0x80u);
+         require(iop.loadModuleImage("reloc", good.bytes, nullptr, 0u).moduleId > 0 &&
+                 word(iop, 0x10040u) == 0x10080u, "supported relocation was not actually applied");
+     }
+ 
++    void unsupportedRelocationForms()
++    {
++        for (unsigned variant = 0u; variant < 3u; ++variant)
++        {
++            Host host;
++            IopEmulator iop(host);
++            Irx image = variant < 2u ? relocationImage(2u) : sonyRelocationImage(4u);
++            if (variant == 1u)
++                put32(image.bytes, 0x678u, 0x10040u); // ET_EXEC r_offset is a virtual address.
++            if (variant == 2u)
++            {
++                image.bytes.resize(0x684u, 0u);
++                put32(image.bytes, 0x654u, 4u); // RELA with an explicit addend.
++                put32(image.bytes, 0x664u, 12u);
++                put32(image.bytes, 0x674u, 12u);
++                put32(image.bytes, 0x680u, 0x100u);
++                put32(image.bytes, 0x140u, 0x08000020u); // Different implicit J addend.
++            }
++            const std::string_view reason = variant < 2u ? "ET_EXEC relocations" : "RELA relocations";
++            rejects([&] { IopEmulator::validateModuleImage(image.bytes); }, reason);
++            rejects([&] { (void)iop.loadModuleImage("unsupported-relocation", image.bytes, nullptr, 0u); }, reason);
++            require(word(iop, 0x10000u) == 0u && word(iop, 0x10040u) == 0u &&
++                        iop.loadedModuleCount() == 0u && host.guestWrites == 0u,
++                    "unsupported relocation form mutated live state");
++            require(iop.loadModuleImage("after-rejected-relocation", returns().bytes, nullptr, 0u).moduleId == 1,
++                    "unsupported relocation form consumed a module identity");
++        }
++    }
++
+     void fileAndIopSources()
+     {
+         for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
+@@ -755,7 +790,7 @@ namespace
+         const uint64_t before = iop.instructions();
+         image.words(0u, {0x08004000u, 0u}); // infinite entry must never run in static preflight
+         IopEmulator::validateModuleImage(image.bytes);
+-        rejects([&] { IopEmulator::validateModuleImage(relocationImage(0xFFu).bytes); }, "relocation");
++        rejects([&] { IopEmulator::validateModuleImage(sonyRelocationImage(0xFFu).bytes); }, "relocation");
+         const Irx outside(0x120000u);
+         rejects([&] { IopEmulator::validateModuleImage(outside.bytes); }, "module arena");
+         require(iop.instructions() == before && iop.loadedModuleCount() == 1u && word(iop, 0x10000u) == 0x03E00008u,
+@@ -1127,6 +1162,7 @@ int main()
+         {"Missing imports cannot become module success", missingImport},
+         {"Exceptions, bad PCs and yielding are not startup returns", exceptionAndBadPc},
+         {"Malformed ELF/relocations fail before commit; valid relocation executes", relocationAndImagePreflight},
++        {"ET_EXEC relocations and RELA reject unsupported semantics before commit", unsupportedRelocationForms},
+         {"Strict files and real IOP buffers use their correct memory spaces", fileAndIopSources},
+         {"Overlap is atomic and legacy EE API remains compatible", overlapAndLegacyCompatibility},
+         {"Later physical RPC callback failures remain strict", callbackCompletion},

@@ -1,0 +1,331 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index ab318a0a2b0bda9495fba8f5c896a82952c57ef2..aa442bccb6a7242bdc3f13010c564a27a505146b 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -18,6 +18,7 @@ add_library(ps2_iop STATIC
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+     src/emulator/imports/iop_cdvd.cpp
++    src/emulator/imports/iop_dmacman.cpp
+     src/emulator/imports/iop_heaplib.cpp
+     src/emulator/imports/iop_imports.cpp
+     src/emulator/imports/iop_intrman.cpp
+@@ -47,6 +48,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_dmacman_tests tests/iop_dmacman_tests.cpp)
++    target_link_libraries(ps2_iop_dmacman_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_dmacman_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_dmacman_tests COMMAND ps2_iop_dmacman_tests)
++
+     add_executable(ps2_iop_modload_policy_tests tests/iop_modload_policy_tests.cpp)
+     target_link_libraries(ps2_iop_modload_policy_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_modload_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_dmacman.cpp b/ps2xIOP/src/emulator/imports/iop_dmacman.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c2611dc41488a5e19853cd3c1e80df10b0a511b
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_dmacman.cpp
+@@ -0,0 +1,67 @@
++#include "iop_dmacman.h"
++
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_memory.h"
++
++#include <optional>
++#include <stdexcept>
++#include <string>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        struct PriorityField
++        {
++            uint32_t address;
++            uint32_t shift;
++            bool hasEnable;
++        };
++
++        std::optional<PriorityField> priorityField(uint32_t channel)
++        {
++            // Channel numbers, DPCR bank addresses and four-bit field layout:
++            // https://ps2dev.github.io/ps2sdk/dmacman_8h_source.html
++            // https://ps2dev.github.io/ps2sdk/dmacman_8c_source.html
++            if (channel <= 6u)
++                return PriorityField{0x1F8010F0u, channel * 4u, true};
++            if (channel <= 12u)
++                return PriorityField{0x1F801570u, (channel - 7u) * 4u, true};
++            if (channel <= 15u)
++                return PriorityField{0x1F8015F0u, (channel - 13u) * 4u, true};
++            if (channel == 67u) // CPU has a priority field but no DMA-enable API.
++                return PriorityField{0x1F8010F0u, 28u, false};
++            if (channel == 85u) // USB
++                return PriorityField{0x1F801570u, 24u, true};
++            return std::nullopt;
++        }
++    }
++
++    bool dispatchDmacmanPriority(IopMemory &memory, uint16_t ordinal, IopCpuState &cpu)
++    {
++        if (ordinal < 33u || ordinal > 35u)
++            return false;
++        const uint32_t channel = cpu.gpr[4u];
++        const auto field = priorityField(channel);
++        if (!field || (ordinal != 33u && !field->hasEnable))
++            throw std::runtime_error("Unsupported IOP DMACMAN channel " + std::to_string(channel) +
++                                     " for ordinal " + std::to_string(ordinal));
++
++        const uint32_t before = memory.read32(field->address);
++        uint32_t after = before;
++        if (ordinal == 33u)
++        {
++            const uint32_t mask = 7u << field->shift;
++            after = (before & ~mask) | ((cpu.gpr[5u] & 7u) << field->shift);
++        }
++        else
++        {
++            const uint32_t enable = 8u << field->shift;
++            after = ordinal == 34u ? before | enable : before & ~enable;
++        }
++        memory.write32(field->address, after);
++        // All three public operations return void; preserve the caller's
++        // registers. The modeled IOP executes this register update atomically.
++        return true;
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_dmacman.h b/ps2xIOP/src/emulator/imports/iop_dmacman.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..db1a5a0de5de6b9baf7d6dcea13fc21f3be5597b
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_dmacman.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <cstdint>
++
++namespace ps2x::iop::detail
++{
++    struct IopCpuState;
++    class IopMemory;
++
++    // Only channel priority/enable operations are modeled here. Scheduling a
++    // transfer still belongs to its actual hardware/device implementation.
++    [[nodiscard]] bool dispatchDmacmanPriority(IopMemory &memory, uint16_t ordinal, IopCpuState &cpu);
++}
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 6cc32d4b47786fff309c7d0483f634e82cdd0cb1..c474ee1eb0c852a1d81945e70373fd3455d773cd 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,5 +1,6 @@
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
++#include "imports/iop_dmacman.h"
+ #include "core/iop_cpu.h"
+ #include "imports/iop_heaplib.h"
+ #include "imports/iop_imports.h"
+@@ -721,6 +722,8 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
++            if (iequals(call.library, "dmacman") && dispatchDmacmanPriority(memory, call.ordinal, cpu))
++                return ImportDisposition::Handled;
+             if (iequals(call.library, "dmacman") && !strictExecution)
+             {
+                 setV0(0);
+diff --git a/ps2xIOP/tests/iop_dmacman_tests.cpp b/ps2xIOP/tests/iop_dmacman_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1eca42da44d5f834a51778d7c3576fd06ff79e3b
+--- /dev/null
++++ b/ps2xIOP/tests/iop_dmacman_tests.cpp
+@@ -0,0 +1,189 @@
++#include "emulator/imports/iop_dmacman.h"
++#include "emulator/iop_emulator.h"
++#include "iop_compat_test_support.h"
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_memory.h"
++
++#include <array>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++    void require(bool condition, std::string_view message)
++    {
++        if (!condition)
++            throw std::runtime_error(std::string(message));
++    }
++
++    void sioChannelsAndBusAliases()
++    {
++        IopMemory memory;
++        memory.write32(0xBF801570u, 0x76543210u);
++        IopCpuState cpu{};
++        cpu.gpr[2u] = 0xDEADBEEFu;
++        cpu.gpr[4u] = 11u;
++        cpu.gpr[5u] = 3u;
++        const auto originalRegisters = cpu.gpr;
++        require(dispatchDmacmanPriority(memory, 33u, cpu) && memory.read32(0x9F801570u) == 0x76533210u,
++                "SIO2 input priority did not update its real DPCR2 field");
++        require(cpu.gpr == originalRegisters, "void priority setter modified guest registers");
++        cpu.gpr[4u] = 12u;
++        require(dispatchDmacmanPriority(memory, 33u, cpu) && memory.read32(0x1F801570u) == 0x76333210u,
++                "SIO2 output priority damaged adjacent fields");
++        cpu.gpr[4u] = 11u;
++        require(dispatchDmacmanPriority(memory, 34u, cpu) && memory.read32(0xBF801570u) == 0x763B3210u,
++                "SIO2 input enable did not preserve its priority");
++        cpu.gpr[4u] = 12u;
++        require(dispatchDmacmanPriority(memory, 34u, cpu) && memory.read32(0xBF801570u) == 0x76BB3210u,
++                "SIO2 output enable did not preserve other channels");
++        cpu.gpr[4u] = 11u;
++        require(dispatchDmacmanPriority(memory, 35u, cpu) && memory.read32(0xBF801570u) == 0x76B33210u,
++                "SIO2 disable cleared priority or another enable bit");
++        require(memory.interruptStatus() == 0u && !memory.takeDmaStart(),
++                "configuring DMA priority fabricated a transfer or interrupt");
++    }
++
++    void banksAndPriorityMask()
++    {
++        constexpr std::array<std::array<uint32_t, 3u>, 18u> cases{{
++            {0u, 0x1F8010F0u, 0u}, {1u, 0x1F8010F0u, 4u}, {2u, 0x1F8010F0u, 8u},
++            {3u, 0x1F8010F0u, 12u}, {4u, 0x1F8010F0u, 16u}, {5u, 0x1F8010F0u, 20u},
++            {6u, 0x1F8010F0u, 24u}, {7u, 0x1F801570u, 0u}, {8u, 0x1F801570u, 4u},
++            {9u, 0x1F801570u, 8u}, {10u, 0x1F801570u, 12u}, {11u, 0x1F801570u, 16u},
++            {12u, 0x1F801570u, 20u}, {13u, 0x1F8015F0u, 0u}, {14u, 0x1F8015F0u, 4u},
++            {15u, 0x1F8015F0u, 8u}, {67u, 0x1F8010F0u, 28u}, {85u, 0x1F801570u, 24u},
++        }};
++        for (const auto &entry : cases)
++        {
++            IopMemory memory;
++            for (const uint32_t address : {0x1F8010F0u, 0x1F801570u, 0x1F8015F0u})
++                memory.write32(address, 0xAAAAAAAAu);
++            IopCpuState cpu{};
++            cpu.gpr[4u] = entry[0u];
++            cpu.gpr[5u] = 0xFFFFFFFDu;
++            require(dispatchDmacmanPriority(memory, 33u, cpu), "known priority channel was rejected");
++            for (const uint32_t address : {0x1F8010F0u, 0x1F801570u, 0x1F8015F0u})
++            {
++                const uint32_t expected = address == entry[1u] ?
++                    (0xAAAAAAAAu & ~(7u << entry[2u])) | (5u << entry[2u]) : 0xAAAAAAAAu;
++                require(memory.read32(address) == expected, "priority mask spilled into another field or bank");
++            }
++            if (entry[0u] != 67u)
++            {
++                require(dispatchDmacmanPriority(memory, 35u, cpu), "known disable channel was rejected");
++                const uint32_t disabled = memory.read32(entry[1u]);
++                require((disabled & (8u << entry[2u])) == 0u &&
++                            ((disabled >> entry[2u]) & 7u) == 5u,
++                        "disable changed the channel priority");
++                require(dispatchDmacmanPriority(memory, 34u, cpu) &&
++                            memory.read32(entry[1u]) == (disabled | (8u << entry[2u])),
++                        "enable changed unrelated DPCR bits");
++            }
++        }
++    }
++
++    void unsupportedBeforeMutation()
++    {
++        IopMemory memory;
++        for (const uint32_t address : {0x1F8010F0u, 0x1F801570u, 0x1F8015F0u})
++            memory.write32(address, 0x13579BDFu);
++        IopCpuState cpu{};
++        cpu.gpr[2u] = 0x2468ACE0u;
++        for (const uint32_t channel : {16u, 66u, 68u, 84u, 86u, 0xFFFFFFFFu})
++        {
++            cpu.gpr[4u] = channel;
++            bool rejected = false;
++            try { (void)dispatchDmacmanPriority(memory, 33u, cpu); }
++            catch (const std::runtime_error &) { rejected = true; }
++            require(rejected, "invalid channel was silently accepted");
++        }
++        cpu.gpr[4u] = 67u;
++        bool rejected = false;
++        try { (void)dispatchDmacmanPriority(memory, 34u, cpu); }
++        catch (const std::runtime_error &) { rejected = true; }
++        require(rejected, "CPU priority slot was treated as a DMA channel enable");
++        require(!dispatchDmacmanPriority(memory, 32u, cpu) && !dispatchDmacmanPriority(memory, 0xFFFFu, cpu),
++                "unimplemented transfers were reported as completed imports");
++        for (const uint32_t address : {0x1F8010F0u, 0x1F801570u, 0x1F8015F0u})
++            require(memory.read32(address) == 0x13579BDFu, "invalid request changed an existing register");
++        require(cpu.gpr[2u] == 0x2468ACE0u && !memory.takeDmaStart(),
++                "invalid request changed result state or started DMA");
++        memory.reset();
++        require(memory.read32(0xBF8010F0u) == 0u && memory.read32(0xBF801570u) == 0u &&
++                    memory.read32(0xBF8015F0u) == 0u, "DMA fields survived a hardware reset");
++    }
++
++    void guestImportDispatchAndStrictFallback()
++    {
++        iop_test::Irx image;
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C08BF80u, 0x35081570u, 0x3C097654u, 0x35293210u, 0xAD090000u,
++            0x2404000Bu, 0x24050003u, 0x3C02DEADu, 0x3442BEEFu,
++            0x0C004065u, 0u, // dmacman:33 updates the real channel-11 field.
++            0x8D0A0000u, 0u, 0x3C0B0001u, 0xAD6A0400u,
++            0x0C004067u, 0u, // dmacman:34 enables that channel.
++            0x8D0A0000u, 0u, 0xAD6A0404u,
++            0x0C004069u, 0u, // dmacman:35 disables it again.
++            0x8D0A0000u, 0u, 0xAD6A0408u, 0xAD62040Cu,
++            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x24020000u,
++        });
++        image.words(0x180u, {
++            0x41E00000u, 0u, 0x0102u, 0x63616D64u, 0x006E616Du,
++            0x03E00008u, 0x24000021u,
++            0x03E00008u, 0x24000022u,
++            0x03E00008u, 0x24000023u, 0u, 0u,
++        });
++        iop_test::Host host;
++        IopEmulator iop(host);
++        const auto loaded = iop.loadModuleImage("authored-dmac-priority", image.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0 && loaded.startResult == 0, "authored DMAC caller did not return");
++        std::array<uint8_t, 16u> bytes{};
++        require(iop.readMemory(0x10400u, bytes.data(), bytes.size()), "authored DPCR captures are absent");
++        const auto word = [&](size_t index)
++        {
++            const size_t offset = index * 4u;
++            return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1u]) << 8u) |
++                   (uint32_t(bytes[offset + 2u]) << 16u) | (uint32_t(bytes[offset + 3u]) << 24u);
++        };
++        require(word(0u) == 0x76533210u && word(1u) == 0x765B3210u &&
++                    word(2u) == 0x76533210u && word(3u) == 0xDEADBEEFu,
++                "guest import dispatch did not expose the actual register updates or void ABI");
++        require(host.guestWrites == 0u, "DMAC configuration wrote unrelated EE memory");
++
++        // A real transfer-start import still has no modeled implementation.
++        // It must reach strict missing-import handling, not a success return.
++        image.words(0x198u, {0x24000020u});
++        IopEmulator unsupported(host);
++        bool rejected = false;
++        try { (void)unsupported.loadModuleImage("authored-unimplemented-dma", image.bytes, nullptr, 0u); }
++        catch (const std::runtime_error &error)
++        {
++            rejected = std::string_view(error.what()).find("missing import dmacman:32") != std::string_view::npos;
++        }
++        require(rejected && unsupported.loadedModuleCount() == 0u,
++                "unsupported DMA execution became a successful module start");
++    }
++}
++
++int main()
++{
++    try
++    {
++        sioChannelsAndBusAliases();
++        banksAndPriorityMask();
++        unsupportedBeforeMutation();
++        guestImportDispatchAndStrictFallback();
++        std::cout << "ps2xIOP DMAC priority tests passed (4 groups)\n";
++        return 0;
++    }
++    catch (const std::exception &error)
++    {
++        std::cerr << "FAIL: " << error.what() << '\n';
++        return 1;
++    }
++}

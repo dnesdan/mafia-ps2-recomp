@@ -1,0 +1,248 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 22e520e818c4ecfc695d6b186243644a57e78f9a..7fe0bd56bf6c84fc2e4acc02118a7269385d07dc 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -212,9 +212,17 @@ namespace ps2x::iop::detail
+             // original registered drivers and leave unsupported modes strict.
+             // https://ps2dev.github.io/ps2sdk/ioman_8h_source.html
+             // https://ps2dev.github.io/ps2sdk/io__common_8h_source.html
+-            if (cpu.gpr[5] != 1u) // FIO_O_RDONLY
++            const uint32_t flags = cpu.gpr[5];
++            if (flags != 1u && flags != 3u) // FIO_O_RDONLY / optical FIO_O_RDWR.
+                 return false;
+             const std::string path = filePath(m_memory, a0);
++            // CDVDMAN accepts O_RDWR but converts the opened file to O_RDONLY.
++            // Preserve that optical-driver behavior without granting host or
++            // memory-card write access, or accepting unmodeled mode bits.
++            // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html (cdrom_open)
++            if (flags == 3u && (path.find(':') == std::string::npos ||
++                               parsePs2Path(path).device != Ps2PathDevice::Cdrom))
++                return false;
+             const std::string device = deviceName(path);
+             if (std::any_of(m_devices.begin(), m_devices.end(),
+                             [&](const Device &entry)
+diff --git a/ps2xIOP/tests/iop_ioman_file_tests.cpp b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+index cb028344f3ae373ff4393efa01bf90e201600991..d8286685ed821870ca937a77f181c02b8865b5fb 100644
+--- a/ps2xIOP/tests/iop_ioman_file_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+@@ -219,12 +219,13 @@ namespace
+             return cpu.gpr[2];
+         }
+ 
+-        int32_t open(std::string_view path = "cdrom0:\\DATA\\TEST.BIN;1")
++        int32_t open(std::string_view path = "cdrom0:\\DATA\\TEST.BIN;1", uint32_t flags = 1u,
++                     uint32_t mode = 0u)
+         {
+             const std::string terminated(path);
+             require(memory.writeRam(0x10000u, terminated.c_str(), terminated.size() + 1u),
+                     "could not install authored file path");
+-            return static_cast<int32_t>(call(4u, 0x10000u, 1u));
++            return static_cast<int32_t>(call(4u, 0x10000u, flags, mode));
+         }
+ 
+         void fill(uint32_t address, size_t size, uint8_t value = 0xCAu)
+@@ -353,42 +354,96 @@ namespace
+                 "unmounted CD device fell back to a native host path");
+     }
+ 
+-    void canonicalContainmentAndDriverPrecedence()
++    void opticalReadWriteModeRetainsReadOnlyBacking()
+     {
+         Fixture f;
+-        for (const fs::path &target : {f.tree.root / "outside" / "SECRET.BIN", f.tree.root / "cd",
+-                                       f.tree.root / "cd-other" / "TEST.BIN"})
++        for (const std::string path : {"cdrom0:\\DATA\\TEST.BIN;1", "cdrom:DATA/TEST.BIN",
++                                      "CDROM0:DATA/TEST.BIN", "CdRoM:DATA/TEST.BIN"})
+         {
+-            f.host.translationOverride = target.string();
+-            require(f.open() == -19 && f.host.opens == 0u,
+-                    "translation escaped its mount or opened the mount directory");
++            // The optional creation mode is irrelevant without O_CREAT, as in
++            // the original caller that opens an existing optical icon with 3.
++            const auto fd = static_cast<uint32_t>(f.open(path, 3u, 0x50E670u));
++            f.fill(0x11000u, 32u);
++            require(fd < 16u && f.call(8u, fd, 0u, 2u) == content.size() &&
++                        f.call(8u, fd, 0u, 0u) == 0u &&
++                        f.call(6u, fd, 0x11001u, 20u) == content.size() &&
++                        f.bytes(0x11001u, content.size()) == content &&
++                        f.memory.read8(0x11000u) == 0xCAu &&
++                        f.memory.read8(0x11001u + content.size()) == 0xCAu &&
++                        f.call(6u, fd, 0x11001u, 1u) == 0u,
++                    "optical mode 3 did not read the actual existing bytes with EOF and seek semantics");
++            IopCpuState write{};
++            write.gpr[2] = marker;
++            write.gpr[4] = fd;
++            write.gpr[5] = 0x11001u;
++            write.gpr[6] = 1u;
++            require(!f.ioman->dispatchImport(7u, write, f.executor) && write.gpr[2] == marker &&
++                        f.position(fd) == content.size() && f.host.handles.size() == 1u &&
++                        f.host.handles.begin()->second == content && f.call(5u, fd) == 0u,
++                    "optical mode 3 granted write behavior or changed the read-only file");
+         }
+-        f.host.translationOverride.reset();
+-        fs::create_directory_symlink(f.tree.root / "outside", f.tree.root / "cd" / "escape");
+-        require(f.open("cdrom0:escape/SECRET.BIN") == -19 && f.host.opens == 0u,
+-                "existing symlink escaped the mounted root");
+-        fs::create_directory_symlink(f.tree.root / "cd" / "DATA", f.tree.root / "cd" / "inside");
+-        const int32_t inside = f.open("cdrom0:inside/TEST.BIN");
+-        require(inside >= 0 && f.call(5u, static_cast<uint32_t>(inside)) == 0u,
+-                "contained symlink did not resolve to its authored file");
+-
+-        require(f.memory.writeRam(0x13000u, "cdrom", 6u) &&
+-                    f.memory.zeroRam(0x13100u, 24u) && f.memory.zeroRam(0x13200u, 8u),
+-                "could not install authored driver metadata");
+-        f.memory.write32(0x13100u, 0x13000u);
+-        f.memory.write32(0x13110u, 0x13200u);
+-        require(f.call(20u, 0x13100u) == 0u, "could not register authored CD driver");
+         const size_t opens = f.host.opens;
+-        for (const std::string path : {"cdrom0:DATA/TEST.BIN", "CDROM0:DATA/TEST.BIN"})
++        for (const std::string path : {"host:TEST.BIN", "HOST0:TEST.BIN", "mc0:TEST.BIN",
++                                      "rom0:ROMVER", "cdrom1:DATA/TEST.BIN", "cdrom00:DATA/TEST.BIN",
++                                      "DATA/TEST.BIN", "/tmp/TEST.BIN"})
+         {
+-            require(f.memory.writeRam(0x10000u, path.c_str(), path.size() + 1u), "could not install driver path");
++            require(f.memory.writeRam(0x10000u, path.c_str(), path.size() + 1u), "could not install strict route");
+             IopCpuState cpu{};
+             cpu.gpr[2] = marker;
+             cpu.gpr[4] = 0x10000u;
+-            cpu.gpr[5] = 1u;
++            cpu.gpr[5] = 3u;
++            const size_t translations = f.host.translations;
+             require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
+-                        f.host.opens == opens,
+-                    "modeled mounted open shadowed a registered original driver");
++                        f.host.opens == opens && f.host.translations == translations,
++                    "optical mode exception broadened another device or an implicit path");
++        }
++        require(f.open("cdrom0:MISSING.BIN", 3u) == -2 && f.host.opens == opens + 1u,
++                "missing optical file with mode 3 did not return its actual ENOENT");
++        f.host.roots[0].clear();
++        require(f.open("cdrom0:DATA/TEST.BIN", 3u) == -19 && f.host.opens == opens + 1u &&
++                    f.host.handles.empty() && f.host.guestWrites == 0u && f.host.guestReads == 0u,
++                "unmounted optical mode 3 escaped the mount or retained a handle");
++    }
++
++    void canonicalContainmentAndDriverPrecedence()
++    {
++        for (const uint32_t flags : {1u, 3u})
++        {
++            Fixture f;
++            for (const fs::path &target : {f.tree.root / "outside" / "SECRET.BIN", f.tree.root / "cd",
++                                           f.tree.root / "cd-other" / "TEST.BIN"})
++            {
++                f.host.translationOverride = target.string();
++                require(f.open("cdrom0:DATA/TEST.BIN", flags) == -19 && f.host.opens == 0u,
++                        "translation escaped its mount or opened the mount directory");
++            }
++            f.host.translationOverride.reset();
++            fs::create_directory_symlink(f.tree.root / "outside", f.tree.root / "cd" / "escape");
++            require(f.open("cdrom0:escape/SECRET.BIN", flags) == -19 && f.host.opens == 0u,
++                    "existing symlink escaped the mounted root");
++            fs::create_directory_symlink(f.tree.root / "cd" / "DATA", f.tree.root / "cd" / "inside");
++            const int32_t inside = f.open("cdrom0:inside/TEST.BIN", flags);
++            require(inside >= 0 && f.call(5u, static_cast<uint32_t>(inside)) == 0u,
++                    "contained symlink did not resolve to its authored file");
++
++            require(f.memory.writeRam(0x13000u, "cdrom", 6u) &&
++                        f.memory.zeroRam(0x13100u, 24u) && f.memory.zeroRam(0x13200u, 8u),
++                    "could not install authored driver metadata");
++            f.memory.write32(0x13100u, 0x13000u);
++            f.memory.write32(0x13110u, 0x13200u);
++            require(f.call(20u, 0x13100u) == 0u, "could not register authored CD driver");
++            const size_t opens = f.host.opens;
++            for (const std::string path : {"cdrom0:DATA/TEST.BIN", "CDROM0:DATA/TEST.BIN"})
++            {
++                require(f.memory.writeRam(0x10000u, path.c_str(), path.size() + 1u), "could not install driver path");
++                IopCpuState cpu{};
++                cpu.gpr[2] = marker;
++                cpu.gpr[4] = 0x10000u;
++                cpu.gpr[5] = flags;
++                require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
++                            f.host.opens == opens,
++                        "modeled mounted open shadowed a registered original driver");
++            }
+         }
+     }
+ 
+@@ -397,7 +452,9 @@ namespace
+         Fixture f;
+         (void)f.open();
+         const size_t opens = f.host.opens;
+-        for (const uint32_t flags : {0u, 2u, 3u, 0x11u, 0x101u, 0x201u, 0x401u, 0x8001u})
++        for (const uint32_t flags : {0u, 2u, 0x11u, 0x101u, 0x201u, 0x401u, 0x8001u,
++                                     0x13u, 0x103u, 0x203u, 0x403u, 0x803u, 0x8003u,
++                                     0x10000003u, 0x40000003u})
+         {
+             IopCpuState cpu{};
+             cpu.gpr[2] = marker;
+@@ -441,6 +498,7 @@ namespace
+                 return address;
+             },
+         };
++        for (const uint32_t flags : {1u, 3u})
+         for (const auto &alter : examples)
+         {
+             Fixture f;
+@@ -449,7 +507,7 @@ namespace
+             IopCpuState cpu{};
+             cpu.gpr[2] = marker;
+             cpu.gpr[4] = address;
+-            cpu.gpr[5] = 1u;
++            cpu.gpr[5] = flags;
+             bool rejected = false;
+             try { (void)f.ioman->dispatchImport(4u, cpu, f.executor); }
+             catch (const std::runtime_error &) { rejected = true; }
+@@ -729,24 +787,27 @@ namespace
+     void authoredMipsImportsConsumeActualIopBytes()
+     {
+         TemporaryTree tree;
+-        FileHost host(tree);
+-        IopEmulator iop(host);
+-        const auto image = authoredFileImports();
+-        const auto loaded = iop.loadModuleImage("authored-file-imports", image.bytes, nullptr, 0u);
+-        std::array<uint32_t, 8u> results{};
+-        std::array<uint8_t, 12u> data{};
+-        require(loaded.moduleId > 0 && loaded.startResult == 0 &&
+-                    iop.readMemory(0x10480u, results.data(), sizeof(results)) &&
+-                    iop.readMemory(0x10440u, data.data(), data.size()) &&
+-                    results[0] < 16u && results[1] == 5u && results[2] == 3u &&
+-                    results[3] == 4u && results[4] == 0u &&
+-                    results[6] == 0xFF807F00u && results[7] == 0x31u &&
+-                    std::equal(content.begin(), content.begin() + 5, data.begin()) &&
+-                    std::equal(content.begin() + 3, content.begin() + 7, data.begin() + 8),
+-                "actual IOP imports did not preserve open/read/seek/close ABI and binary bytes");
+-        require(host.opens == 1u && host.reads == 2u && host.closes == 1u &&
+-                    host.handles.empty() && host.guestWrites == 0u && host.guestReads == 0u,
+-                "authored imported file path leaked a handle or directly touched EE RAM");
++        for (const uint32_t flags : {1u, 3u})
++        {
++            FileHost host(tree);
++            IopEmulator iop(host);
++            const auto image = authoredFileImports(flags);
++            const auto loaded = iop.loadModuleImage("authored-file-imports", image.bytes, nullptr, 0u);
++            std::array<uint32_t, 8u> results{};
++            std::array<uint8_t, 12u> data{};
++            require(loaded.moduleId > 0 && loaded.startResult == 0 &&
++                        iop.readMemory(0x10480u, results.data(), sizeof(results)) &&
++                        iop.readMemory(0x10440u, data.data(), data.size()) &&
++                        results[0] < 16u && results[1] == 5u && results[2] == 3u &&
++                        results[3] == 4u && results[4] == 0u &&
++                        results[6] == 0xFF807F00u && results[7] == 0x31u &&
++                        std::equal(content.begin(), content.begin() + 5, data.begin()) &&
++                        std::equal(content.begin() + 3, content.begin() + 7, data.begin() + 8),
++                    "actual IOP imports did not preserve open/read/seek/close ABI and binary bytes");
++            require(host.opens == 1u && host.reads == 2u && host.closes == 1u &&
++                        host.handles.empty() && host.guestWrites == 0u && host.guestReads == 0u,
++                    "authored imported file path leaked a handle or directly touched EE RAM");
++        }
+ 
+         FileHost unsupportedHost(tree);
+         IopEmulator unsupported(unsupportedHost);
+@@ -767,6 +828,7 @@ int main()
+         {"Read accepts complete RAM aliases and live allocation interiors", aliasesAndLiveHeapBuffers},
+         {"Bad descriptors and signed seek errors preserve file position", descriptorAndSeekErrorsPreservePosition},
+         {"Explicit mounts distinguish absent devices from absent files", supportedMountsAndAbsentRoutes},
++        {"Optical mode 3 opens existing files with read-only backing", opticalReadWriteModeRetainsReadOnlyBacking},
+         {"Canonical paths remain contained and original drivers take precedence", canonicalContainmentAndDriverPrecedence},
+         {"Unsupported file modes and operations remain strict", unsupportedOperationsStayStrict},
+         {"Malformed paths fail before host or guest side effects", malformedPathsFailBeforeHostActivity},

@@ -1,0 +1,1441 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 5c8a6b16b43b0c3904366f0b100b104c491d9891..c6671bbaa19fd6cdfea54e5fa7874a6198976bde 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ee_scheduler.h"
++#include "../ps2_vif_internal.h"
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+@@ -1252,6 +1253,13 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+     if (cause < 32u)
+     {
+         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
++        if (!dmac && cause < 15u)
++        {
++            auto &memory = m_runtime.memory();
++            const uint32_t bit = 1u << cause;
++            if (((memory.readIORegister(0x1000F010u) & bit) != 0u) != enabled)
++                memory.writeIORegister(0x1000F010u, bit);
++        }
+         if (enabled)
+         {
+             mask |= 1u << cause;
+@@ -1771,6 +1779,25 @@ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
+     m_runtime.drainCompletedDmacHandlers(m_rdram);
++    // Device stores may happen before the executor is bound or after it has
++    // joined. Consume pending VIF interrupts only on this executor-owned pump,
++    // including when every ordinary EE thread is waiting.
++    auto &memory = m_runtime.memory();
++    // VIF I-bit events belong to INTC, independently of DMA completion.
++    // Acknowledge exactly once at the modeled kernel boundary, then run the
++    // registered guest handler through the existing interrupt scheduler.
++    const uint32_t intcMask = memory.readIORegister(ps2_vif::IntcMask);
++    for (uint32_t cause : {4u, 5u})
++    {
++        const uint32_t bit = 1u << cause;
++        setIrqCauseEnabled(false, cause, (intcMask & bit) != 0u);
++        if ((memory.readIORegister(ps2_vif::IntcStat) & intcMask & bit) &&
++            hasEnabledIrqHandler(false, cause))
++        {
++            memory.writeIORegister(ps2_vif::IntcStat, bit);
++            dispatchIrq(false, cause);
++        }
++    }
+     processDueDeadlines();
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 7c22c201d9fe42d8f95fe78084b272465e9a6f49..e351f704762ca803afdba4ca9ccb0dcc1bf7d450 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/ps2_memory.h"
++#include "ps2_vif_internal.h"
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+@@ -327,6 +328,9 @@ bool PS2Memory::initialize(size_t ramSize)
+         m_completedDmacCauses.clear();
+     }
+     m_codeRegions.clear();
++    m_pendingGifTransfers.clear();
++    m_pendingVif0Transfers.clear();
++    m_pendingVif1Transfers.clear();
+     m_path3Masked = false;
+     m_path3MaskedFifo.clear();
+     m_vif1PendingPath2ImageQwc = 0u;
+@@ -1216,79 +1220,97 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         return true;
+     }
+ 
+-    m_ioRegisters[address] = value;
++    if (address == ps2_vif::IntcStat)
++    {
++        m_ioRegisters[address] &= ~(value & 0x7FFFu); // INTC_STAT: write one to acknowledge
++        return true;
++    }
++    if (address == ps2_vif::IntcMask)
++    {
++        m_ioRegisters[address] ^= value & 0x7FFFu; // INTC_MASK: write one toggles
++        return true;
++    }
+ 
+-    if (address >= 0x10003C00u && address < 0x10003E00u)
++    if ((address >= 0x10003800u && address < 0x10003A00u) ||
++        (address >= 0x10003C00u && address < 0x10003E00u))
+     {
+         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+-
+-        switch (address)
+-        {
+-        case 0x10003C10u:     // VIF1_FBRST
+-            if (value & 0x1u) // RST
++        const unsigned unit = address >= 0x10003C00u ? 1u : 0u;
++        auto &regs = ps2_vif::registers(*this, unit);
++        const uint32_t offset = address - (unit ? 0x10003C00u : 0x10003800u);
++        switch (offset)
++        {
++        case 0x00u: // Only VIF1 STAT.FDR is CPU-writable.
++            if (unit)
++                regs.stat = (regs.stat & ~(1u << 23u)) | (value & (1u << 23u));
++            break;
++        case 0x10u: // FBRST
++            if ((value & 0x1u) && (m_ioRegisters[unit ? 0x10009000u : 0x10008000u] & 0x100u))
++                throw std::runtime_error("VIF reset during active DMA requires explicit channel cancellation");
++            if (value & 0x2u)
++                regs.stat |= 1u << 9u; // VFS
++            if (value & 0x4u)
+             {
+-                const bool wasPath3Masked = m_path3Masked;
+-                std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+-                m_vif1PendingPath2ImageQwc = 0u;
+-                m_vif1PendingPath2DirectHl = false;
+-                m_path3Masked = false;
+-                if (wasPath3Masked)
+-                    flushMaskedPath3Packets();
++                if ((regs.stat & 3u) == 1u)
++                    regs.fbrst |= 0x4u; // Finish an incomplete current payload before STOP.
++                else
++                    regs.stat |= 1u << 8u; // VSS
+             }
+-            if (value & 0x8u) // STC
++            if (value & 0x8u)
+             {
+-                vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
++                regs.fbrst &= ~0x4u;
++                regs.stat &= ~(0x3Fu << 8u); // STC: VSS, VFS, VIS, INT, ER0, ER1
++            }
++            if (value & 0x1u)
++            {
++                // FBRST resets execution/FIFO state, not programmed values.
++                // ROW/COL retention is observed on hardware (PCSX2 Vif.cpp);
++                // Play!'s FBRST path likewise differs from a cold VIF reset.
++                regs.stat = 0u;
++                regs.code = 0u;
++                regs.num = 0u;
++                regs.err = 0u;
++                regs.fbrst = 0u;
++                ps2_vif::pending(*this, unit).clear();
++                // Reset owns VIF/FIFO only. DMA register state has a separate
++                // lifetime; an active channel must be explicitly cancelled first.
++                if (unit)
++                {
++                    const bool wasPath3Masked = m_path3Masked;
++                    m_vif1PendingPath2ImageQwc = 0u;
++                    m_vif1PendingPath2DirectHl = false;
++                    m_path3Masked = false;
++                    if (wasPath3Masked)
++                        flushMaskedPath3Packets();
++                }
++            }
++            else if ((value & 0x8u) && !ps2_vif::pending(*this, unit).empty())
++            {
++                processPendingTransfers();
+             }
+             break;
+-        case 0x10003C30u:
+-            vif1_regs.mark = value & 0xFFFFu;
+-            vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
+-            break;
+-        case 0x10003C40u:
+-            vif1_regs.cycle = value & 0xFFFFu;
+-            break;
+-        case 0x10003C50u:
+-            vif1_regs.mode = value & 0x3u;
+-            break;
+-        case 0x10003C60u:
+-            vif1_regs.num = value & 0xFFu;
+-            break;
+-        case 0x10003C70u:
+-            vif1_regs.mask = value;
+-            break;
+-        case 0x10003C80u:
+-            vif1_regs.code = value;
+-            break;
+-        case 0x10003C90u:
+-            vif1_regs.itops = value & 0x3FFu;
+-            break;
+-        case 0x10003CA0u:
+-            vif1_regs.base = value & 0x3FFu;
+-            break;
+-        case 0x10003CB0u:
+-            vif1_regs.ofst = value & 0x3FFu;
+-            break;
+-        case 0x10003CC0u:
+-            vif1_regs.tops = value & 0x3FFu;
+-            break;
+-        case 0x10003CD0u:
+-            vif1_regs.itop = value & 0x3FFu;
++        case 0x20u:
++            regs.err = value & 7u;
+             break;
+-        case 0x10003CE0u:
+-            vif1_regs.top = value & 0x3FFu;
++        case 0x30u:
++            regs.mark = value & 0xFFFFu;
++            regs.stat &= ~(1u << 6u);
+             break;
+         default:
+-            break;
++            // VIFcodes, not CPU stores, program the data/configuration registers
++            // (EE manual 6.5). Ignore writes to those read-only MMIO views.
++            return true;
+         }
+-
++        m_ioRegisters[address] = value;
+         return true;
+     }
+ 
+-    if (address >= 0x10003800u && address < 0x10003A00u)
+-    {
+-        m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+-        return true;
+-    }
++    if ((address == 0x10008000u || address == 0x10009000u) &&
++        (m_ioRegisters[address] & 0x100u) && !(value & 0x100u))
++        ps2_vif::cancelDma(*this, address == 0x10009000u ? 1u : 0u);
++    m_ioRegisters[address] = value;
++    if (address == 0x10008000u || address == 0x10009000u)
++        ps2_vif::updateFifoCount(*this, address == 0x10009000u ? 1u : 0u);
+ 
+     if (address >= 0x10008000 && address < 0x1000F000)
+     {
+@@ -1743,8 +1765,12 @@ void PS2Memory::processPendingTransfers()
+     }
+     m_pendingGifTransfers.clear();
+ 
+-    const bool hadVif0 = !m_pendingVif0Transfers.empty();
+-    for (auto &p : m_pendingVif0Transfers)
++    // Move the submitted batch out before decoding. The decoder owns any
++    // partial command or bytes held behind an I-bit in the original queue.
++    std::vector<PendingTransfer> vif0Batch;
++    vif0Batch.swap(m_pendingVif0Transfers);
++    const bool hadVif0 = !vif0Batch.empty() && (m_ioRegisters[0x10008000u] & 0x100u);
++    for (auto &p : vif0Batch)
+     {
+         if (!p.chainData.empty())
+         {
+@@ -1799,10 +1825,14 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
+-    m_pendingVif0Transfers.clear();
++    ps2_vif::updateFifoCount(*this, 0u);
+ 
+-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
+-    for (auto &p : m_pendingVif1Transfers)
++    // Move the submitted batch out before decoding. The decoder owns any
++    // partial command or bytes held behind an I-bit in the original queue.
++    std::vector<PendingTransfer> vif1Batch;
++    vif1Batch.swap(m_pendingVif1Transfers);
++    const bool hadVif1 = !vif1Batch.empty() && (m_ioRegisters[0x10009000u] & 0x100u);
++    for (auto &p : vif1Batch)
+     {
+         if (!p.chainData.empty())
+         {
+@@ -1857,7 +1887,7 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
+-    m_pendingVif1Transfers.clear();
++    ps2_vif::updateFifoCount(*this, 1u);
+ 
+     if (m_gifArbiter)
+         m_gifArbiter->drain();
+@@ -1889,19 +1919,29 @@ void PS2Memory::processPendingTransfers()
+         m_ioRegisters[GIF_CHANNEL + 0x00] &= ~0x100u;
+         m_ioRegisters[GIF_CHANNEL + 0x20] = 0;
+     }
+-    if (hadVif0)
++    // DMA may finish while VIF is stalled if its remaining bytes fit the
++    // hardware FIFO. Larger retained streams keep STR set until STC consumes
++    // enough input. Draining an already transferred FIFO never reissues DMAC.
++    if (hadVif0 && (!(vif0_regs.stat & ps2_vif::Stalls) ||
++                       ps2_vif::pendingBytes(*this, 0u) <= 128u))
+     {
+         raiseDStatChannel(0u); // VIF0 channel
+         queueCompletedDmacCause(0u);
+         m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
+         m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
++        ps2_vif::updateFifoCount(*this, 0u);
+     }
+-    if (hadVif1)
++    // DMA may finish while VIF is stalled if its remaining bytes fit the
++    // hardware FIFO. Larger retained streams keep STR set until STC consumes
++    // enough input. Draining an already transferred FIFO never reissues DMAC.
++    if (hadVif1 && (!(vif1_regs.stat & ps2_vif::Stalls) ||
++                       ps2_vif::pendingBytes(*this, 1u) <= 256u))
+     {
+         raiseDStatChannel(1u); // VIF1 channel
+         queueCompletedDmacCause(1u);
+         m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
+         m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
++        ps2_vif::updateFifoCount(*this, 1u);
+     }
+ }
+ 
+@@ -2317,6 +2357,38 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         return 0u;
+     }
+ 
++    if ((address >= 0x10003800u && address < 0x10003A00u) ||
++        (address >= 0x10003C00u && address < 0x10003E00u))
++    {
++        const unsigned unit = address >= 0x10003C00u ? 1u : 0u;
++        const auto &regs = ps2_vif::registers(*this, unit);
++        const uint32_t offset = address - (unit ? 0x10003C00u : 0x10003800u);
++        switch (offset)
++        {
++        case 0x00u: return regs.stat;
++        case 0x10u: return 0u; // FBRST is write-only
++        case 0x20u: return regs.err;
++        case 0x30u: return regs.mark;
++        case 0x40u: return regs.cycle;
++        case 0x50u: return regs.mode;
++        case 0x60u: return regs.num;
++        case 0x70u: return regs.mask;
++        case 0x80u: return regs.code;
++        case 0x90u: return regs.itops;
++        case 0xA0u: return regs.base;
++        case 0xB0u: return regs.ofst;
++        case 0xC0u: return regs.tops;
++        case 0xD0u: return regs.itop;
++        case 0xE0u: return regs.top;
++        default:
++            if (offset >= 0x100u && offset <= 0x130u && !(offset & 15u))
++                return regs.row[(offset - 0x100u) / 16u];
++            if (offset >= 0x140u && offset <= 0x170u && !(offset & 15u))
++                return regs.col[(offset - 0x140u) / 16u];
++            return 0u;
++        }
++    }
++
+     if (address >= 0x10002000 && address <= 0x10002030)
+     {
+         uint32_t val = 0;
+@@ -2361,10 +2433,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         {
+             if ((address & 0xFF) == 0x00)
+             {
+-                // SIF0 is a receive chain: polling CHCR cannot complete it.
+-                // The negotiated IOP transport clears STR only after delivering
+-                // a packet, or the guest can cancel it with an explicit write.
+-                if (address == 0x1000C000u)
++                // SIF0 receive delivery and VIF FIFO/backpressure own these
++                // channels' completion. Merely polling CHCR cannot clear STR.
++                if (address == 0x1000C000u || address == 0x10008000u || address == 0x10009000u)
+                     return m_ioRegisters[address];
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd15678f8899b6dbc60db8f9d95379829ce..35ea17a8d0d9da1b823e67c5204f93a11e5f50ac 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,5 +1,6 @@
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
++#include "ps2_vif_internal.h"
+ #include <cstring>
+ 
+ enum VIFCmd : uint8_t
+@@ -97,10 +98,38 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
+-
+-    uint32_t pos = 0;
+-    while (pos + 4 <= sizeBytes)
++    if (!data)
++        throw std::runtime_error("Null VIF0 input");
++    if (vif0_regs.stat & ps2_vif::Stalls)
++    {
++        ps2_vif::defer(*this, 0u, data, sizeBytes);
++        return;
++    }
++    std::vector<uint8_t> joined;
++    ps2_vif::joinDeferred(*this, 0u, data, sizeBytes, joined);
++    uint32_t pos = 0u;
++    bool completedIrq = false;
++    uint8_t completedOpcode = 0u;
++    bool completedCommand = false;
++    for (;;)
+     {
++        if (completedCommand && (vif0_regs.fbrst & 4u))
++        {
++            vif0_regs.fbrst &= ~4u;
++            vif0_regs.stat |= 1u << 8u;
++        }
++        completedCommand = false;
++        if (completedIrq)
++        {
++            ps2_vif::completeInterrupt(*this, 0u, completedOpcode);
++            completedIrq = false;
++        }
++        if ((vif0_regs.stat & ps2_vif::Stalls) || sizeBytes - pos < 4u)
++        {
++            ps2_vif::defer(*this, 0u, data + pos, sizeBytes - pos);
++            break;
++        }
++
+         uint32_t cmd = 0u;
+         std::memcpy(&cmd, data + pos, sizeof(cmd));
+         pos += 4u;
+@@ -108,12 +137,23 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
+         const uint8_t opcode = static_cast<uint8_t>((cmd >> 24) & 0x7Fu);
+         const uint16_t imm = static_cast<uint16_t>(cmd & 0xFFFFu);
+         const uint8_t num = static_cast<uint8_t>((cmd >> 16) & 0xFFu);
+-        const bool irq = (cmd & 0x80000000u) != 0u;
++        const bool irq = (cmd & 0x80000000u) != 0u && (vif0_regs.err & 1u) == 0u;
+ 
+         vif0_regs.code = cmd;
+         vif0_regs.num = num;
+-        if (irq)
+-            vif0_regs.stat |= (1u << 11);
++        const auto required = ps2_vif::payloadBytes(vif0_regs, cmd, 0u);
++        if (!required && irq)
++            throw std::runtime_error("Unsupported interrupting VIF0 command");
++        if (required && *required > sizeBytes - pos)
++        {
++            vif0_regs.stat = (vif0_regs.stat & ~3u) | 1u; // VPS: waiting for payload
++            ps2_vif::defer(*this, 0u, data + pos - 4u, sizeBytes - pos + 4u);
++            break;
++        }
++        vif0_regs.stat &= ~3u;
++        completedIrq = irq;
++        completedOpcode = opcode;
++        completedCommand = required.has_value();
+ 
+         if (opcode == VIF_NOP)
+         {
+@@ -299,16 +339,44 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+     if (sizeBytes == 0u)
+         return;
+-
+-    uint32_t pos = 0;
+-
+-    while (pos + 4 <= sizeBytes)
++    if (!data)
++        throw std::runtime_error("Null VIF1 input");
++    if (vif1_regs.stat & ps2_vif::Stalls)
++    {
++        ps2_vif::defer(*this, 1u, data, sizeBytes);
++        return;
++    }
++    std::vector<uint8_t> joined;
++    ps2_vif::joinDeferred(*this, 1u, data, sizeBytes, joined);
++    uint32_t pos = 0u;
++    bool completedIrq = false;
++    uint8_t completedOpcode = 0u;
++    bool completedCommand = false;
++    for (;;)
+     {
++        if (completedCommand && (vif1_regs.fbrst & 4u))
++        {
++            vif1_regs.fbrst &= ~4u;
++            vif1_regs.stat |= 1u << 8u;
++        }
++        completedCommand = false;
++        if (completedIrq)
++        {
++            ps2_vif::completeInterrupt(*this, 1u, completedOpcode);
++            completedIrq = false;
++        }
++        if ((vif1_regs.stat & ps2_vif::Stalls) || sizeBytes - pos < 4u)
++        {
++            ps2_vif::defer(*this, 1u, data + pos, sizeBytes - pos);
++            break;
++        }
++
+         if (m_vif1PendingPath2ImageQwc != 0u)
+         {
+             const uint32_t availableQw = (sizeBytes - pos) / 16u;
+             if (availableQw == 0u)
+             {
++                ps2_vif::defer(*this, 1u, data + pos, sizeBytes - pos);
+                 break;
+             }
+ 
+@@ -338,13 +406,23 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         uint8_t opcode = (cmd >> 24) & 0x7F;
+         uint16_t imm = cmd & 0xFFFF;
+         uint8_t num = (cmd >> 16) & 0xFF;
+-        const bool irq = (cmd & 0x80000000u) != 0u;
++        const bool irq = (cmd & 0x80000000u) != 0u && (vif1_regs.err & 1u) == 0u;
+ 
+-        // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+-        if (irq)
+-            vif1_regs.stat |= (1u << 11); // INT
++        const auto required = ps2_vif::payloadBytes(vif1_regs, cmd, 1u);
++        if (!required && irq)
++            throw std::runtime_error("Unsupported interrupting VIF1 command");
++        if (required && *required > sizeBytes - pos)
++        {
++            vif1_regs.stat = (vif1_regs.stat & ~3u) | 1u; // VPS: waiting for payload
++            ps2_vif::defer(*this, 1u, data + pos - 4u, sizeBytes - pos + 4u);
++            break;
++        }
++        vif1_regs.stat &= ~3u;
++        completedIrq = irq;
++        completedOpcode = opcode;
++        completedCommand = required.has_value();
+ 
+         if (opcode == VIF_NOP)
+         {
+diff --git a/ps2xRuntime/src/lib/ps2_vif_internal.h b/ps2xRuntime/src/lib/ps2_vif_internal.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd376bd81f42b7a2a95bf9c18221d3eb759307ea
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vif_internal.h
+@@ -0,0 +1,163 @@
++#pragma once
++
++// Internal VIF stream helpers. Deferred bytes stay owned by PS2Memory's
++// existing transfer queues; no process-global state or guest-memory aliases.
++#include "runtime/ps2_memory.h"
++#include <algorithm>
++#include <limits>
++#include <optional>
++#include <stdexcept>
++
++namespace ps2_vif
++{
++    constexpr uint32_t IntcStat = 0x1000F000u;
++    constexpr uint32_t IntcMask = 0x1000F010u;
++    constexpr uint32_t Interrupt = 1u << 11u;
++    constexpr uint32_t InterruptStall = 1u << 10u;
++    constexpr uint32_t Stalls = 7u << 8u;
++
++    inline VIFRegisters &registers(PS2Memory &memory, unsigned unit)
++    {
++        return unit ? memory.vif1_regs : memory.vif0_regs;
++    }
++
++    inline auto &pending(PS2Memory &memory, unsigned unit)
++    {
++        return unit ? memory.m_pendingVif1Transfers : memory.m_pendingVif0Transfers;
++    }
++
++    inline size_t pendingBytes(PS2Memory &memory, unsigned unit)
++    {
++        size_t bytes = 0;
++        for (const auto &transfer : pending(memory, unit))
++            bytes += transfer.chainData.empty() ? size_t(transfer.qwc) * 16u : transfer.chainData.size();
++        return bytes;
++    }
++
++    inline void updateFifoCount(PS2Memory &memory, unsigned unit)
++    {
++        auto &regs = registers(memory, unit);
++        const size_t capacityQwc = unit ? 16u : 8u;
++        const bool activeDma = (memory.m_ioRegisters[unit ? 0x10009000u : 0x10008000u] & 0x100u) != 0u;
++        // Retained decoder input is not a hardware FIFO byte counter. Console
++        // intstall tests report FQC=0 after a short DMA completes with VIS set.
++        // This untimed model reports a full FIFO only while a larger DMA is
++        // backpressured; it does not expose the owned decoder tail as FIFO data.
++        const uint32_t qwords = activeDma && (regs.stat & Stalls) && pendingBytes(memory, unit) > capacityQwc * 16u
++                                    ? static_cast<uint32_t>(capacityQwc) : 0u;
++        regs.stat = (regs.stat & ~0x1F000000u) | (qwords << 24u);
++    }
++
++    inline void defer(PS2Memory &memory, unsigned unit, const uint8_t *data, uint32_t bytes)
++    {
++        if (bytes)
++        {
++            PS2Memory::PendingTransfer transfer;
++            transfer.chainData.assign(data, data + bytes);
++            pending(memory, unit).push_back(std::move(transfer));
++        }
++        auto &regs = registers(memory, unit);
++        if ((regs.stat & InterruptStall) && pendingBytes(memory, unit) >= 4u)
++            regs.stat = (regs.stat & ~3u) | 2u; // VPS: decoder held by I-bit, including split input.
++        updateFifoCount(memory, unit);
++    }
++
++    inline void cancelDma(PS2Memory &memory, unsigned unit)
++    {
++        const size_t capacityBytes = unit ? 256u : 128u;
++        if (pendingBytes(memory, unit) <= capacityBytes)
++            return;
++        // The untimed DMA staging queue also owns bytes held outside the full
++        // FIFO. Cancelling CHCR must discard that untransferred suffix, while
++        // preserving the prefetched FIFO prefix until VIF consumes or resets it.
++        PS2Memory::PendingTransfer fifo;
++        fifo.chainData.reserve(capacityBytes);
++        auto &queue = pending(memory, unit);
++        for (const auto &transfer : queue)
++        {
++            if (transfer.qwc)
++                throw std::runtime_error("VIF DMA cancellation reached an unstaged source");
++            const size_t take = std::min(capacityBytes - fifo.chainData.size(), transfer.chainData.size());
++            fifo.chainData.insert(fifo.chainData.end(), transfer.chainData.begin(), transfer.chainData.begin() + take);
++            if (fifo.chainData.size() == capacityBytes)
++                break;
++        }
++        queue.clear();
++        queue.push_back(std::move(fifo));
++    }
++
++    inline void joinDeferred(PS2Memory &memory, unsigned unit,
++                             const uint8_t *&data, uint32_t &bytes, std::vector<uint8_t> &storage)
++    {
++        auto &queue = pending(memory, unit);
++        if (queue.empty())
++            return;
++        const size_t previous = pendingBytes(memory, unit);
++        if (previous > std::numeric_limits<uint32_t>::max() - bytes)
++            throw std::runtime_error("VIF deferred input exceeds the stream size limit");
++        storage.reserve(previous + bytes);
++        for (const auto &transfer : queue)
++        {
++            // DMA source descriptors are removed by processPendingTransfers
++            // before it enters the decoder. Only retained stream bytes belong here.
++            if (transfer.qwc || transfer.chainData.empty())
++                throw std::runtime_error("VIF decoder entered with an undrained DMA source");
++            storage.insert(storage.end(), transfer.chainData.begin(), transfer.chainData.end());
++        }
++        if (bytes)
++            storage.insert(storage.end(), data, data + bytes);
++        queue.clear();
++        data = storage.data();
++        bytes = static_cast<uint32_t>(storage.size());
++        updateFifoCount(memory, unit);
++    }
++
++    inline void completeInterrupt(PS2Memory &memory, unsigned unit, uint8_t opcode)
++    {
++        auto &regs = registers(memory, unit);
++        // Hardware intstall tests show MARK.I sets INT without VIS and lets
++        // subsequent commands execute. Other I-bit commands stall the stream.
++        // See ps2autotests tests/dma/vif/intstall.{cpp,expected}; the manual's
++        // repeated following-MARK wording is ambiguous for this command.
++        regs.stat |= Interrupt;
++        if (opcode != 0x07u)
++            regs.stat |= InterruptStall;
++        memory.m_ioRegisters[IntcStat] |= 1u << (4u + unit);
++    }
++
++    // Required data after one supported command. Waiting for a split payload
++    // must not execute its effects or deliver its I-bit interrupt early.
++    inline std::optional<uint32_t> payloadBytes(const VIFRegisters &regs, uint32_t command, unsigned unit)
++    {
++        const uint8_t opcode = (command >> 24u) & 0x7Fu;
++        const uint32_t count = ((command >> 16u) & 0xFFu) ? ((command >> 16u) & 0xFFu) : 256u;
++        switch (opcode)
++        {
++        case 0x00: case 0x01: case 0x04: case 0x05: case 0x07:
++        case 0x10: case 0x11: case 0x13:
++            return 0u;
++        case 0x02: case 0x03: case 0x06: case 0x14: case 0x15: case 0x17:
++            return unit ? std::optional<uint32_t>(0u) : std::nullopt;
++        case 0x20:
++            return 4u;
++        case 0x30: case 0x31:
++            return 16u;
++        case 0x4A:
++            return count * 8u;
++        case 0x50: case 0x51:
++            return unit ? std::optional<uint32_t>(((command & 0xFFFFu) ? (command & 0xFFFFu) : 65536u) * 16u)
++                        : std::nullopt;
++        default:
++            if ((opcode & 0x60u) != 0x60u)
++                return std::nullopt;
++            const uint32_t vn = (opcode >> 2u) & 3u;
++            const uint32_t vl = opcode & 3u;
++            const uint32_t bits = vl == 0u ? 32u : vl == 1u ? 16u : vl == 2u ? 8u : 16u;
++            const uint32_t vectorBytes = vl == 3u && vn == 3u ? 2u : (vn + 1u) * bits / 8u;
++            const uint32_t cl = std::max(1u, regs.cycle & 0xFFu);
++            const uint32_t wl = std::max(1u, (regs.cycle >> 8u) & 0xFFu);
++            const uint32_t sourceVectors = cl < wl ? (count / wl) * cl + std::min(count % wl, cl) : count;
++            return (sourceVectors * vectorBytes + 3u) & ~3u;
++        }
++    }
++}
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 5fc24792fa1a09738a27e3e6a71be0c217269e2e..940b3d2ed80963dd18ec538d06c39ce0225f23f8 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -29,6 +29,8 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_kernel_tests.cpp
+     src/ps2_startup_args_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
++    src/ps2_runtime_vif_interrupt_tests.cpp
++    src/ps2_vif_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index a5f9a4b58af476701b28873a881142bf678094ee..d70ab04549c6f5ece919ad8ac57ecc12a849c995 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -10,6 +10,8 @@ void register_ps2_runtime_io_tests();
+ void register_ps2_runtime_kernel_tests();
+ void register_ps2_startup_args_tests();
+ void register_ps2_runtime_interrupt_tests();
++void register_ps2_runtime_vif_interrupt_tests();
++void register_ps2_vif_interrupt_tests();
+ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+@@ -35,6 +37,8 @@ int main()
+     register_ps2_runtime_kernel_tests();
+     register_ps2_startup_args_tests();
+     register_ps2_runtime_interrupt_tests();
++    register_ps2_runtime_vif_interrupt_tests();
++    register_ps2_vif_interrupt_tests();
+     register_ps2_memory_tests();
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 4438fef1f81861fe70a9b7e556d11c791f42d4de..f36a895580a7477bfdd00ba4bf1d17eda43b17c0 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -770,7 +770,7 @@ void register_ps2_memory_tests()
+             t.IsTrue((mem.vif1_regs.stat & (1u << 11)) == 0u, "FBRST.STC should clear VIF1 STAT.INT");
+         });
+ 
+-        tc.Run("VIF FBRST RST clears VIF1 command state", [](TestCase &t)
++        tc.Run("VIF FBRST RST clears execution state and retains programmed values", [](TestCase &t)
+         {
+             PS2Memory mem;
+             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+@@ -785,11 +785,11 @@ void register_ps2_memory_tests()
+ 
+             t.IsTrue(mem.writeIORegister(0x10003C10u, 0x1u), "FBRST RST write should succeed");
+ 
+-            t.Equals(mem.vif1_regs.mark, 0u, "RST should clear MARK");
+-            t.Equals(mem.vif1_regs.cycle, 0u, "RST should clear CYCLE");
+-            t.Equals(mem.vif1_regs.mode, 0u, "RST should clear MODE");
++            t.Equals(mem.vif1_regs.mark, 0x1234u, "RST should retain MARK value");
++            t.Equals(mem.vif1_regs.cycle, 0x0102u, "RST should retain CYCLE");
++            t.Equals(mem.vif1_regs.mode, 2u, "RST should retain MODE");
+             t.Equals(mem.vif1_regs.num, 0u, "RST should clear NUM");
+-            t.Equals(mem.vif1_regs.mask, 0u, "RST should clear MASK");
++            t.Equals(mem.vif1_regs.mask, 0x89ABCDEFu, "RST should retain MASK");
+             t.Equals(mem.vif1_regs.code, 0u, "RST should clear CODE");
+             t.Equals(mem.vif1_regs.stat, 0u, "RST should clear STAT");
+         });
+diff --git a/ps2xTest/src/ps2_runtime_vif_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_vif_interrupt_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7c3b9dad7280502dfbedf4c07a655d2a87f5b1a
+--- /dev/null
++++ b/ps2xTest/src/ps2_runtime_vif_interrupt_tests.cpp
+@@ -0,0 +1,283 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_syscalls.h"
++#include "runtime/ee_scheduler.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <exception>
++#include <thread>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kVifWait = 0x00162000u;
++    constexpr uint32_t kVifResume = 0x00162010u;
++    constexpr uint32_t kVifFinish = 0x00162020u;
++    constexpr uint32_t kVifDriver = 0x00162030u;
++    constexpr uint32_t kVifEnable = 0x00162040u;
++    constexpr uint32_t kVifHandler = 0x00162050u;
++    constexpr uint32_t kVifDmaPayload = 0x00002b00u;
++    constexpr uint32_t kVifScratch = 0x00002c00u;
++    constexpr uint32_t kVif1Fifo = 0x10005000u;
++    constexpr uint32_t kVif1Fbrst = 0x10003c10u;
++    constexpr uint32_t kIntcStat = 0x1000f000u;
++    constexpr uint32_t kVif1Chcr = 0x10009000u;
++    constexpr uint32_t kVif1Madr = 0x10009010u;
++    constexpr uint32_t kVif1Qwc = 0x10009020u;
++    constexpr uint32_t kInterruptNop = 0x80000000u;
++    constexpr uint32_t kFollowingCycle = 0x01005678u;
++
++    struct VifScenario
++    {
++        bool dma = false;
++        bool initiallyDisabled = false;
++        bool preloaded = false;
++        int semaphore = 0;
++        int32_t resumedResult = -1;
++        uint32_t calls = 0u;
++        uint32_t cause = 0u;
++        uint32_t liveStatAtHandler = 0u;
++        uint32_t codeAtHandler = 0u;
++        uint32_t cycleBeforeResume = 0u;
++        uint32_t cycleAfterResume = 0u;
++        uint32_t callsBeforeEnable = 0u;
++        uint32_t statusBeforeEnable = 0u;
++        std::vector<int> trace;
++        std::atomic<bool> finished{false};
++        std::atomic<bool> threw{false};
++    };
++
++    VifScenario *g_vifScenario = nullptr;
++
++    void vifSetReg(R5900Context *ctx, int reg, uint32_t value)
++    {
++        ctx->r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
++    }
++
++    // Ordinary stores exercise the same runtime drain boundary as guest code.
++    // Repeating them before and after acknowledgement must not queue a second
++    // invocation for one latched I-bit interrupt.
++    void vifDrainThroughStores(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        for (uint32_t i = 0u; i < 3u; ++i)
++            runtime->Store32(rdram, ctx, kVifScratch + i * 4u, i);
++    }
++
++    void vifHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &state = *g_vifScenario;
++        ++state.calls;
++        state.trace.push_back(4);
++        state.cause = getRegU32(ctx, 4);
++        state.liveStatAtHandler = runtime->memory().vif1_regs.stat;
++        state.codeAtHandler = runtime->memory().vif1_regs.code;
++        state.cycleBeforeResume = runtime->memory().vif1_regs.cycle;
++        runtime->Store32(rdram, ctx, kIntcStat, 1u << 5u);
++        runtime->Store32(rdram, ctx, kVif1Fbrst, 8u); // STC resumes the held tail.
++        state.cycleAfterResume = runtime->memory().vif1_regs.cycle;
++        vifDrainThroughStores(rdram, ctx, runtime);
++        vifSetReg(ctx, 4, static_cast<uint32_t>(state.semaphore));
++        ps2_syscalls::iSignalSema(rdram, ctx, runtime);
++        state.trace.push_back(5); // The interrupt-safe signal must finish first.
++        ctx->pc = 0u;
++    }
++
++    void vifEnablePending(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &state = *g_vifScenario;
++        state.trace.push_back(3);
++        state.callsBeforeEnable = state.calls;
++        state.statusBeforeEnable = runtime->memory().vif1_regs.stat;
++        vifSetReg(ctx, 4, 5u);
++        ps2_syscalls::EnableIntc(rdram, ctx, runtime);
++        vifDrainThroughStores(rdram, ctx, runtime);
++        ctx->pc = 0u;
++    }
++
++    void vifDriver(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &state = *g_vifScenario;
++        state.trace.push_back(2);
++        // The STCYCL belongs to the same FIFO/DMA payload and must remain
++        // unexecuted until the registered handler clears the interrupt stall.
++        const __m128i packet = _mm_set_epi32(0, 0, static_cast<int>(kFollowingCycle),
++                                           static_cast<int>(kInterruptNop));
++        if (state.dma)
++        {
++            runtime->Store128(rdram, ctx, kVifDmaPayload, packet);
++            runtime->Store32(rdram, ctx, kVif1Madr, kVifDmaPayload);
++            runtime->Store32(rdram, ctx, kVif1Qwc, 1u);
++            runtime->Store32(rdram, ctx, kVif1Chcr, 0x101u); // Normal memory-to-VIF DMA.
++        }
++        else
++        {
++            runtime->Store128(rdram, ctx, kVif1Fifo, packet);
++        }
++        vifDrainThroughStores(rdram, ctx, runtime);
++        // A separate dispatch boundary gives a mistakenly enabled handler an
++        // opportunity to run before the explicit EnableIntc call.
++        ctx->pc = state.initiallyDisabled ? kVifEnable : 0u;
++    }
++
++    void vifWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &state = *g_vifScenario;
++        state.trace.push_back(1);
++        auto &scheduler = runtime->eeScheduler();
++        state.semaphore = scheduler.createSemaphore(0, 1, 0u, 0u);
++        vifSetReg(ctx, 4, 5u);
++        vifSetReg(ctx, 5, kVifHandler);
++        vifSetReg(ctx, 6, 0u);
++        vifSetReg(ctx, 7, 0u);
++        ps2_syscalls::AddIntcHandler(rdram, ctx, runtime);
++        vifSetReg(ctx, 4, 5u);
++        if (state.initiallyDisabled)
++            ps2_syscalls::DisableIntc(rdram, ctx, runtime);
++        else
++            ps2_syscalls::EnableIntc(rdram, ctx, runtime);
++
++        if (!state.preloaded)
++        {
++            EeThreadCreateParams driver{};
++            driver.entry = kVifDriver;
++            driver.stack = 0x001c0000u;
++            driver.stackSize = 0x1000u;
++            driver.priority = 10;
++            const int id = scheduler.createThread(driver);
++            scheduler.startThread(id, 0u, *ctx, false);
++        }
++        ctx->pc = kVifResume;
++        vifSetReg(ctx, 4, static_cast<uint32_t>(state.semaphore));
++        ps2_syscalls::WaitSema(rdram, ctx, runtime);
++    }
++
++    void vifResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &state = *g_vifScenario;
++        state.trace.push_back(6);
++        state.resumedResult = static_cast<int32_t>(getRegU32(ctx, 2));
++        // Leave one ordinary scheduler event before stopping, so a duplicate
++        // pending IRQ cannot escape the exactly-once assertion at shutdown.
++        ctx->pc = kVifFinish;
++        runtime->eeScheduler().waitVSync(runtime->eeScheduler().currentVSyncTick());
++    }
++
++    void vifFinish(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_vifScenario->finished.store(true, std::memory_order_release);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void runVifScenario(TestCase &test, bool dma, bool initiallyDisabled, bool preloaded = false)
++    {
++        PS2Runtime runtime;
++        const bool initialized = runtime.memory().initialize();
++        test.IsTrue(initialized, "runtime memory initializes for actual VIF FIFO/DMA access");
++        if (!initialized) return;
++        runtime.registerFunction(kVifWait, vifWait);
++        runtime.registerFunction(kVifResume, vifResume);
++        runtime.registerFunction(kVifFinish, vifFinish);
++        runtime.registerFunction(kVifDriver, vifDriver);
++        runtime.registerFunction(kVifEnable, vifEnablePending);
++        runtime.registerFunction(kVifHandler, vifHandler);
++        VifScenario state;
++        state.dma = dma;
++        state.initiallyDisabled = initiallyDisabled;
++        state.preloaded = preloaded;
++        g_vifScenario = &state;
++        R5900Context main{};
++        main.pc = kVifWait;
++        if (preloaded)
++        {
++            // The host contract allows ordinary stores before reset/run. A
++            // hardware event latched then must survive for the later executor.
++            auto *rdram = runtime.memory().getRDRAM();
++            runtime.Store32(rdram, &main, kVifScratch, 0x12345678u);
++            const __m128i packet = _mm_set_epi32(0, 0, static_cast<int>(kFollowingCycle),
++                                               static_cast<int>(kInterruptNop));
++            runtime.Store128(rdram, &main, kVif1Fifo, packet);
++            runtime.Store32(rdram, &main, kVifScratch, 0x87654321u);
++            test.Equals(runtime.memory().readIORegister(kIntcStat), 1u << 5u,
++                        "unbound host store leaves pending VIF INTC for its future executor");
++        }
++        std::thread worker([&]()
++        {
++            try
++            {
++                runtime.eeScheduler().reset(runtime.memory().getRDRAM(), main);
++                runtime.eeScheduler().run();
++            }
++            catch (...)
++            {
++                state.threw.store(true, std::memory_order_release);
++            }
++        });
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
++        while (!state.finished.load(std::memory_order_acquire) &&
++               !state.threw.load(std::memory_order_acquire) &&
++               std::chrono::steady_clock::now() < deadline)
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        runtime.requestStop();
++        worker.join();
++        g_vifScenario = nullptr;
++
++        test.IsTrue(state.finished.load(), "VIF I-bit INTC wakes the real semaphore waiter");
++        test.IsFalse(state.threw.load(), "registered VIF interrupt delivery does not throw");
++        test.Equals(state.calls, 1u, "one VIF interrupt is delivered exactly once across repeated drains");
++        test.Equals(state.cause, 5u, "the handler receives the actual VIF1 INTC cause");
++        test.IsTrue((state.liveStatAtHandler & (1u << 11u)) != 0u, "VIF INT is live at handler entry");
++        test.Equals(state.codeAtHandler, kInterruptNop, "CODE retains the interrupting command until STC");
++        test.Equals(state.cycleBeforeResume, 0u, "commands after I-bit remain held until STC");
++        test.Equals(state.cycleAfterResume, 0x5678u, "STC resumes the original queued command bytes");
++        test.Equals(state.resumedResult, state.semaphore, "iSignalSema hands the waiter its semaphore id");
++        const std::vector<int> expected = preloaded ? std::vector<int>{1, 4, 5, 6}
++                                        : initiallyDisabled ? std::vector<int>{1, 2, 3, 4, 5, 6}
++                                                            : std::vector<int>{1, 2, 4, 5, 6};
++        test.IsTrue(state.trace == expected, "wait, hardware producer, complete IRQ, and resume occur in order");
++        if (initiallyDisabled)
++        {
++            test.Equals(state.callsBeforeEnable, 0u, "disabled INTC cause suppresses delivery");
++            test.IsTrue((state.statusBeforeEnable & (1u << 11u)) != 0u,
++                        "disabled delivery preserves the original pending VIF interrupt");
++        }
++        if (preloaded)
++        {
++            runtime.Store32(runtime.memory().getRDRAM(), &main, kVifScratch, 0xABCDEF01u);
++            test.Equals(runtime.memory().read32(kVifScratch), 0xABCDEF01u,
++                        "host stores also remain valid after the executor has joined");
++        }
++        const EeSemaphore *semaphore = runtime.eeScheduler().semaphore(state.semaphore);
++        test.IsTrue(semaphore != nullptr, "the original semaphore survives the hardware wake");
++        if (semaphore)
++        {
++            test.Equals(semaphore->count, 0, "direct handoff leaves no duplicate semaphore token");
++            test.Equals(semaphore->waiters.size(), size_t{0}, "the awakened thread leaves the semaphore wait queue");
++        }
++    }
++}
++
++void register_ps2_runtime_vif_interrupt_tests()
++{
++    MiniTest::Case("PS2RuntimeVifInterrupt", [](TestCase &tests)
++    {
++        tests.Run("FIFO I-bit wakes a semaphore through the registered INTC handler", [](TestCase &test)
++        {
++            runVifScenario(test, false, false);
++        });
++        tests.Run("DMA I-bit wakes a semaphore through the registered INTC handler", [](TestCase &test)
++        {
++            runVifScenario(test, true, false);
++        });
++        tests.Run("host stores preserve pre-run VIF interrupt for the executor and remain valid after join", [](TestCase &test)
++        {
++            runVifScenario(test, false, false, true);
++        });
++        tests.Run("disabled VIF cause retains its interrupt until EnableIntc", [](TestCase &test)
++        {
++            runVifScenario(test, false, true);
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_vif_interrupt_tests.cpp b/ps2xTest/src/ps2_vif_interrupt_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1ba9202f6a1490f6cbab64d22c0a2b448155eb5
+--- /dev/null
++++ b/ps2xTest/src/ps2_vif_interrupt_tests.cpp
+@@ -0,0 +1,403 @@
++#include "MiniTest.h"
++#include "runtime/ps2_memory.h"
++#include <array>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kIntcStat = 0x1000F000u;
++    constexpr uint32_t kIntcMask = 0x1000F010u;
++    constexpr uint32_t kInt = 1u << 11u;
++    constexpr uint32_t kVis = 1u << 10u;
++
++    uint32_t regBase(unsigned unit) { return unit ? 0x10003C00u : 0x10003800u; }
++    void feed(PS2Memory &memory, unsigned unit, const void *data, size_t bytes)
++    {
++        if (unit)
++            memory.processVIF1Data(static_cast<const uint8_t *>(data), static_cast<uint32_t>(bytes));
++        else
++            memory.processVIF0Data(static_cast<const uint8_t *>(data), static_cast<uint32_t>(bytes));
++    }
++    template <size_t Count>
++    void feed(PS2Memory &memory, unsigned unit, const std::array<uint32_t, Count> &words)
++    {
++        feed(memory, unit, words.data(), sizeof(words));
++    }
++}
++
++void register_ps2_vif_interrupt_tests()
++{
++    MiniTest::Case("PS2VifInterrupt", [](TestCase &tests)
++    {
++        tests.Run("I-bit stalls each VIF and STC resumes owned bytes without a DMA event", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t base = regBase(unit), cause = 1u << (4u + unit);
++                std::array<uint32_t, 2> words{0x80000000u, 0x01001234u};
++                feed(memory, unit, words);
++                words[1] = 0x0100DEADu;
++                t.Equals(memory.readIORegister(base) & (kInt | kVis), kInt | kVis, "INT and VIS are live through MMIO");
++                t.Equals(memory.readIORegister(base + 0x80u), 0x80000000u, "CODE stops at the interrupting command");
++                t.Equals(memory.readIORegister(base + 0x40u), 0u, "tail STCYCL has not run");
++                t.Equals(memory.readIORegister(kIntcStat), cause, "the proper INTC cause is latched");
++                memory.writeIORegister(kIntcStat, cause);
++                t.Equals(memory.readIORegister(base) & (kInt | kVis), kInt | kVis, "INTC ack does not cancel the VIF stall");
++                memory.writeIORegister(base + 0x10u, 8u);
++                t.Equals(memory.readIORegister(base + 0x40u), 0x1234u, "STC uses the retained bytes, not mutated caller storage");
++                t.Equals(memory.readIORegister(base) & (kInt | kVis), 0u, "STC clears the interrupt and stall");
++                t.IsTrue(memory.consumeCompletedDmacCauses().empty(), "a FIFO resume is not a DMA completion");
++            }
++        });
++
++        tests.Run("successive I-bits interrupt only when their own commands complete", [](TestCase &t)
++        {
++            PS2Memory memory;
++            t.IsTrue(memory.initialize(), "memory initializes");
++            const std::array<uint32_t, 4> words{0x80000000u, 0x01001111u, 0x85000002u, 0x01002222u};
++            feed(memory, 1, words);
++            memory.writeIORegister(kIntcStat, 1u << 5u);
++            memory.writeIORegister(0x10003C10u, 8u);
++            t.Equals(memory.vif1_regs.cycle, 0x1111u, "first STC stops at the second I-bit");
++            t.Equals(memory.vif1_regs.mode, 2u, "the interrupting STMOD has executed");
++            t.Equals(memory.vif1_regs.code, words[2], "CODE identifies the second I-bit");
++            t.Equals(memory.readIORegister(kIntcStat), 1u << 5u, "the second completion raises a new pending event");
++            memory.writeIORegister(kIntcStat, 1u << 5u);
++            memory.writeIORegister(0x10003C10u, 8u);
++            t.Equals(memory.vif1_regs.cycle, 0x2222u, "second STC resumes the final command");
++            t.Equals(memory.readIORegister(kIntcStat), 0u, "ordinary commands do not relatch an IRQ");
++        });
++
++        tests.Run("MII masks I-bits and hardware MARK I-bit continues the command stream", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t base = regBase(unit);
++                memory.writeIORegister(base + 0x20u, 1u);
++                feed(memory, unit, std::array<uint32_t, 2>{0x80000000u, 0x07004321u});
++                t.Equals(memory.readIORegister(base + 0x30u), 0x4321u, "masked I-bit does not hold following commands");
++                t.Equals(memory.readIORegister(base) & (kInt | kVis), 0u, "MII masks INT and VIS");
++                t.Equals(memory.readIORegister(kIntcStat), 0u, "masked commands do not assert INTC");
++                memory.writeIORegister(base + 0x20u, 0u);
++                t.Equals(memory.readIORegister(kIntcStat), 0u, "unmasking does not replay an ignored I-bit");
++                feed(memory, unit, std::array<uint32_t, 3>{0x8700ABCDu, 0x0700BCDEu, 0x01000304u});
++                t.Equals(memory.readIORegister(base + 0x30u), 0xBCDEu, "following MARK executes after nonstalling MARK I-bit");
++                t.Equals(memory.readIORegister(base + 0x40u), 0x0304u, "MARK I-bit also allows the next ordinary command");
++                t.Equals(memory.readIORegister(base) & (kInt | kVis), kInt, "MARK I-bit latches INT without VIS");
++                t.Equals(memory.readIORegister(kIntcStat), 1u << (4u + unit), "MARK asserts its actual INTC cause");
++                memory.writeIORegister(base + 0x10u, 8u);
++                t.Equals(memory.readIORegister(base + 0x40u), 0x0304u, "STC preserves the completed command after MARK");
++                feed(memory, unit, std::array<uint32_t, 3>{0x80000000u, 0x0700DEF0u, 0x01000305u});
++                t.Equals(memory.readIORegister(base + 0x30u), 0xBCDEu, "an ordinary I-bit holds the later stream including MARK");
++                t.Equals(memory.readIORegister(base + 0x40u), 0x0304u, "the next ordinary command still waits");
++                memory.writeIORegister(base + 0x10u, 8u);
++                t.Equals(memory.readIORegister(base + 0x40u), 0x0305u, "subsequent command executes after STC");
++                t.Equals(memory.readIORegister(base + 0x30u), 0xDEF0u, "held MARK executes in order after STC");
++            }
++        });
++
++        tests.Run("split STROW payload cannot execute or interrupt before the final word", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t base = regBase(unit);
++                feed(memory, unit, std::array<uint32_t, 3>{0xB0000000u, 0x80000000u, 0x0700BAD0u});
++                t.Equals(memory.readIORegister(kIntcStat), 0u, "partial STROW has no completion IRQ");
++                t.Equals(memory.readIORegister(base + 0x100u), 0u, "partial command has no committed row writes");
++                t.Equals(memory.readIORegister(base) & 3u, 1u, "VPS reports a payload wait");
++                feed(memory, unit, std::array<uint32_t, 3>{0x11223344u, 0x55667788u, 0x010055AAu});
++                t.Equals(memory.readIORegister(base + 0x100u), 0x80000000u, "payload I-bit is data");
++                t.Equals(memory.readIORegister(base + 0x110u), 0x0700BAD0u, "payload MARK-like word is data");
++                t.Equals(memory.readIORegister(base + 0x130u), 0x55667788u, "last row word commits before the IRQ");
++                t.Equals(memory.readIORegister(base + 0x40u), 0u, "tail remains stalled");
++                t.Equals(memory.readIORegister(kIntcStat), 1u << (4u + unit), "completed payload asserts INTC");
++                memory.writeIORegister(base + 0x10u, 8u);
++                t.Equals(memory.readIORegister(base + 0x40u), 0x55AAu, "tail survives payload continuation");
++            }
++        });
++
++        tests.Run("MARK I-bit matches the console intstall MASK and STAT result", [](TestCase &t)
++        {
++            // Primary hardware regression: unknownbrackets/ps2autotests,
++            // tests/dma/vif/intstall.cpp and intstall.expected. The console
++            // reaches the final STMASK after MARK.I and reports STAT 0x840.
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const std::array<uint32_t, 12> words{
++                    0x20000000u, 0xAAAAAAAAu, 0x87000000u, 0x20000000u,
++                    0xBBBBBBBBu, 0u, 0u, 0u, 0x20000000u, 0xCCCCCCCCu, 0u, 0u};
++                feed(memory, unit, words);
++                t.Equals(memory.readIORegister(regBase(unit) + 0x70u), 0xCCCCCCCCu, "console result reaches the last MASK");
++                t.Equals(memory.readIORegister(regBase(unit)), 0x00000840u, "console result has INT and MRK, without VIS");
++            }
++        });
++
++        tests.Run("short DMA NOP and STMASK interrupts match console MASK and STAT", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                for (bool maskCommand : {false, true})
++                {
++                    PS2Memory memory;
++                    t.IsTrue(memory.initialize(), "memory initializes");
++                    const uint32_t channel = unit ? 0x10009000u : 0x10008000u;
++                    const std::array<uint32_t, 12> words = maskCommand
++                        ? std::array<uint32_t, 12>{0x20000000u, 0xAAAAAAAAu, 0xA0000000u, 0xFFFFFFFFu,
++                                                  0x20000000u, 0xBBBBBBBBu, 0u, 0u, 0x20000000u, 0xCCCCCCCCu, 0u, 0u}
++                        : std::array<uint32_t, 12>{0x20000000u, 0xAAAAAAAAu, 0x80000000u, 0x20000000u,
++                                                  0xBBBBBBBBu, 0u, 0u, 0x20000000u, 0xCCCCCCCCu, 0u, 0u, 0u};
++                    std::memcpy(memory.getRDRAM() + 0x2000u, words.data(), sizeof(words));
++                    memory.writeIORegister(channel + 0x10u, 0x2000u);
++                    memory.writeIORegister(channel + 0x20u, 3u);
++                    memory.writeIORegister(channel, 0x101u);
++                    t.Equals(memory.readIORegister(channel) & 0x100u, 0u, "console short DMA completes independently of VIS");
++                    for (unsigned repeat = 0; repeat < 3; ++repeat)
++                    {
++                        memory.processPendingTransfers();
++                        t.Equals(memory.readIORegister(regBase(unit) + 0x70u), maskCommand ? 0xFFFFFFFFu : 0xAAAAAAAAu,
++                                 "console MASK value stops at the interrupting command");
++                        t.Equals(memory.readIORegister(regBase(unit)), 0x00000C02u,
++                                 "console STAT has INT, VIS, decoding VPS and zero FQC after DMA completion");
++                    }
++                }
++            }
++        });
++
++        tests.Run("split interrupt-stalled input has the same decoding status as one packet", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                feed(memory, unit, std::array<uint32_t, 1>{0x80000000u});
++                feed(memory, unit, std::array<uint32_t, 1>{0x01001234u});
++                t.Equals(memory.readIORegister(regBase(unit)), 0xC02u, "later input reports the same VIS decoding state");
++                t.Equals(memory.readIORegister(regBase(unit) + 0x40u), 0u, "newly arrived command still waits for STC");
++                memory.writeIORegister(regBase(unit) + 0x10u, 8u);
++                t.Equals(memory.readIORegister(regBase(unit) + 0x40u), 0x1234u, "STC executes the later packet once");
++            }
++        });
++
++        tests.Run("partial nonstalled payload does not leave stale FQC after DMA completion", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t channel = unit ? 0x10009000u : 0x10008000u;
++                const uint32_t qwc = unit ? 17u : 9u;
++                const uint32_t command = unit ? 0x50000040u : 0x4A400000u; // DIRECT64 or MPG64
++                std::memcpy(memory.getRDRAM() + 0x2000u, &command, sizeof(command));
++                memory.writeIORegister(channel + 0x10u, 0x2000u);
++                memory.writeIORegister(channel + 0x20u, qwc);
++                memory.writeIORegister(channel, 0x101u);
++                t.Equals(memory.readIORegister(channel) & 0x100u, 0u, "DMA transfers this partial payload");
++                t.Equals(memory.readIORegister(regBase(unit)), 1u, "VPS waits for more data without a stale full FIFO count");
++            }
++        });
++
++        tests.Run("DIRECT I-bit waits for all GIF data and preserves the later VIF command", [](TestCase &t)
++        {
++            PS2Memory memory;
++            t.IsTrue(memory.initialize(), "memory initializes");
++            std::vector<uint8_t> delivered;
++            memory.setGifPacketCallback([&](const uint8_t *data, uint32_t bytes)
++            {
++                delivered.assign(data, data + bytes);
++            });
++            feed(memory, 1, std::array<uint32_t, 3>{0xD0000001u, 0x80000000u, 0x11223344u});
++            t.IsTrue(delivered.empty(), "incomplete DIRECT data is not submitted");
++            t.Equals(memory.readIORegister(kIntcStat), 0u, "incomplete DIRECT cannot interrupt");
++            feed(memory, 1, std::array<uint32_t, 3>{0x55667788u, 0x99AABBCCu, 0x01003456u});
++            const std::array<uint32_t, 4> payload{0x80000000u, 0x11223344u, 0x55667788u, 0x99AABBCCu};
++            t.IsTrue(delivered.size() == sizeof(payload) && std::memcmp(delivered.data(), payload.data(), sizeof(payload)) == 0,
++                     "the actual complete GIF payload is delivered once");
++            t.Equals(memory.vif1_regs.cycle, 0u, "VIF tail still waits for STC");
++            t.Equals(memory.readIORegister(kIntcStat), 1u << 5u, "DIRECT completion asserts INTC");
++            memory.writeIORegister(0x10003C10u, 8u);
++            t.Equals(memory.vif1_regs.cycle, 0x3456u, "STC resumes following VIF code");
++        });
++
++        tests.Run("large stalled DMA remains active until STC and polling cannot finish it", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t channel = unit ? 0x10009000u : 0x10008000u;
++                std::array<uint32_t, 128> words{};
++                words.front() = 0x80000000u;
++                words.back() = 0x07006789u;
++                std::memcpy(memory.getRDRAM() + 0x2000u, words.data(), sizeof(words));
++                memory.writeIORegister(channel + 0x10u, 0x2000u);
++                memory.writeIORegister(channel + 0x20u, sizeof(words) / 16u);
++                memory.writeIORegister(channel, 0x101u);
++                for (unsigned drain = 0; drain < 3; ++drain)
++                {
++                    memory.processPendingTransfers();
++                    t.IsTrue((memory.readIORegister(channel) & 0x100u) != 0u, "an interrupt stall larger than FIFO keeps DMA active");
++                    t.IsTrue(memory.consumeCompletedDmacCauses().empty(), "no completion before retained data can advance");
++                }
++                memory.writeIORegister(regBase(unit) + 0x10u, 8u);
++                t.Equals(memory.readIORegister(regBase(unit) + 0x30u), 0x6789u, "STC consumes the original remaining DMA bytes");
++                t.Equals(memory.readIORegister(channel) & 0x100u, 0u, "DMA finishes only after progress");
++                const auto causes = memory.consumeCompletedDmacCauses();
++                t.IsTrue(causes.size() == 1u && causes[0] == unit, "one actual channel completion is queued");
++                memory.processPendingTransfers();
++                t.IsTrue(memory.consumeCompletedDmacCauses().empty(), "later drains do not duplicate completion");
++            }
++        });
++
++        tests.Run("reset drops held input and reinitialize retires all partial commands", [](TestCase &t)
++        {
++            PS2Memory memory;
++            t.IsTrue(memory.initialize(), "memory initializes");
++            feed(memory, 1, std::array<uint32_t, 2>{0x80000000u, 0x0100BAD0u});
++            memory.writeIORegister(0x10003C10u, 1u);
++            memory.writeIORegister(0x10003C10u, 8u);
++            t.Equals(memory.vif1_regs.cycle, 0u, "reset discards held STCYCL");
++            t.IsTrue(memory.m_pendingVif1Transfers.empty(), "reset retires the owned tail");
++            t.IsTrue(memory.consumeCompletedDmacCauses().empty(), "reset does not fabricate DMA completion");
++            t.Equals(memory.readIORegister(kIntcStat), 1u << 5u, "latched INTC has its own acknowledgement lifetime");
++            feed(memory, 0, std::array<uint32_t, 1>{0xB0000000u});
++            t.IsTrue(memory.initialize(), "memory reinitializes");
++            feed(memory, 0, std::array<uint32_t, 1>{0x07001234u});
++            t.Equals(memory.vif0_regs.mark, 0x1234u, "old partial STROW cannot consume new-session commands");
++            t.Equals(memory.readIORegister(kIntcStat), 0u, "new memory session has no stale IRQ");
++        });
++
++        tests.Run("STOP finishes an incomplete current command before holding the next command", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t base = regBase(unit);
++                feed(memory, unit, std::array<uint32_t, 2>{0x30000000u, 0x11223344u});
++                memory.writeIORegister(base + 0x10u, 4u);
++                t.Equals(memory.readIORegister(base) & (1u << 8u), 0u, "STOP waits for the current STROW payload");
++                feed(memory, unit, std::array<uint32_t, 4>{0x55667788u, 0x99AABBCCu, 0xDDEEFF00u, 0x01001234u});
++                t.Equals(memory.readIORegister(base + 0x130u), 0xDDEEFF00u, "current command completes its final row write");
++                t.IsTrue((memory.readIORegister(base) & (1u << 8u)) != 0u, "STOP latches VSS after command completion");
++                t.Equals(memory.readIORegister(base + 0x40u), 0u, "next command waits behind STOP");
++                memory.writeIORegister(base + 0x10u, 8u);
++                t.Equals(memory.readIORegister(base + 0x40u), 0x1234u, "STC resumes the stopped tail");
++            }
++        });
++
++        tests.Run("VIF reset cannot silently cancel an active DMA channel", [](TestCase &t)
++        {
++            PS2Memory memory;
++            t.IsTrue(memory.initialize(), "memory initializes");
++            std::array<uint32_t, 128> words{};
++            words.front() = 0x80000000u;
++            std::memcpy(memory.getRDRAM() + 0x2000u, words.data(), sizeof(words));
++            memory.writeIORegister(0x10009010u, 0x2000u);
++            memory.writeIORegister(0x10009020u, 32u);
++            memory.writeIORegister(0x10009000u, 0x101u);
++            bool rejected = false;
++            try { memory.writeIORegister(0x10003C10u, 1u); }
++            catch (const std::runtime_error &) { rejected = true; }
++            t.IsTrue(rejected, "unmodeled active-DMA reset is an explicit boundary");
++            t.IsTrue((memory.readIORegister(0x10009000u) & 0x100u) != 0u, "RST does not forge DMA completion");
++            t.Equals(memory.readIORegister(0x10009020u), 32u, "RST does not rewrite DMA count");
++            t.IsTrue(!memory.m_pendingVif1Transfers.empty(), "rejected reset preserves pending input");
++            memory.writeIORegister(0x10009000u, 1u); // Explicit DMA cancellation precedes VIF reset.
++            memory.writeIORegister(0x10003C10u, 1u);
++            t.IsTrue(memory.m_pendingVif1Transfers.empty(), "VIF reset drops FIFO state after explicit cancellation");
++            t.Equals(memory.readIORegister(0x10009020u), 32u, "VIF reset preserves the separate DMA register");
++            t.IsTrue(memory.consumeCompletedDmacCauses().empty(), "cancellation and reset do not signal success");
++        });
++
++        tests.Run("cancelling backpressured DMA discards bytes beyond the prefetched FIFO", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t channel = unit ? 0x10009000u : 0x10008000u;
++                std::array<uint32_t, 128> words{};
++                words[0] = 0x80000000u;
++                words[1] = 0x0100ABCDu; // Within the prefetched FIFO.
++                words[100] = 0x0700DEADu; // Beyond either FIFO, still held at DMA.
++                std::memcpy(memory.getRDRAM() + 0x2000u, words.data(), sizeof(words));
++                memory.writeIORegister(channel + 0x10u, 0x2000u);
++                memory.writeIORegister(channel + 0x20u, 32u);
++                memory.writeIORegister(channel, 0x101u);
++                memory.writeIORegister(channel, 1u); // Explicit cancellation, not completion.
++                t.Equals(memory.readIORegister(regBase(unit)) & 0x1F000000u, 0u, "cancellation refreshes the FIFO status immediately");
++                memory.writeIORegister(regBase(unit) + 0x10u, 8u);
++                t.Equals(memory.readIORegister(regBase(unit) + 0x40u), 0xABCDu, "already prefetched command survives DMA cancellation");
++                t.Equals(memory.readIORegister(regBase(unit) + 0x30u), 0u, "cancelled, untransferred command never executes");
++                t.IsTrue(memory.consumeCompletedDmacCauses().empty(), "cancelled DMA does not queue completion");
++            }
++        });
++
++        tests.Run("VIFcodes program read-only views and FBRST preserves their configuration", [](TestCase &t)
++        {
++            for (unsigned unit = 0; unit != 2; ++unit)
++            {
++                PS2Memory memory;
++                t.IsTrue(memory.initialize(), "memory initializes");
++                const uint32_t base = regBase(unit);
++                const std::array<uint32_t, 14> program{
++                    0x01000304u, 0x05000002u, 0x20000000u, 0x12345678u,
++                    0x30000000u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
++                    0x31000000u, 0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
++                feed(memory, unit, program);
++                std::vector<std::pair<uint32_t, uint32_t>> before;
++                for (uint32_t offset : {0x40u, 0x50u, 0x60u, 0x70u, 0x80u, 0x90u,
++                                        0xA0u, 0xB0u, 0xC0u, 0xD0u, 0xE0u,
++                                        0x100u, 0x110u, 0x120u, 0x130u, 0x140u, 0x150u, 0x160u, 0x170u})
++                {
++                    before.emplace_back(offset, memory.readIORegister(base + offset));
++                    memory.writeIORegister(base + offset, 0xDEADBEEFu);
++                    t.Equals(memory.readIORegister(base + offset), before.back().second, "CPU stores cannot rewrite read-only VIF views");
++                }
++                memory.writeIORegister(base + 0x20u, 7u);
++                memory.writeIORegister(base + 0x10u, 1u);
++                for (const auto &[offset, value] : before)
++                {
++                    const uint32_t expected = offset == 0x60u || offset == 0x80u ? 0u : value;
++                    t.Equals(memory.readIORegister(base + offset), expected, "FBRST retires execution while preserving programmed data");
++                }
++                t.Equals(memory.readIORegister(base), 0u, "FBRST clears execution status");
++                t.Equals(memory.readIORegister(base + 0x20u), 0u, "FBRST resets error-mask state");
++            }
++        });
++
++        tests.Run("INTC write-one semantics and VIF stop controls preserve independent state", [](TestCase &t)
++        {
++            PS2Memory memory;
++            t.IsTrue(memory.initialize(), "memory initializes");
++            memory.writeIORegister(kIntcMask, 0x30u);
++            memory.writeIORegister(kIntcMask, 0x10u);
++            t.Equals(memory.readIORegister(kIntcMask), 0x20u, "MASK toggles only written bits");
++            feed(memory, 0, std::array<uint32_t, 1>{0x87001111u});
++            feed(memory, 1, std::array<uint32_t, 1>{0x87002222u});
++            memory.writeIORegister(kIntcStat, 0x10u);
++            t.Equals(memory.readIORegister(kIntcStat), 0x20u, "STAT clears only the acknowledged source");
++            memory.writeIORegister(0x10003C00u, 0u);
++            t.IsTrue((memory.readIORegister(0x10003C00u) & kInt) != 0u, "a STAT write cannot clear hardware INT");
++            memory.writeIORegister(0x10003C10u, 8u);
++            for (uint32_t control : {2u, 4u})
++            {
++                memory.writeIORegister(0x10003C10u, control);
++                feed(memory, 1, std::array<uint32_t, 1>{0x07003333u + control});
++                t.IsTrue(memory.vif1_regs.mark != 0x3333u + control, "force break or stop holds new input");
++                memory.writeIORegister(0x10003C10u, 8u);
++                t.Equals(memory.vif1_regs.mark, 0x3333u + control, "STC resumes the held control command");
++            }
++        });
++    });
++}

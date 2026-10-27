@@ -1,0 +1,94 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index ea61ec4e84bde2f6659c10ff8a8c55ba2c726dc2..85886ca9a648b4b724976e4f0832a11ed59ad1da 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -364,6 +364,12 @@ namespace ps2x::iop::detail
+         void reset()
+         {
+             memory.reset();
++            // Direct guest calls use this reserved kernel stack, including the
++            // caller's O32 argument home area. Own the whole bounded arena once
++            // at reset; later calls and RPC results retain its actual bytes.
++            static_assert(kCallStackBase < kCallStackLimit && kCallStackLimit <= kRamSize);
++            if (!memory.zeroRam(kCallStackBase, kCallStackLimit - kCallStackBase))
++                throw std::logic_error("IOP reserved call stack lies outside RAM");
+             kernel.reset();
+             modules.clear();
+             retiredStrictRanges.clear();
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index 352cc75790a23034688313a4f47fe53e7504f393..d2b9058d3d7f1467b0034834c6e51e8d3b3fbe7e 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -743,6 +743,64 @@ namespace
+         }
+     }
+ 
++    void packetRpcOwnedCallStack()
++    {
++        constexpr uint32_t sid = 0x80000006u;
++        constexpr uint32_t stackBase = 0x001F0000u;
++        constexpr uint32_t stackLimit = 0x001FFF00u;
++        constexpr uint32_t entrySp = stackLimit - 32u;
++        Host host;
++        IopEmulator iop(host);
++        Irx image = rpcServer(sid, 0u);
++        // Return a four-byte local followed by twelve bytes in the caller's
++        // reserved O32 argument home area, as a single sixteen-byte DMA result.
++        image.words(0x300u, {0x27BDFFD8u, 0x3C081122u, 0x35083344u,
++                            0xAFA80024u, 0x27A20024u, 0x03E00008u, 0x27BD0028u});
++        const auto start = [&] {
++            require(iop.loadModuleImage("stack-result", image.bytes, nullptr, 0u).moduleId > 0,
++                    "stack-result fixture did not start");
++        };
++        start();
++        std::vector<uint8_t> expected(16u);
++        expected[0] = 0x44u;
++        expected[1] = 0x33u;
++        expected[2] = 0x22u;
++        expected[3] = 0x11u;
++        require(iop.readMemory(entrySp, expected.data() + 4u, 12u), "home area snapshot failed");
++        require(iop.executePacketRpc(sid, 0x10200u, 0u, {}, 16u) == expected,
++                "reserved stack result did not include the existing caller home bytes");
++
++        std::array<uint8_t, 12> home{};
++        for (size_t index = 0u; index < home.size(); ++index)
++            home[index] = static_cast<uint8_t>(0x51u + index);
++        require(iop.writeMemory(entrySp, home.data(), home.size()), "home area seed failed");
++        std::copy(home.begin(), home.end(), expected.begin() + 4u);
++        for (unsigned call = 0u; call < 2u; ++call)
++            require(iop.executePacketRpc(sid, 0x10200u, 0u, {}, 16u) == expected,
++                    "a later stack callback replaced existing home bytes with padding");
++
++        iop.reset();
++        start();
++        std::fill(expected.begin() + 4u, expected.end(), uint8_t{0});
++        require(iop.executePacketRpc(sid, 0x10200u, 0u, {}, 16u) == expected,
++                "reset failed to initialize and own the reserved invocation stack");
++        require(host.guestWrites == 0u, "physical stack result bypassed ordered EE transport");
++
++        for (uint32_t address : {stackBase - 4u, stackLimit - 4u, stackLimit})
++        {
++            Host boundaryHost;
++            IopEmulator boundary(boundaryHost);
++            Irx outside = rpcServer(sid, 0u);
++            outside.words(0x300u, {0x3C020000u | (address >> 16u),
++                                  0x34420000u | (address & 0xFFFFu), 0x03E00008u, 0u});
++            require(boundary.loadModuleImage("stack-boundary", outside.bytes, nullptr, 0u).moduleId > 0,
++                    "stack-boundary fixture did not start");
++            rejects([&] { (void)boundary.executePacketRpc(sid, 0x10200u, 0u, {}, 16u); },
++                    "complete requested result");
++            require(boundaryHost.guestWrites == 0u, "out-of-stack result reached EE memory");
++        }
++    }
++
+     void packetRpcResultsAndRegistrationLifetime()
+     {
+         constexpr uint32_t sid = 0x80000006u;
+@@ -1243,6 +1301,7 @@ int main()
+         {"Later physical RPC callback failures remain strict", callbackCompletion},
+         {"Packet RPC invokes the registered callback and returns its real IOP bytes", packetRpcOriginalCallback},
+         {"Packet RPC preflights identities, complete ranges and supported aliases", packetRpcPreflightAndAliases},
++        {"Packet RPC stack results retain owned O32 home bytes and bounded guards", packetRpcOwnedCallStack},
+         {"Packet RPC rejects null/invalid results and survives registry removal", packetRpcResultsAndRegistrationLifetime},
+         {"Packet callbacks remain strict and cannot bypass ordered SIF delivery", packetRpcStrictExecutionAndOrdering},
+         {"Retiring any physical registration data owner invalidates its packet binding", packetRpcSplitOwnership},

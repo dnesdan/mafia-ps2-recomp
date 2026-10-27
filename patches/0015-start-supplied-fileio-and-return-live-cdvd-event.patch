@@ -1,0 +1,667 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 4ff7b32bffb6a1fea0b08ebf97ab7472c8d2fa75..5e62a716d1949ec8e96c05587272215ba8714f9d 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -48,6 +48,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_ioman_devctl_tests tests/iop_ioman_devctl_tests.cpp)
++    target_link_libraries(ps2_iop_ioman_devctl_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_ioman_devctl_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_ioman_devctl_tests COMMAND ps2_iop_ioman_devctl_tests)
++
+     add_executable(ps2_iop_cdvd_clock_tests tests/iop_cdvd_clock_tests.cpp)
+     target_link_libraries(ps2_iop_cdvd_clock_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_cdvd_clock_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index b7cd5d7d9ebfe97017f6aa1fd1dc2f75709725e7..a1b8b42d0fcc699503c36c92bf1ec6bd02ed600d 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -259,6 +259,11 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        int interruptEventFlag()
++        {
++            return ensureInterruptEventFlag();
++        }
++
+         void releaseFsvReadBuffer() noexcept
+         {
+             if (fsvReadBuffer != 0u)
+@@ -512,6 +517,15 @@ namespace ps2x::iop::detail
+                 interruptEventFlagId = kernel.createInternalEventFlag(
+                     kEventFlagMulti, 0u, kCdvdInterruptReadyBits);
+             }
++            else
++            {
++                IopCpuState query{};
++                query.gpr[4] = static_cast<uint32_t>(interruptEventFlagId);
++                // ReferEventFlag with no output checks that the cached object
++                // still exists without writing RAM or changing its event bits.
++                if (!kernel.dispatchEventImport(13u, query) || query.gpr[2] != 0u)
++                    throw std::runtime_error("IOP CDVD interrupt event flag was deleted before reset");
++            }
+             return interruptEventFlagId;
+         }
+ 
+@@ -945,6 +959,11 @@ namespace ps2x::iop::detail
+         return m_impl->readCdvdRegister(physicalAddress, value);
+     }
+ 
++    int IopCdvd::interruptEventFlag()
++    {
++        return m_impl->interruptEventFlag();
++    }
++
+     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         return m_impl->dispatchImport(ordinal, cpu);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 78df9f7a0ed64c0cceb9581a94a7d198f4977628..dd8bf5357db8040fc2429ff6f4cca16685c21b39 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -43,6 +43,9 @@ namespace ps2x::iop::detail
+         // Read-only controller view used by direct guest MMIO and imports.
+         // Unsupported ports return false without changing value.
+         [[nodiscard]] bool readRegisterByte(uint32_t physicalAddress, uint8_t &value);
++        // The same live kernel event exposed by sceCdSC(-11). Reading its ID
++        // does not signal power-off or alter an existing event's bits.
++        [[nodiscard]] int interruptEventFlag();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+ 
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 3eb41190f592d93e98306535754579ce1e1dd5a8..cbec548092fd3595626fe3168e858d8620330970 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -1,15 +1,70 @@
+ #include "iop_ioman.h"
++#include "iop_cdvd.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_memory.h"
+ #include "../services/iop_rpc.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <stdexcept>
++#include <string_view>
+ 
+ namespace ps2x::iop::detail
+ {
+-    IopIoman::IopIoman(IopMemory &memory) noexcept
+-        : m_memory(memory)
++    namespace
++    {
++        void requireRamSpan(uint32_t address, size_t size, const char *description)
++        {
++            const uint32_t segment = address & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            if (address == 0u ||
++                (segment != 0u && segment != 0x80000000u && segment != 0xA0000000u) ||
++                physical >= IopMemory::RamSize || size > IopMemory::RamSize - physical)
++                throw std::runtime_error(std::string("IOP Devctl ") + description + " is outside complete RAM");
++        }
++
++        void requireOwnedRam(const IopMemory &memory, uint32_t address, size_t size, const char *description)
++        {
++            requireRamSpan(address, size, description);
++            if (!memory.ownsRamRange(address, size))
++                throw std::runtime_error(std::string("IOP Devctl ") + description + " is outside owned RAM");
++        }
++
++        std::string devctlPath(const IopMemory &memory, uint32_t address)
++        {
++            constexpr size_t maximumPathBytes = 1024u;
++            std::string result;
++            for (size_t i = 0u; i < maximumPathBytes; ++i)
++            {
++                // The first checked RAM byte restricts address to an alias of
++                // the 2 MiB RAM, so subsequent bounded offsets cannot wrap.
++                requireOwnedRam(memory, address + static_cast<uint32_t>(i), 1u, "path");
++                const char value = static_cast<char>(memory.read8(address + static_cast<uint32_t>(i)));
++                if (value == '\0')
++                    return result;
++                result.push_back(value);
++            }
++            throw std::runtime_error("IOP Devctl path is not terminated within 1024 bytes");
++        }
++
++        bool isModeledCdromUnit(std::string_view path)
++        {
++            const size_t colon = path.find(':');
++            if (colon == std::string_view::npos)
++                return false;
++            const std::string_view device = path.substr(0u, colon);
++            constexpr std::string_view name = "cdrom";
++            // Like IOMAN, resolve a device name and optional decimal unit.
++            // The modeled controller has one unit. The suffix is not opened.
++            return device.starts_with(name) &&
++                   std::all_of(device.begin() + static_cast<std::ptrdiff_t>(name.size()), device.end(),
++                               [](char value) { return value == '0'; });
++        }
++    }
++
++    IopIoman::IopIoman(IopMemory &memory, IopCdvd &cdvd) noexcept
++        : m_memory(memory), m_cdvd(cdvd)
+     {
+     }
+ 
+@@ -84,6 +139,49 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         }
++        case 31: // devctl(name, cmd, arg, arglen, output, outputlen)
++        {
++            // IOMAN 1.4 uses the extended ABI also documented by IOMANX.
++            // CDVD command 0x4391 returns sceCdSC(-11), the existing interrupt
++            // event flag; it does not signal power-off or complete an operation.
++            // https://ps2dev.github.io/ps2sdk/ioman_x_8h_source.html
++            // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html
++            if (cpu.gpr[5] != 0x4391u)
++                return false;
++            const std::string path = devctlPath(m_memory, a0);
++            if (!isModeledCdromUnit(path))
++                return false;
++            // A registered original driver must not be silently replaced by
++            // this modeled device route. Leave it to a genuine export handler.
++            if (std::any_of(m_devices.begin(), m_devices.end(),
++                            [](const Device &device) { return device.name == "cdrom"; }))
++                return false;
++            if (cpu.gpr[7] != 0u)
++                throw std::runtime_error("IOP CDVD Devctl 0x4391 does not support an input payload");
++            const uint32_t stack = cpu.gpr[29];
++            if ((stack & 3u) != 0u)
++                throw std::runtime_error("IOP Devctl argument stack is not word aligned");
++            // O32 reserves four register-argument slots at sp, but callers do
++            // not have to initialize them. Validate the complete physical
++            // span before offset arithmetic, then only require ownership for
++            // the fifth and sixth arguments actually read by this import.
++            requireRamSpan(stack, 24u, "argument stack");
++            requireOwnedRam(m_memory, stack + 16u, 8u, "argument words");
++            const uint32_t output = m_memory.read32(stack + 16u);
++            const uint32_t outputBytes = m_memory.read32(stack + 20u);
++            if ((output & 3u) != 0u || outputBytes < 4u)
++                throw std::runtime_error("IOP CDVD Devctl event output requires an aligned four-byte result");
++            requireOwnedRam(m_memory, output, outputBytes, "event output");
++
++            const uint32_t event = static_cast<uint32_t>(m_cdvd.interruptEventFlag());
++            std::array<uint8_t, 4u> bytes{};
++            for (uint32_t i = 0u; i < bytes.size(); ++i)
++                bytes[i] = static_cast<uint8_t>(event >> (i * 8u));
++            if (!m_memory.writeRam(output, bytes.data(), bytes.size()))
++                throw std::runtime_error("IOP Devctl event result could not be written to RAM");
++            setV0(0u);
++            return true;
++        }
+         default:
+             return false;
+         }
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.h b/ps2xIOP/src/emulator/imports/iop_ioman.h
+index 182f786b1763c570e78af60d39dc41584e37d9dc..bf44ab9b9b8ba4fc7bfba4c58b648776a5fa4796 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.h
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.h
+@@ -7,13 +7,14 @@
+ namespace ps2x::iop::detail
+ {
+     struct IopCpuState;
++    class IopCdvd;
+     class IopGuestExecutor;
+     class IopMemory;
+ 
+     class IopIoman
+     {
+     public:
+-        explicit IopIoman(IopMemory &memory) noexcept;
++        IopIoman(IopMemory &memory, IopCdvd &cdvd) noexcept;
+ 
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+@@ -27,6 +28,7 @@ namespace ps2x::iop::detail
+         };
+ 
+         IopMemory &m_memory;
++        IopCdvd &m_cdvd;
+         std::vector<Device> m_devices;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index c474ee1eb0c852a1d81945e70373fd3455d773cd..5bc13ce1e9329db3f6b63445b1d28772414d57b5 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -345,7 +345,7 @@ namespace ps2x::iop::detail
+               heaplib(memory),
+               intrman(memory),
+               timrman(),
+-              ioman(memory),
++              ioman(memory, cdvd),
+               cpuCore(memory),
+               imports(memory),
+               loadcore(memory, imports)
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 34e934c322ab54a705716f0b741d6e036782b3b9..2da627d83fec4145244674e59d139de0dc17b234 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -32,7 +32,8 @@ namespace ps2x::iop
+             // These are explicitly selected service providers for the modeled
+             // kernel, not a reconstruction of the firmware's IOPBTCONF order.
+             for (const auto &[name, sid] : {std::pair{"LOADFILE", 0x80000006u},
+-                                            std::pair{"CDVDFSV", 0x80000593u}})
++                                            std::pair{"CDVDFSV", 0x80000593u},
++                                            std::pair{"FILEIO", 0x80000001u}})
+             {
+                 const auto entry = std::find_if(directory.entries.begin(), directory.entries.end(),
+                     [name](const auto &candidate) { return candidate.name == name; });
+diff --git a/ps2xIOP/tests/iop_ioman_devctl_tests.cpp b/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..beb99945bcb2d92ef7302865f22dc59a880fc684
+--- /dev/null
++++ b/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
+@@ -0,0 +1,307 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/imports/iop_ioman.h"
++#include "emulator/iop_emulator.h"
++#include "emulator/services/iop_rpc.h"
++#include "iop_compat_test_support.h"
++
++#include <functional>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++
++    class NoGuestCallback final : public IopGuestExecutor
++    {
++    public:
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override
++        {
++            throw std::runtime_error("unexpected device callback");
++        }
++    };
++
++    struct Fixture
++    {
++        iop_test::Host host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopCdvd cdvd{host, memory, kernel};
++        IopIoman ioman{memory, cdvd};
++        NoGuestCallback executor;
++
++        void path(uint32_t address, const std::string &value = "cdrom0:")
++        {
++            require(memory.writeRam(address, value.c_str(), value.size() + 1u), "could not install device path");
++        }
++
++        IopCpuState arguments(uint32_t pathAddress = 0x10000u, uint32_t stack = 0x11000u,
++                              uint32_t output = 0x12000u, uint32_t outputSize = 12u)
++        {
++            path(pathAddress);
++            require(memory.zeroRam(stack, 24u), "could not install O32 arguments");
++            std::vector<uint8_t> bytes(outputSize, 0xCAu);
++            require(memory.writeRam(output, bytes.data(), bytes.size()), "could not install output canaries");
++            memory.write32(stack + 16u, output);
++            memory.write32(stack + 20u, outputSize);
++            IopCpuState cpu{};
++            cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = pathAddress;
++            cpu.gpr[5] = 0x4391u;
++            cpu.gpr[29] = stack;
++            return cpu;
++        }
++
++        void invoke(IopCpuState &cpu)
++        {
++            require(ioman.dispatchImport(31u, cpu, executor), "modeled CDVD Devctl is absent");
++        }
++
++        int32_t event(uint16_t ordinal, uint32_t id, uint32_t bits = 0u, uint32_t output = 0u)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = id;
++            cpu.gpr[5] = bits;
++            cpu.gpr[7] = output;
++            require(kernel.dispatchEventImport(ordinal, cpu), "kernel event import is absent");
++            return static_cast<int32_t>(cpu.gpr[2]);
++        }
++    };
++
++    void queryUsesActualSharedEvent()
++    {
++        Fixture f;
++        auto cpu = f.arguments();
++        f.invoke(cpu);
++        const uint32_t id = f.memory.read32(0x12000u);
++        require(cpu.gpr[2] == 0u && id != 0u &&
++                    f.event(11u, id, 0x29u, 0x12100u) == 0 &&
++                    f.memory.read32(0x12100u) == 0x29u &&
++                    f.event(11u, id, 0x10u) == -418,
++                "Devctl did not return a real event without the power-off bit");
++        require(f.memory.read32(0x12004u) == 0xCACACACAu &&
++                    f.memory.read32(0x12008u) == 0xCACACACAu,
++                "event query overwrote bytes beyond its one result word");
++
++        IopCpuState sc{};
++        sc.gpr[4] = static_cast<uint32_t>(-11);
++        require(f.cdvd.dispatchImport(50u, sc) && sc.gpr[2] == id,
++                "Devctl returned an event independent of sceCdSC(-11)");
++        require(f.event(8u, id, 0u) == 0, "could not clear actual event bits");
++        f.invoke(cpu);
++        require(f.memory.read32(0x12000u) == id && f.event(11u, id, 0x29u) == -418,
++                "repeated query re-created the event or fabricated completion bits");
++        require(f.event(6u, id, 0x10u) == 0, "could not signal the actual kernel event");
++        f.invoke(cpu);
++        require(f.memory.read32(0x12000u) == id && f.event(11u, id, 0x10u) == 0,
++                "query reset or replaced existing power-off event state");
++        require(!f.cdvd.takeCompletionCallback() && !f.memory.takeDmaStart() &&
++                    f.memory.interruptStatus() == 0u && f.host.guestWrites == 0u,
++                "event query generated unrelated callbacks, DMA, interrupts or EE writes");
++    }
++
++    void aliasesAndExactEndRanges()
++    {
++        for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            for (const bool stackAtEnd : {false, true})
++            {
++                Fixture f;
++                const uint32_t stack = alias | (stackAtEnd ? IopMemory::RamSize - 24u : 0x11000u);
++                const uint32_t output = alias | (stackAtEnd ? 0x12000u : IopMemory::RamSize - 4u);
++                auto cpu = f.arguments(alias | 0x10000u, stack, output, 4u);
++                f.memory.write8(output - 1u, 0xA5u);
++                f.invoke(cpu);
++                require(cpu.gpr[2] == 0u && f.memory.read32(output) != 0u &&
++                            f.memory.read8(output - 1u) == 0xA5u,
++                        "valid exact-end stack/output alias failed or damaged a canary");
++            }
++        }
++        for (const std::string path : {"cdrom:", "cdrom00:", "cdrom0:\\ignored-name"})
++        {
++            Fixture f;
++            auto cpu = f.arguments();
++            f.path(0x10000u, path);
++            f.invoke(cpu);
++            require(cpu.gpr[2] == 0u, "valid unit-zero device syntax did not resolve");
++        }
++    }
++
++    void invalidArgumentsFailBeforeEventAcquisition()
++    {
++        using Alter = std::function<void(Fixture &, IopCpuState &)>;
++        const Alter examples[] = {
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[4] = 0u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[4] = 0xC0010000u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[4] = 0x8000u; },
++            [](Fixture &f, IopCpuState &cpu)
++            {
++                f.memory.write8(IopMemory::RamSize - 1u, 'c');
++                cpu.gpr[4] = 0xA0000000u | (IopMemory::RamSize - 1u);
++            },
++            [](Fixture &f, IopCpuState &)
++            {
++                std::array<uint8_t, 1024u> path{};
++                path.fill('c');
++                require(f.memory.writeRam(0x10000u, path.data(), path.size()), "could not install unterminated path");
++            },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[7] = 1u; cpu.gpr[6] = 0xFFFFFFFFu; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[29] = 0u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[29] = 0x11001u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[29] = 0x8000u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[29] = 0xFFFFFFF0u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[29] = 0xA01FFFF0u; },
++            [](Fixture &, IopCpuState &cpu) { cpu.gpr[29] = 0x20011000u; },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11010u, 0u); },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11010u, 0x12001u); },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11010u, 0xC0012000u); },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11010u, 0xA01FFFFCu); },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11014u, 3u); },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11014u, 16u); },
++            [](Fixture &f, IopCpuState &) { f.memory.write32(0x11014u, 0xFFFFFFFFu); },
++        };
++        for (const auto &alter : examples)
++        {
++            Fixture f;
++            auto cpu = f.arguments();
++            alter(f, cpu);
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            const uint32_t idBefore = static_cast<uint32_t>(f.kernel.createInternalEventFlag(0u, 0u, 0u));
++            bool rejected = false;
++            try { f.invoke(cpu); }
++            catch (const std::runtime_error &error)
++            {
++                rejected = std::string_view(error.what()).find("Devctl") != std::string_view::npos;
++            }
++            const uint32_t idAfter = static_cast<uint32_t>(f.kernel.createInternalEventFlag(0u, 0u, 0u));
++            require(rejected && cpu.gpr[2] == 0xDEADBEEFu && idAfter == idBefore + 1u &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "malformed Devctl acquired an event, changed RAM, or reported success");
++        }
++    }
++
++    void unsupportedRoutesRemainUnhandled()
++    {
++        for (const std::string path : {"host:", "cdrom1:", "CDROM0:", "cdromx:", "cdrom0", ""})
++        {
++            Fixture f;
++            auto cpu = f.arguments();
++            f.path(0x10000u, path);
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            require(!f.ioman.dispatchImport(31u, cpu, f.executor) && cpu.gpr[2] == 0xDEADBEEFu &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "unsupported device route fabricated a Devctl response");
++        }
++        Fixture f;
++        auto cpu = f.arguments();
++        cpu.gpr[5] = 0x4392u;
++        require(!f.ioman.dispatchImport(31u, cpu, f.executor) && cpu.gpr[2] == 0xDEADBEEFu,
++                "unsupported CDVD command fabricated success");
++
++        // A genuinely registered driver must not be shadowed by this model.
++        f.path(0x13000u, "cdrom");
++        require(f.memory.zeroRam(0x13100u, 24u) && f.memory.zeroRam(0x13200u, 8u),
++                "could not install authored driver metadata");
++        f.memory.write32(0x13100u, 0x13000u);
++        f.memory.write32(0x13110u, 0x13200u);
++        IopCpuState add{};
++        add.gpr[4] = 0x13100u;
++        require(f.ioman.dispatchImport(20u, add, f.executor) && add.gpr[2] == 0u,
++                "could not register authored original-driver metadata");
++        cpu.gpr[5] = 0x4391u;
++        require(!f.ioman.dispatchImport(31u, cpu, f.executor),
++                "modeled CDVD query silently replaced a registered original device");
++    }
++
++    void deletedEventAndResetLifetime()
++    {
++        Fixture f;
++        auto cpu = f.arguments();
++        f.invoke(cpu);
++        const uint32_t id = f.memory.read32(0x12000u);
++        require(f.event(5u, id) == 0, "could not delete event for lifetime regression");
++        f.memory.write32(0x12000u, 0xCACACACAu);
++        cpu.gpr[2] = 0xDEADBEEFu;
++        bool rejected = false;
++        try { f.invoke(cpu); }
++        catch (const std::runtime_error &error)
++        {
++            rejected = std::string_view(error.what()).find("deleted before reset") != std::string_view::npos;
++        }
++        require(rejected && f.memory.read32(0x12000u) == 0xCACACACAu && cpu.gpr[2] == 0xDEADBEEFu,
++                "deleted CDVD event was returned or silently recreated");
++        f.kernel.reset();
++        f.cdvd.reset();
++        f.ioman.reset();
++        f.invoke(cpu);
++        const uint32_t resetId = f.memory.read32(0x12000u);
++        require(cpu.gpr[2] == 0u && f.event(11u, resetId, 0x29u) == 0 &&
++                    f.event(11u, resetId, 0x10u) == -418,
++                "reset did not establish a fresh normal CDVD event lifetime");
++    }
++
++    iop_test::Irx authoredDevctl(uint32_t command)
++    {
++        iop_test::Irx image;
++        image.words(0u, {
++            0x27BDFFD0u, 0xAFBF002Cu, 0x3C040001u, 0x34840400u,
++            0x34050000u | command, 0x00003021u, 0x00003821u,
++            0x3C080001u, 0x35080440u, 0xAFA80010u,
++            0x24090004u, 0xAFA90014u, 0x0C004045u, 0u,
++            0x3C080001u, 0xAD020444u, 0x2404FFF5u, 0x00002821u,
++            0x0C004055u, 0u, 0x3C080001u, 0xAD020448u,
++            0x8FBF002Cu, 0x27BD0030u, 0x03E00008u, 0x24020000u,
++        });
++        image.words(0x100u, {
++            0x41E00000u, 0u, 0x0104u, 0x616D6F69u, 0x0000006Eu,
++            0x03E00008u, 0x2400001Fu, 0u, 0u,
++        });
++        image.words(0x140u, {
++            0x41E00000u, 0u, 0x0101u, 0x64766463u, 0x006E616Du,
++            0x03E00008u, 0x24000032u, 0u, 0u,
++        });
++        std::memcpy(image.bytes.data() + 0x100u + 0x400u, "cdrom0:", 8u);
++        return image;
++    }
++
++    void authoredImportsUseRealO32Arguments()
++    {
++        iop_test::Host host;
++        IopEmulator iop(host);
++        const auto image = authoredDevctl(0x4391u);
++        const auto loaded = iop.loadModuleImage("authored-devctl", image.bytes, nullptr, 0u);
++        std::array<uint32_t, 3u> result{};
++        require(loaded.moduleId > 0 && loaded.startResult == 0 &&
++                    iop.readMemory(0x10440u, result.data(), sizeof(result)) &&
++                    result[0] != 0u && result[1] == 0u && result[2] == result[0],
++                "actual authored O32 imports did not return the same live CDVD event");
++        require(host.guestWrites == 0u, "Devctl touched unrelated EE memory");
++
++        iop_test::Host unsupportedHost;
++        IopEmulator unsupported(unsupportedHost);
++        const auto invalid = authoredDevctl(0x4392u);
++        bool rejected = false;
++        try { (void)unsupported.loadModuleImage("authored-unsupported-devctl", invalid.bytes, nullptr, 0u); }
++        catch (const std::runtime_error &error)
++        {
++            rejected = std::string_view(error.what()).find("missing import ioman:31") != std::string_view::npos;
++        }
++        require(rejected && unsupportedHost.guestWrites == 0u,
++                "unsupported Devctl was not a strict missing operation");
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"CDVD Devctl returns the actual shared kernel event without signaling", queryUsesActualSharedEvent},
++        {"Devctl accepts complete aliases and exact-end O32/output ranges", aliasesAndExactEndRanges},
++        {"Malformed Devctl arguments reject before event or RAM mutation", invalidArgumentsFailBeforeEventAcquisition},
++        {"Unsupported devices and commands remain unhandled", unsupportedRoutesRemainUnhandled},
++        {"Deleted CDVD events fail until normal reset", deletedEventAndResetLifetime},
++        {"Authored IOP Devctl and SC imports share a live event", authoredImportsUseRealO32Arguments},
++    };
++    return iop_test::run(tests);
++}
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+index 4812dff069b26f3299831c34b7a92b3949dd64d8..0a135d25cd4dcd63267beac2526ccd18d7c720bd 100644
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -86,20 +86,27 @@ namespace
+         return bootImage({{name, module}});
+     }
+ 
+-    iop_test::Irx secondRpcServer(uint32_t sid, uint32_t reply)
++    iop_test::Irx relocatedRpcServer(uint32_t sid, uint32_t reply, uint32_t base)
+     {
+         auto image = iop_test::rpcServer(sid, reply);
+-        put(image.bytes, 24u, 0x20000u);
+-        put(image.bytes, 60u, 0x20000u);
+-        put(image.bytes, 64u, 0x20000u);
+-        image.words(0x08u, {0x3C040002u}); // server 0x20200
+-        image.words(0x18u, {0x3C060002u}); // callback 0x20300
+-        image.words(0x20u, {0x3C070002u}); // buffer 0x20400
+-        image.words(0x34u, {0x0C00801Du}); // RegisterRpc import 0x20074
+-        image.words(0x300u, {0x3C020002u}); // return 0x20400
++        if ((base & 0xFFFFu) != 0u || base >= 0x00100000u)
++            throw std::runtime_error("authored RPC base is outside the fixture's LUI encoding");
++        put(image.bytes, 24u, base);
++        put(image.bytes, 60u, base);
++        put(image.bytes, 64u, base);
++        image.words(0x08u, {0x3C040000u | (base >> 16u)}); // server base+0x200
++        image.words(0x18u, {0x3C060000u | (base >> 16u)}); // callback base+0x300
++        image.words(0x20u, {0x3C070000u | (base >> 16u)}); // buffer base+0x400
++        image.words(0x34u, {0x0C000000u | ((base + 0x74u) >> 2u)}); // RegisterRpc import
++        image.words(0x300u, {0x3C020000u | (base >> 16u)}); // return base+0x400
+         return image;
+     }
+ 
++    iop_test::Irx secondRpcServer(uint32_t sid, uint32_t reply)
++    {
++        return relocatedRpcServer(sid, reply, 0x20000u);
++    }
++
+     struct ResetImageFixture
+     {
+         PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
+@@ -677,6 +684,56 @@ void register_ps2_sif_packet_tests()
+             env.iop().checkExecutionFailure();
+         });
+ 
++        tc.Run("RESET starts supplied FILEIO and preserves all active services on malformed input", [](TestCase &t)
++        {
++            const auto loadfile = iop_test::rpcServer(0x80000006u, 0x11223344u);
++            const auto cdvd = secondRpcServer(0x80000593u, 0x55667788u);
++            const auto fileio = relocatedRpcServer(0x80000001u, 0xAABBCCDDu, 0x30000u);
++            ResetImageFixture fixture(bootImage({{"LOADFILE", loadfile.bytes}, {"CDVDFSV", cdvd.bytes},
++                                                {"FILEIO", fileio.bytes}}));
++            PacketEnv env;
++            env.submit(fixture.resetPacket());
++            t.IsTrue((env.iop().getSifRegister(4u) & 0x40000u) != 0u &&
++                         env.iop().debugSnapshot().emulatorLoadedModules == 3u &&
++                         env.iop().debugSnapshot().emulatorRpcServers == 3u,
++                     "BOOTEND requires the three supplied entries and their actual RPC registrations");
++            env.endpoint = env.iop().getSifRegister(2u);
++            const uint32_t server = env.bindService(0x80000001u);
++            t.Equals(server, 0x30200u, "FILEIO BIND exposes the authored provider's actual server");
++            env.submitRpc(server, 0xFFu, {}, 4u);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply) && word(reply.data, 0u) == 0xAABBCCDDu,
++                     "FILEIO result consists of bytes returned by its guest callback");
++            env.iop().consumeSifReply();
++
++            fixture.replace(bootImage({{"LOADFILE", loadfile.bytes}, {"CDVDFSV", cdvd.bytes},
++                                       {"FILEIO", std::vector<uint8_t>(128u, 0u)}}));
++            t.IsTrue(env.fails(fixture.resetPacket()) && env.iop().sifRpcBuffer(server) == 0x30400u &&
++                         env.iop().debugSnapshot().emulatorLoadedModules == 3u &&
++                         env.iop().debugSnapshot().emulatorRpcServers == 3u,
++                     "invalid FILEIO bytes fail preflight before discarding any active provider");
++            env.iop().checkExecutionFailure();
++        });
++
++        tc.Run("RESET cannot publish FILEIO readiness without its actual server registration", [](TestCase &t)
++        {
++            const auto loadfile = iop_test::rpcServer(0x80000006u, 0x11223344u);
++            iop_test::Irx noServer(0x20000u);
++            noServer.words(0u, {0x03E00008u, 0x24020000u});
++            ResetImageFixture fixture(bootImage({{"LOADFILE", loadfile.bytes}, {"FILEIO", noServer.bytes}}));
++            PacketEnv env;
++            env.submit(fixture.resetPacket());
++            std::string error;
++            try { (void)env.iop().getSifRegister(4u); }
++            catch (const std::runtime_error &failure) { error = failure.what(); }
++            t.IsTrue(error.find("IOP reset FILEIO service did not register") != std::string::npos,
++                     "a returning FILEIO entry cannot substitute for a real SID1 registration");
++            bool latched = false;
++            try { (void)env.iop().getSifRegister(2u); }
++            catch (const std::runtime_error &failure) { latched = error == failure.what(); }
++            t.IsTrue(latched, "incomplete FILEIO boot keeps the endpoint unavailable with the same failure");
++        });
++
+         tc.Run("RESET preflight rejects invalid images and mixed DMA before mutation", [](TestCase &t)
+         {
+             const auto valid = bootImage(iop_test::rpcServer(0x80000006u, 0x10203040u).bytes);

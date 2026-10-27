@@ -1,0 +1,156 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -305,18 +305,20 @@
+         const uint64_t handle = host.openHostFile(path);
+         if (handle == 0u)
+             return false;
++        struct CloseFile
++        {
++            IopHost &host;
++            uint64_t handle;
++            ~CloseFile() noexcept { try { host.closeHostFile(handle); } catch (...) {} }
++        } close{host, handle};
+ 
+         uint64_t size = 0u;
+         if (!host.hostFileSize(handle, size) || size == 0u || size > kMaxImageSize)
+-        {
+-            host.closeHostFile(handle);
+             return false;
+-        }
+ 
+         bytes.resize(static_cast<size_t>(size));
+         size_t bytesRead = 0u;
+         const bool ok = host.readHostFile(handle, 0u, bytes.data(), bytes.size(), bytesRead) && bytesRead == bytes.size();
+-        host.closeHostFile(handle);
+         return ok;
+     }
+ 
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -188,7 +188,8 @@
+         {
+             IopHost &host;
+             uint64_t handle;
+-            ~CloseFile() { host.closeHostFile(handle); }
++            // Preserve the original read/validation exception during cleanup.
++            ~CloseFile() noexcept { try { host.closeHostFile(handle); } catch (...) {} }
+         } close{host, handle};
+         uint64_t size = 0u;
+         if (!host.hostFileSize(handle, size) || size < 64u || size > detail::kMaxBootImageBytes)
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -105,6 +105,8 @@
+         }
+         bool hostFileSize(uint64_t handle, uint64_t &size) const override
+         {
++            if (throwOnSize)
++                throw std::runtime_error("authored host size failure");
+             const auto found = active.find(handle);
+             if (found == active.end())
+                 return false;
+@@ -127,7 +129,13 @@
+                 std::memcpy(destination, found->second->data() + offset, bytesRead);
+             return true;
+         }
+-        void closeHostFile(uint64_t handle) override { active.erase(handle); ++closed; }
++        void closeHostFile(uint64_t handle) override
++        {
++            active.erase(handle);
++            ++closed;
++            if (throwOnClose)
++                throw std::runtime_error("authored host close failure");
++        }
+         int32_t memoryCard(const MemoryCardRequest &r) override { return ee.memoryCard(r); }
+         bool hasGuestFunction(uint32_t a) const override { return ee.hasGuestFunction(a); }
+         bool invokeGuestFunction(uint64_t t, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
+@@ -143,6 +151,7 @@
+ 
+         Host ee;
+         bool mounted = true, shortRead = false, throwOnRead = false;
++        bool throwOnSize = false, throwOnClose = false;
+         std::optional<uint64_t> advertisedSize;
+         std::map<std::string, std::string> translations;
+         std::map<std::string, std::vector<uint8_t>> files;
+@@ -536,6 +545,70 @@
+                 "strict host file path did not run original entry");
+     }
+ 
++    void strictInitialHostReadCleanup()
++    {
++        constexpr std::string_view path = "cdrom0:\\MODULES\\read-failure.IRX;1";
++        for (bool sizeFailure : {true, false})
++        for (bool closeFailure : {false, true})
++        {
++            ModuleHost host;
++            host.file(std::string(path), returns());
++            host.throwOnSize = sizeFailure;
++            host.throwOnRead = !sizeFailure;
++            host.throwOnClose = closeFailure;
++            IopEmulator iop(host);
++            rejects([&] { (void)iop.loadModuleStrict(path, nullptr, 0u); },
++                    sizeFailure ? "authored host size failure" : "authored host read failure");
++            require(host.opened.size() == 1u && host.closed == 1u && host.active.empty(),
++                    "strict source exception leaked the open host file");
++            require(iop.loadedModuleCount() == 0u && word(iop, 0x10000u) == 0u && host.ee.guestWrites == 0u,
++                    "failed source read partially executed or loaded the module");
++        }
++        ModuleHost host;
++        host.file(std::string(path), returns());
++        host.throwOnClose = true;
++        IopEmulator iop(host);
++        require(iop.loadModuleStrict(path, nullptr, 0u).moduleId > 0 &&
++                    host.closed == 1u && host.active.empty(),
++                "a cleanup callback replaced the successful complete module read");
++    }
++
++    void rebootImageHostReadCleanup()
++    {
++        constexpr std::string_view path = "cdrom0:\\MODULES\\IOPRP.IMG;1";
++        const Irx module = returns();
++        constexpr uint32_t directoryBytes = 80u;
++        std::vector<uint8_t> image(directoryBytes + ((module.bytes.size() + 15u) & ~size_t{15u}), 0u);
++        const std::array<std::string_view, 4u> names{"RESET", "ROMDIR", "EXTINFO", "LOADFILE"};
++        for (size_t index = 0u; index < names.size(); ++index)
++            std::copy(names[index].begin(), names[index].end(), image.begin() + index * 16u);
++        put32(image, 28u, directoryBytes);
++        put32(image, 60u, static_cast<uint32_t>(module.bytes.size()));
++        std::copy(module.bytes.begin(), module.bytes.end(), image.begin() + directoryBytes);
++
++        for (unsigned variant = 0u; variant < 4u; ++variant)
++        {
++            ModuleHost host;
++            host.file(std::string(path), module);
++            host.files.at(host.translations.at(std::string(path))) =
++                variant == 2u ? std::vector<uint8_t>(80u, 0u) : image;
++            host.throwOnSize = variant == 0u;
++            host.throwOnRead = variant == 1u;
++            host.throwOnClose = true;
++            IopSubsystem iop(host);
++            if (variant < 3u)
++                rejects([&] { (void)iop.readRebootImage(path); },
++                        variant == 0u ? "authored host size failure" :
++                        variant == 1u ? "authored host read failure" : "Invalid IOP boot image:");
++            else
++                require(iop.readRebootImage(path) == image,
++                        "cleanup changed a completely read and validated reboot image");
++            require(host.opened.size() == 1u && host.closed == 1u && host.active.empty() &&
++                        host.ee.guestWrites == 0u,
++                    "reboot image cleanup leaked, duplicated close or mutated guest bytes");
++        }
++    }
++
+     void overlapAndLegacyCompatibility()
+     {
+         Host host;
+@@ -1164,6 +1237,8 @@
+         {"Malformed ELF/relocations fail before commit; valid relocation executes", relocationAndImagePreflight},
+         {"ET_EXEC relocations and RELA reject unsupported semantics before commit", unsupportedRelocationForms},
+         {"Strict files and real IOP buffers use their correct memory spaces", fileAndIopSources},
++        {"Initial strict module source exceptions close the owned file", strictInitialHostReadCleanup},
++        {"Reboot image cleanup preserves original read/parse failures", rebootImageHostReadCleanup},
+         {"Overlap is atomic and legacy EE API remains compatible", overlapAndLegacyCompatibility},
+         {"Later physical RPC callback failures remain strict", callbackCompletion},
+         {"Packet RPC invokes the registered callback and returns its real IOP bytes", packetRpcOriginalCallback},

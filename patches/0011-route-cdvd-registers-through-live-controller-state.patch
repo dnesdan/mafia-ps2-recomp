@@ -1,0 +1,881 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 3225faf71d2263fda91dde38ebd2a60aef5c2a33..004570afbeea09b302fc264f8876635e28b566a3 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -47,6 +47,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_cdvd_memory_tests tests/iop_cdvd_memory_tests.cpp)
++    target_link_libraries(ps2_iop_cdvd_memory_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_cdvd_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_cdvd_memory_tests COMMAND ps2_iop_cdvd_memory_tests)
++
+     add_executable(ps2_iop_boot_image_tests tests/iop_boot_image_tests.cpp)
+     target_link_libraries(ps2_iop_boot_image_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_boot_image_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 8239b9be8d976fe13eaf7e0ce7db59feda08d655..252c5cfb3871d6895f078172f8aa1089304e1808 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <sstream>
++#include <stdexcept>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -17,6 +19,20 @@ namespace ps2x::iop::detail
+         {
+             return (value + alignment - 1u) & ~(alignment - 1u);
+         }
++
++        bool overlapsCdvd(uint32_t physical, uint32_t size)
++        {
++            return physical < IopMemory::CdvdEnd &&
++                   static_cast<uint64_t>(physical) + size > IopMemory::CdvdBase;
++        }
++
++        [[noreturn]] void unsupportedCdvd(const char *operation, uint32_t physical, uint32_t size)
++        {
++            std::ostringstream message;
++            message << "Unsupported IOP CDVD MMIO " << operation << " at 0x" << std::hex << physical
++                    << " (" << std::dec << size << " byte" << (size == 1u ? "" : "s") << ")";
++            throw std::runtime_error(message.str());
++        }
+     }
+ 
+     IopMemory::IopMemory()
+@@ -37,6 +53,24 @@ namespace ps2x::iop::detail
+         m_interruptMask = 0;
+         m_interruptControl = 1;
+         m_dmaStart.reset();
++        // Device ownership is outside RAM. Preserve the weak binding through a
++        // memory reset and through the strict loader's staged copy/commit.
++    }
++
++    void IopMemory::bindCdvdRegisters(const std::shared_ptr<IopCdvdRegisters> &registers) noexcept
++    {
++        m_cdvdRegisters = registers;
++    }
++
++    uint8_t IopMemory::readCdvdByte(uint32_t physical) const
++    {
++        const auto registers = m_cdvdRegisters.lock();
++        uint8_t value = 0u;
++        if (!registers)
++            unsupportedCdvd("read without a live controller", physical, 1u);
++        if (!registers->readCdvdRegister(physical, value))
++            unsupportedCdvd("register read", physical, 1u);
++        return value;
+     }
+ 
+     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+@@ -51,6 +85,8 @@ namespace ps2x::iop::detail
+             return m_ram[phys];
+         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
+             return m_scratch[phys - ScratchBase];
++        if (phys >= CdvdBase && phys < CdvdEnd)
++            return readCdvdByte(phys);
+         const uint32_t value = readHardware32(phys & ~3u);
+         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
+     }
+@@ -64,7 +100,9 @@ namespace ps2x::iop::detail
+             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
+             return value;
+         }
+-        return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
++        const uint8_t low = read8(address);
++        const uint8_t high = read8(address + 1u);
++        return static_cast<uint16_t>(low | (static_cast<uint16_t>(high) << 8u));
+     }
+ 
+     uint32_t IopMemory::read32(uint32_t address) const
+@@ -85,15 +123,17 @@ namespace ps2x::iop::detail
+         if ((phys & 3u) == 0u && isHardwareAddress(phys))
+             return readHardware32(phys);
+ 
+-        return static_cast<uint32_t>(read8(address)) |
+-               (static_cast<uint32_t>(read8(address + 1u)) << 8u) |
+-               (static_cast<uint32_t>(read8(address + 2u)) << 16u) |
+-               (static_cast<uint32_t>(read8(address + 3u)) << 24u);
++        uint32_t value = 0u;
++        for (uint32_t offset = 0u; offset < 4u; ++offset)
++            value |= static_cast<uint32_t>(read8(address + offset)) << (offset * 8u);
++        return value;
+     }
+ 
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (overlapsCdvd(phys, 1u))
++            unsupportedCdvd("write", phys, 1u);
+         if (phys < RamSize)
+         {
+             m_ram[phys] = value;
+@@ -115,6 +155,8 @@ namespace ps2x::iop::detail
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (overlapsCdvd(phys, 2u))
++            unsupportedCdvd("write", phys, 2u);
+         if (phys + 1u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -128,6 +170,8 @@ namespace ps2x::iop::detail
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (overlapsCdvd(phys, 4u))
++            unsupportedCdvd("write", phys, 4u);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -206,13 +250,21 @@ namespace ps2x::iop::detail
+     bool IopMemory::isHardwareAddress(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
+-        return (phys >= HardwareBase && phys < HardwareEnd) ||
++        return (phys >= CdvdBase && phys < CdvdEnd) ||
++               (phys >= HardwareBase && phys < HardwareEnd) ||
+                (phys >= Spu2Base && phys < Spu2End) ||
+                (phys >= SifBase && phys < SifEnd);
+     }
+ 
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        if (address >= CdvdBase && address < CdvdEnd)
++        {
++            uint32_t result = 0u;
++            for (uint32_t offset = 0u; offset < 4u; ++offset)
++                result |= static_cast<uint32_t>(readCdvdByte(address + offset)) << (offset * 8u);
++            return result;
++        }
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 2f427999297bb65b50afdc658058d86042a5a107..f995f84975f438373f707f7811d198baeaa8263d 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -10,12 +11,24 @@
+ 
+ namespace ps2x::iop::detail
+ {
++    // The controller owns its state. Memory only holds a weak route to it, so a
++    // staged RAM copy cannot keep a destroyed device alive or retain a dangling
++    // callback when the owning emulator is reset or destroyed.
++    class IopCdvdRegisters
++    {
++    public:
++        virtual ~IopCdvdRegisters() = default;
++        [[nodiscard]] virtual bool readCdvdRegister(uint32_t physical, uint8_t &value) = 0;
++    };
++
+     class IopMemory
+     {
+     public:
+         static constexpr uint32_t RamSize = 2u * 1024u * 1024u;
+         static constexpr uint32_t ScratchBase = 0x1F800000u;
+         static constexpr uint32_t ScratchSize = 0x400u;
++        static constexpr uint32_t CdvdBase = 0x1F402000u;
++        static constexpr uint32_t CdvdEnd = 0x1F402040u;
+         static constexpr uint32_t HardwareBase = 0x1F801000u;
+         static constexpr uint32_t HardwareEnd = 0x1F900000u;
+         static constexpr uint32_t Spu2Base = 0x1F900000u;
+@@ -41,6 +54,7 @@ namespace ps2x::iop::detail
+         IopMemory();
+ 
+         void reset();
++        void bindCdvdRegisters(const std::shared_ptr<IopCdvdRegisters> &registers) noexcept;
+ 
+         [[nodiscard]] uint8_t read8(uint32_t address) const;
+         [[nodiscard]] uint16_t read16(uint32_t address) const;
+@@ -77,6 +91,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+     private:
++        [[nodiscard]] uint8_t readCdvdByte(uint32_t physical) const;
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
+@@ -85,6 +100,7 @@ namespace ps2x::iop::detail
+         std::vector<uint8_t> m_owned;
+         std::vector<uint8_t> m_scratch;
+         std::unordered_map<uint32_t, uint32_t> m_hardware;
++        std::weak_ptr<IopCdvdRegisters> m_cdvdRegisters;
+         std::vector<Allocation> m_allocations;
+         uint64_t m_nextAllocationIdentity = 1u; // survives RAM reset and ordinary staged copies
+         uint32_t m_heapCursor = HeapBase;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 46673d73c54e5d0df42373d76a043091a9171ed4..175b61189a7e0b2fe9f7407e062f643bb1136c57 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -31,6 +31,11 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdErrorRead = 0x30u;
+         constexpr uint32_t kCdvdTypePs2Dvd = 0x14u;
+         constexpr uint32_t kCdvdReadyComplete = 2u;
++        constexpr uint8_t kControllerError = 0x01u;
++        constexpr uint8_t kControllerReady = 0x40u;
++        constexpr uint8_t kControllerBusy = 0x80u;
++        constexpr uint32_t kCdvdStatusStop = 0x00u;
++        constexpr uint32_t kCdvdStatusRead = 0x06u;
+         constexpr uint32_t kCdvdStatusPause = 0x0Au;
+         constexpr uint32_t kCdvdInitExit = 5u;
+         constexpr uint32_t kCdvdCallbackRead = 1u;
+@@ -160,7 +165,7 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
+-    class IopCdvd::Impl
++    class IopCdvd::Impl : public IopCdvdRegisters
+     {
+     public:
+         struct Callback
+@@ -199,6 +204,8 @@ namespace ps2x::iop::detail
+             releaseFsvReadBuffer();
+             callback = {};
+             initialized = false;
++            readActive = false;
++            controllerReadError = false;
+             mediaMode = 0u;
+             currentLsn = 0u;
+             lastError = kCdvdErrorNone;
+@@ -213,6 +220,45 @@ namespace ps2x::iop::detail
+             imageHandle = 0u;
+         }
+ 
++        uint8_t controllerReady() const noexcept
++        {
++            // READY describes command-controller availability, not the presence
++            // of a disc or a completed read. This model executes sector reads
++            // synchronously and has no outstanding command between calls.
++            // Port definitions: PS2SDK dev5_mmio_hwport.h; READY/BUSY bits:
++            // https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVD_internal.h
++            return static_cast<uint8_t>((readActive ? kControllerBusy : kControllerReady) |
++                                        (controllerReadError ? kControllerError : 0u));
++        }
++
++        uint8_t diskType()
++        {
++            return mediaAvailable() ? static_cast<uint8_t>(kCdvdTypePs2Dvd) : uint8_t{0u};
++        }
++
++        uint8_t driveStatus()
++        {
++            if (readActive)
++                return static_cast<uint8_t>(kCdvdStatusRead);
++            return static_cast<uint8_t>(initialized && mediaAvailable() ? kCdvdStatusPause : kCdvdStatusStop);
++        }
++
++        bool readCdvdRegister(uint32_t physicalAddress, uint8_t &value) override
++        {
++            // These three byte ports describe the already modeled device. Other
++            // controller ports and raw command execution remain unsupported.
++            // In particular, the hardware ERROR port has clear-on-read behavior
++            // distinct from the driver's cached GetError/SC(-2) value.
++            // https://ps2dev.github.io/ps2sdk/dev5__mmio__hwport_8h.html
++            switch (physicalAddress)
++            {
++            case 0x1F402005u: value = controllerReady(); return true;
++            case 0x1F40200Au: value = driveStatus(); return true;
++            case 0x1F40200Fu: value = diskType(); return true;
++            default: return false;
++            }
++        }
++
+         void releaseFsvReadBuffer() noexcept
+         {
+             if (fsvReadBuffer != 0u)
+@@ -265,10 +311,12 @@ namespace ps2x::iop::detail
+                     completionCallback.reset();
+                 }
+                 lastError = kCdvdErrorNone;
++                controllerReadError = false;
+                 cpu.gpr[2] = 1u;
+                 return true;
+ 
+             case 5: // sceCdStandby
++                controllerReadError = false;
+                 cpu.gpr[2] = 1u;
+                 return true;
+ 
+@@ -293,6 +341,7 @@ namespace ps2x::iop::detail
+             case 7: // sceCdSeek
+                 currentLsn = a0;
+                 lastError = kCdvdErrorNone;
++                controllerReadError = false;
+                 signalCommandComplete();
+                 if (callback.address != 0u)
+                 {
+@@ -318,15 +367,18 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 12: // sceCdGetDiskType
+-                cpu.gpr[2] = kCdvdTypePs2Dvd;
++                cpu.gpr[2] = diskType();
+                 return true;
+ 
+             case 13: // sceCdDiskReady
+-                cpu.gpr[2] = initialized && mediaAvailable() ? kCdvdReadyComplete : 6u; // SCECdNotReady
++                // PS2SDK's mode 8 returns the raw controller READY byte. Other
++                // modes retain this service's initialized-media requirement.
++                cpu.gpr[2] = a0 == 8u ? controllerReady() :
++                    !readActive && initialized && mediaAvailable() ? kCdvdReadyComplete : 6u;
+                 return true;
+ 
+             case 28: // sceCdStatus
+-                cpu.gpr[2] = kCdvdStatusPause;
++                cpu.gpr[2] = driveStatus();
+                 return true;
+ 
+             case 37: // sceCdCallback
+@@ -366,6 +418,9 @@ namespace ps2x::iop::detail
+                 case -9:
+                     cpu.gpr[2] = kCdvdmanVersion;
+                     return true;
++                case -3: // Active read2 operation; synchronous reads clear it before returning.
++                    cpu.gpr[2] = readActive ? 1u : 0u;
++                    return true;
+                 case -2:
+                     lastError = a1 != 0u ? memory.read8(a1) : kCdvdErrorNone;
+                     cpu.gpr[2] = lastError;
+@@ -721,6 +776,32 @@ namespace ps2x::iop::detail
+         }
+ 
+         bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
++        {
++            if (readActive)
++                throw std::runtime_error("IOP CDVDMAN cannot start a nested synchronous sector read");
++            struct ReadScope
++            {
++                bool &active;
++                explicit ReadScope(bool &value) : active(value) { active = true; }
++                ~ReadScope() { active = false; }
++            } scope{readActive};
++            lastError = kCdvdErrorNone;
++            controllerReadError = false;
++            try
++            {
++                const bool completed = readSectorsImpl(lsn, sectors, destination);
++                controllerReadError = !completed;
++                return completed;
++            }
++            catch (...)
++            {
++                lastError = kCdvdErrorRead;
++                controllerReadError = true;
++                throw;
++            }
++        }
++
++        bool readSectorsImpl(uint32_t lsn, uint32_t sectors, uint32_t destination)
+         {
+             if (sectors == 0u)
+             {
+@@ -782,6 +863,8 @@ namespace ps2x::iop::detail
+         Callback callback;
+         std::optional<CompletionCallback> completionCallback;
+         bool initialized = false;
++        bool readActive = false;
++        bool controllerReadError = false;
+         uint32_t mediaMode = 0u;
+         uint32_t currentLsn = 0u;
+         uint32_t lastError = kCdvdErrorNone;
+@@ -799,8 +882,9 @@ namespace ps2x::iop::detail
+     };
+ 
+     IopCdvd::IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel)
+-        : m_impl(std::make_unique<Impl>(host, memory, kernel))
++        : m_impl(std::make_shared<Impl>(host, memory, kernel))
+     {
++        memory.bindCdvdRegisters(m_impl);
+     }
+ 
+     IopCdvd::~IopCdvd() = default;
+@@ -810,6 +894,11 @@ namespace ps2x::iop::detail
+         m_impl->reset();
+     }
+ 
++    bool IopCdvd::readRegisterByte(uint32_t physicalAddress, uint8_t &value)
++    {
++        return m_impl->readCdvdRegister(physicalAddress, value);
++    }
++
+     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         return m_impl->dispatchImport(ordinal, cpu);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 2ca6048900f4d1f7ac3d051ed4ccfa44184373e5..029304db31c7a3021fcf2778cac3f515e6c5d0de 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -33,11 +33,14 @@ namespace ps2x::iop::detail
+ 
+         void reset() noexcept;
+ 
++        // Read-only controller view used by direct guest MMIO and imports.
++        // Unsupported ports return false without changing value.
++        [[nodiscard]] bool readRegisterByte(uint32_t physicalAddress, uint8_t &value);
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+ 
+     private:
+         class Impl;
+-        std::unique_ptr<Impl> m_impl;
++        std::shared_ptr<Impl> m_impl;
+     };
+ }
+diff --git a/ps2xIOP/tests/iop_cdvd_memory_tests.cpp b/ps2xIOP/tests/iop_cdvd_memory_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9335540e80d82fc8bf942de1ace174764eafe0e
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_memory_tests.cpp
+@@ -0,0 +1,213 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_memory.h"
++
++#include <array>
++#include <cstdint>
++#include <iostream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++
++    class AuthoredRegisters final : public IopCdvdRegisters
++    {
++    public:
++        bool readCdvdRegister(uint32_t physical, uint8_t &value) override
++        {
++            ++reads;
++            lastAddress = physical;
++            addresses.push_back(physical);
++            if (physical < IopMemory::CdvdBase || physical >= IopMemory::CdvdEnd)
++                return false;
++            const size_t offset = physical - IopMemory::CdvdBase;
++            if (!supported[offset])
++                return false;
++            value = bytes[offset];
++            return true;
++        }
++
++        std::array<uint8_t, IopMemory::CdvdEnd - IopMemory::CdvdBase> bytes{};
++        std::array<bool, IopMemory::CdvdEnd - IopMemory::CdvdBase> supported{};
++        uint32_t reads = 0u;
++        uint32_t lastAddress = 0u;
++        std::vector<uint32_t> addresses;
++    };
++
++    void require(bool condition, std::string_view message)
++    {
++        if (!condition)
++            throw std::runtime_error(std::string(message));
++    }
++
++    template <typename Operation>
++    void rejects(Operation operation, std::string_view text)
++    {
++        try
++        {
++            operation();
++        }
++        catch (const std::runtime_error &error)
++        {
++            require(std::string_view(error.what()).find(text) != std::string_view::npos,
++                    "CDVD failure lost its operation/address diagnostic");
++            return;
++        }
++        throw std::runtime_error("unsupported CDVD access was silently accepted");
++    }
++
++    void aliasesAndWidths()
++    {
++        IopMemory memory;
++        auto registers = std::make_shared<AuthoredRegisters>();
++        registers->supported.fill(true);
++        for (size_t index = 0; index < registers->bytes.size(); ++index)
++            registers->bytes[index] = static_cast<uint8_t>(0x80u + index);
++        memory.bindCdvdRegisters(registers);
++
++        for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            const uint32_t base = alias | IopMemory::CdvdBase;
++            require(memory.isHardwareAddress(base) && memory.isHardwareAddress(base + 0x3Fu),
++                    "CDVD byte range is not recognized as hardware");
++            const uint32_t before = registers->reads;
++            require(memory.read8(base + 5u) == 0x85u && registers->reads == before + 1u &&
++                        registers->lastAddress == IopMemory::CdvdBase + 5u,
++                    "byte read touched adjacent registers or failed to normalize the alias");
++            require(memory.read16(base + 4u) == 0x8584u && memory.read16(base + 5u) == 0x8685u,
++                    "halfword reads did not assemble exact little-endian device bytes");
++            registers->addresses.clear();
++            (void)memory.read16(base + 5u);
++            require(registers->addresses == std::vector<uint32_t>{IopMemory::CdvdBase + 5u,
++                                                                  IopMemory::CdvdBase + 6u},
++                    "halfword register reads were not sequenced in address order");
++            require(memory.read32(base + 4u) == 0x87868584u && memory.read32(base + 5u) == 0x88878685u,
++                    "word reads bypassed the device or assembled bytes incorrectly");
++            for (const uint32_t offset : {4u, 5u})
++            {
++                registers->addresses.clear();
++                (void)memory.read32(base + offset);
++                const uint32_t first = IopMemory::CdvdBase + offset;
++                require(registers->addresses == std::vector<uint32_t>{first, first + 1u, first + 2u, first + 3u},
++                        "word register reads were not sequenced in address order");
++            }
++        }
++        registers->supported[4u] = false;
++        require(memory.read8(0xBF402005u) == 0x85u,
++                "valid byte read depended on the unsupported adjacent command port");
++        rejects([&] { (void)memory.read32(0xBF402004u); }, "0x1f402004");
++    }
++
++    void lifetimeAndStagedCommit()
++    {
++        IopMemory memory;
++        rejects([&] { (void)memory.read8(0xBF402005u); }, "without a live controller");
++        auto registers = std::make_shared<AuthoredRegisters>();
++        registers->supported[5u] = true;
++        registers->bytes[5u] = 0x40u;
++        memory.bindCdvdRegisters(registers);
++        IopMemory staged = memory;
++        staged.write32(0x1000u, 0x12345678u);
++        require(registers.use_count() == 1u, "RAM copy extended controller ownership");
++        memory = std::move(staged);
++        require(memory.read32(0x1000u) == 0x12345678u && memory.read8(0xBF402005u) == 0x40u,
++                "staged RAM commit lost its controller binding");
++        memory.reset();
++        require(memory.read32(0x1000u) == 0u && memory.read8(0xBF402005u) == 0x40u,
++                "RAM reset erased the device route or retained old RAM");
++        IopMemory survivingCopy = memory;
++        registers->bytes[5u] = 0x80u;
++        require(survivingCopy.read8(0xBF402005u) == 0x80u,
++                "copied RAM observes a stale register snapshot");
++        registers.reset();
++        rejects([&] { (void)memory.read8(0xBF402005u); }, "without a live controller");
++        rejects([&] { (void)survivingCopy.read8(0xBF402005u); }, "without a live controller");
++
++        auto replacement = std::make_shared<AuthoredRegisters>();
++        replacement->supported[5u] = true;
++        replacement->bytes[5u] = 0x41u;
++        memory.bindCdvdRegisters(replacement);
++        require(memory.read8(0xBF402005u) == 0x41u, "replacement controller was not bound");
++        rejects([&] { (void)survivingCopy.read8(0xBF402005u); }, "without a live controller");
++    }
++
++    void unsupportedWritesAreAtomic()
++    {
++        IopMemory memory;
++        auto registers = std::make_shared<AuthoredRegisters>();
++        registers->supported.fill(true);
++        registers->bytes[5u] = 0x40u;
++        memory.bindCdvdRegisters(registers);
++        memory.write32(IopMemory::CdvdBase - 4u, 0x12345678u);
++        memory.write32(IopMemory::CdvdEnd, 0x89ABCDEFu);
++        rejects([&] { memory.write8(0xBF402005u, 0u); }, "write");
++        rejects([&] { memory.write16(0x9F402004u, 0u); }, "write");
++        rejects([&] { memory.write32(0x1F402004u, 0u); }, "write");
++        rejects([&] { memory.write16(IopMemory::CdvdBase - 1u, 0u); }, "write");
++        rejects([&] { memory.write32(IopMemory::CdvdBase - 2u, 0u); }, "write");
++        rejects([&] { memory.write32(IopMemory::CdvdEnd - 1u, 0u); }, "write");
++        require(registers->reads == 0u && registers->bytes[5u] == 0x40u &&
++                    memory.read32(IopMemory::CdvdBase - 4u) == 0x12345678u &&
++                    memory.read32(IopMemory::CdvdEnd) == 0x89ABCDEFu,
++                "unsupported write read a device port or partially modified adjacent storage");
++    }
++
++    void authoredCpuPoll()
++    {
++        IopMemory memory;
++        auto registers = std::make_shared<AuthoredRegisters>();
++        registers->supported[5u] = true;
++        registers->bytes[5u] = 0x80u;
++        memory.bindCdvdRegisters(registers);
++        // Authored MIPS poll: the busy device loops, then an actual LBU observes
++        // the changed register and reaches the result instruction. The load and
++        // branch delay slots are intentionally present.
++        constexpr uint32_t code[] = {
++            0x3C08BF40u, // lui t0, 0xbf40
++            0x35082005u, // ori t0, t0, 0x2005
++            0x91090000u, // lbu t1, 0(t0)
++            0x00000000u, // nop
++            0x312900C0u, // andi t1, t1, 0xc0
++            0x240A0040u, // addiu t2, zero, 0x40
++            0x152AFFFBu, // bne t1, t2, poll
++            0x00000000u, // nop
++            0x34021234u, // ori v0, zero, 0x1234
++        };
++        require(memory.writeRam(0x1000u, code, sizeof(code)), "could not install authored code");
++        IopCpuCore core(memory);
++        IopCpuState cpu{};
++        cpu.pc = 0x1000u;
++        for (uint32_t instruction = 0; instruction < 32u; ++instruction)
++            require(core.executeInstruction(cpu) && !cpu.exception, "authored busy poll trapped");
++        require(cpu.gpr[2u] == 0u && registers->reads >= 4u,
++                "busy controller did not hold the original-style CPU poll");
++        registers->bytes[5u] = 0x40u;
++        for (uint32_t instruction = 0; instruction < 16u && cpu.gpr[2u] == 0u; ++instruction)
++            require(core.executeInstruction(cpu) && !cpu.exception, "authored ready poll trapped");
++        require(cpu.gpr[2u] == 0x1234u && cpu.pc == 0x1024u,
++                "CPU byte loads did not observe the live controller state");
++    }
++}
++
++int main()
++{
++    try
++    {
++        aliasesAndWidths();
++        lifetimeAndStagedCommit();
++        unsupportedWritesAreAtomic();
++        authoredCpuPoll();
++        std::cout << "ps2xIOP CDVD memory tests passed (4 groups)\n";
++        return 0;
++    }
++    catch (const std::exception &error)
++    {
++        std::cerr << "FAIL: " << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index c8a78fa6ed491982ad9e50629567fa7542f0be1e..e9529cf3e395846beb535e4f6c13daa06b39efd5 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -9,11 +9,13 @@
+ #include "ps2x/iop/iop_host.h"
+ 
+ #include <cstdint>
++#include <array>
+ #include <chrono>
+ #include <cstring>
+ #include <iostream>
+ #include <fstream>
+ #include <filesystem>
++#include <functional>
+ #include <string>
+ #include <string_view>
+ #include <stdexcept>
+@@ -67,6 +69,59 @@ namespace
+         std::filesystem::path root;
+     };
+ 
++    class SectorImageHost final : public NullHost
++    {
++    public:
++        SectorImageHost()
++        {
++            // Authored bytes exercise the existing sector-backed device model.
++            // No original image or proprietary module is involved.
++            image[16u * 2048u] = 1u;
++            std::memcpy(image.data() + 16u * 2048u + 1u, "CD001", 5u);
++            image[16u * 2048u + 6u] = 1u;
++            for (size_t i = 0u; i < 2048u; ++i)
++                image[2048u + i] = static_cast<uint8_t>(i * 17u + 3u);
++        }
++
++        std::string hostPath(HostPathKind kind) const override
++        {
++            return kind == HostPathKind::CdImage ? "authored-sectors.iso" : std::string{};
++        }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            return path == "authored-sectors.iso" ? 1u : 0u;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            size = image.size();
++            return handle == 1u;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination,
++                          size_t wanted, size_t &bytesRead) override
++        {
++            bytesRead = 0u;
++            if (handle != 1u || offset > image.size() || wanted > image.size() - offset)
++                return false;
++            if (wanted == 2048u)
++            {
++                if (onSectorRead)
++                    onSectorRead();
++                if (throwSectorRead)
++                    throw std::runtime_error("authored host read failure");
++                if (failSectorRead)
++                    return false;
++            }
++            std::memcpy(destination, image.data() + offset, wanted);
++            bytesRead = wanted;
++            return true;
++        }
++
++        std::array<uint8_t, 18u * 2048u> image{};
++        std::function<void()> onSectorRead;
++        bool failSectorRead = false;
++        bool throwSectorRead = false;
++    };
++
+     class RecordingExecutor final : public IopGuestExecutor
+     {
+     public:
+@@ -230,6 +285,136 @@ namespace
+                expect(cpu.gpr[2] == 2u, "sceCdSC(-1) did not preserve the stream state");
+     }
+ 
++    bool testCdvdControllerWithoutMedia()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        const auto call = [&](uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            if (!cdvd.dispatchImport(ordinal, cpu))
++                throw std::runtime_error("authored CDVD import was not handled");
++            return cpu.gpr[2];
++        };
++        if (!expect(memory.read8(0xBF402005u) == 0x40u && call(13u, 8u) == 0x40u,
++                    "an idle controller without media must still accept a command") ||
++            !expect(memory.read8(0xBF40200Fu) == 0u && call(12u) == 0u,
++                    "absent backing was reported as an inserted disc") ||
++            !expect(memory.read8(0xBF40200Au) == 0u && call(28u) == 0u,
++                    "uninitialized no-media device reported a spinning drive") ||
++            !expect(call(13u) == 6u && call(50u, static_cast<uint32_t>(-3)) == 0u,
++                    "controller availability was confused with initialized media or an active read"))
++            return false;
++        uint8_t untouched = 0xA5u;
++        if (!expect(!cdvd.readRegisterByte(0x1F402004u, untouched) &&
++                    !cdvd.readRegisterByte(0x1F402006u, untouched) && untouched == 0xA5u,
++                    "unmodeled command or clear-on-read error port acquired a fabricated value"))
++            return false;
++        (void)call(4u);
++        if (!expect(call(13u) == 6u && call(13u, 8u) == 0x40u && call(12u) == 0u,
++                    "initializing the driver manufactured media"))
++            return false;
++
++        constexpr uint32_t errorAddress = 0x2100u;
++        memory.write8(errorAddress, 0x30u);
++        (void)call(50u, static_cast<uint32_t>(-2), errorAddress);
++        if (!expect(call(8u) == 0x30u, "software GetError did not retain its explicit cached error") ||
++            !expect(memory.read8(0xBF402005u) == 0x40u && call(13u, 8u) == 0x40u,
++                    "writing the software error cache fabricated a controller failure"))
++            return false;
++        cdvd.reset();
++        return expect(memory.read8(0xBF402005u) == 0x40u && call(8u) == 0u &&
++                      call(50u, static_cast<uint32_t>(-3)) == 0u && call(13u) == 6u,
++                      "device reset did not restore idle no-media state through the existing binding");
++    }
++
++    bool testCdvdControllerReadLifecycle()
++    {
++        SectorImageHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        const auto call = [&](uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u,
++                              uint32_t a2 = 0u)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            cpu.gpr[6] = a2;
++            if (!cdvd.dispatchImport(ordinal, cpu))
++                throw std::runtime_error("authored CDVD import was not handled");
++            return cpu.gpr[2];
++        };
++        (void)call(4u);
++        if (!expect(memory.read8(0xBF40200Fu) == 0x14u && call(12u) == 0x14u,
++                    "available sector backing was not reflected in the common disc-type view") ||
++            !expect(memory.read8(0xBF40200Au) == 0x0Au && call(28u) == 0x0Au && call(13u) == 2u,
++                    "initialized idle media did not have consistent paused state"))
++            return false;
++        const uint32_t destination = memory.allocate(2048u);
++        if (!expect(destination != 0u, "could not allocate the authored sector destination"))
++            return false;
++        uint32_t observations = 0u;
++        host.onSectorRead = [&]
++        {
++            ++observations;
++            if (memory.read8(0xBF402005u) != 0x80u || call(13u, 8u) != 0x80u ||
++                memory.read8(0xBF40200Au) != 0x06u || call(28u) != 0x06u ||
++                call(50u, static_cast<uint32_t>(-3)) != 1u || call(13u) != 6u)
++                throw std::runtime_error("active host read did not expose BUSY/read-active consistently");
++        };
++        if (!expect(call(6u, 1u, 1u, destination) == 1u && observations == 1u,
++                    "authored sector read did not execute the real host read") ||
++            !expect(memory.read32(destination) == 0x36251403u &&
++                    memory.read8(destination + 2047u) == host.image[4095u],
++                    "sector read did not copy the authored bytes") ||
++            !expect(memory.read8(0xBF402005u) == 0x40u && call(50u, static_cast<uint32_t>(-3)) == 0u,
++                    "successful synchronous read left the controller busy"))
++            return false;
++
++        memory.write32(destination, 0xAABBCCDDu);
++        host.failSectorRead = true;
++        if (!expect(call(6u, 1u, 1u, destination) == 0u && observations == 2u,
++                    "failed host transfer acquired a successful result") ||
++            !expect(memory.read32(destination) == 0xAABBCCDDu,
++                    "failed host transfer changed the guest destination") ||
++            !expect(memory.read8(0xBF402005u) == 0x41u && call(8u) == 0x30u &&
++                    call(50u, static_cast<uint32_t>(-3)) == 0u,
++                    "failed transfer did not clear BUSY while retaining its real error"))
++            return false;
++        constexpr uint32_t softwareError = 0x2100u;
++        memory.write8(softwareError, 0u);
++        (void)call(50u, static_cast<uint32_t>(-2), softwareError);
++        if (!expect(call(8u) == 0u && call(13u, 8u) == 0x41u,
++                    "changing the driver error cache cleared the controller's failed-transfer latch"))
++            return false;
++        host.failSectorRead = false;
++        host.throwSectorRead = true;
++        bool threw = false;
++        try { (void)call(6u, 1u, 1u, destination); }
++        catch (const std::runtime_error &error)
++        {
++            threw = std::string_view(error.what()) == "authored host read failure";
++        }
++        if (!expect(threw && observations == 3u && memory.read32(destination) == 0xAABBCCDDu,
++                    "host exception was swallowed or changed guest data") ||
++            !expect(call(13u, 8u) == 0x41u && call(50u, static_cast<uint32_t>(-3)) == 0u,
++                    "exception path retained an active synchronous operation"))
++            return false;
++        host.throwSectorRead = false;
++        if (!expect(call(6u, 1u, 1u, destination) == 1u && observations == 4u &&
++                    call(13u, 8u) == 0x40u && call(8u) == 0u,
++                    "a new real transfer could not clear the previous operation error"))
++            return false;
++        (void)call(4u, 5u); // driver exit leaves the controller and inserted media distinct
++        return expect(call(13u) == 6u && call(13u, 8u) == 0x40u && call(28u) == 0u && call(12u) == 0x14u,
++                      "driver exit confused controller, initialization and mounted-media lifetimes");
++    }
++
+     bool testCdvdSearchFile()
+     {
+         const auto suffix = std::to_string(
+@@ -528,7 +713,8 @@ namespace
+ 
+ int main()
+ {
+-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
++    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() ||
++        !testCdvdControllerWithoutMedia() || !testCdvdControllerReadLifecycle() || !testCdvdSearchFile() ||
+         !testCdvdFsvBuffer() || !testCdvdFsvBufferFailure() || !testCdvdFsvAllocationIdentity() ||
+         !testIopAllocationBoundsAndIdentity() || !testTimrmanPeriodicCallback())
+         return 1;

@@ -1,0 +1,377 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index aa442bccb6a7242bdc3f13010c564a27a505146b..4ff7b32bffb6a1fea0b08ebf97ab7472c8d2fa75 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -48,6 +48,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_cdvd_clock_tests tests/iop_cdvd_clock_tests.cpp)
++    target_link_libraries(ps2_iop_cdvd_clock_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_cdvd_clock_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_cdvd_clock_tests COMMAND ps2_iop_cdvd_clock_tests)
++
+     add_executable(ps2_iop_dmacman_tests tests/iop_dmacman_tests.cpp)
+     target_link_libraries(ps2_iop_dmacman_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_dmacman_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 175b61189a7e0b2fe9f7407e062f643bb1136c57..b7cd5d7d9ebfe97017f6aa1fd1dc2f75709725e7 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -187,8 +187,8 @@ namespace ps2x::iop::detail
+             std::vector<size_t> children;
+         };
+ 
+-        Impl(IopHost &hostRef, IopMemory &memoryRef, IopKernel &kernelRef)
+-            : host(hostRef), memory(memoryRef), kernel(kernelRef)
++        Impl(IopHost &hostRef, IopMemory &memoryRef, IopKernel &kernelRef, ClockSource clock)
++            : host(hostRef), memory(memoryRef), kernel(kernelRef), clockSource(std::move(clock))
+         {
+         }
+ 
+@@ -377,6 +377,10 @@ namespace ps2x::iop::detail
+                     !readActive && initialized && mediaAvailable() ? kCdvdReadyComplete : 6u;
+                 return true;
+ 
++            case 24: // sceCdReadClock(sceCdCLOCK *)
++                cpu.gpr[2] = readClock(a0) ? 1u : 0u;
++                return true;
++
+             case 28: // sceCdStatus
+                 cpu.gpr[2] = driveStatus();
+                 return true;
+@@ -460,6 +464,47 @@ namespace ps2x::iop::detail
+         }
+ 
+     private:
++        bool readClock(uint32_t destination)
++        {
++            constexpr size_t clockBytes = 8u;
++            const uint32_t segment = destination & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(destination);
++            if (destination == 0u ||
++                (segment != 0u && segment != 0x80000000u && segment != 0xA0000000u) ||
++                physical >= IopMemory::RamSize || clockBytes > IopMemory::RamSize - physical ||
++                !memory.ownsRamRange(destination, clockBytes))
++                throw std::runtime_error("IOP CDVD clock destination is outside complete owned RAM");
++
++            using namespace std::chrono;
++            const std::optional<sys_seconds> utc = clockSource ? clockSource() :
++                std::optional<sys_seconds>{floor<seconds>(system_clock::now())};
++            // The PS2 RTC uses JST and a two-digit year based at 2000. Check
++            // bounds before adding the offset, including extreme host samples.
++            // https://ps2dev.github.io/ps2sdk/osd__config_8h.html
++            // https://ps2dev.github.io/ps2sdk/scmd_8c_source.html
++            constexpr sys_seconds first = sys_days{year{2000}/January/1} - hours{9};
++            constexpr sys_seconds end = sys_days{year{2100}/January/1} - hours{9};
++            if (!utc || *utc < first || *utc >= end)
++                return false;
++            const sys_seconds jst = *utc + hours{9};
++            const sys_days datePart = floor<days>(jst);
++            const year_month_day date{datePart};
++            const hh_mm_ss time{jst - datePart};
++            const auto bcd = [](unsigned value)
++                { return static_cast<uint8_t>(((value / 10u) << 4u) | (value % 10u)); };
++            // sceCdCLOCK is eight byte fields: stat, second, minute, hour, pad,
++            // day, month, year. ReadClock normalizes pad and the month high bit.
++            // https://ps2dev.github.io/ps2sdk/libcdvd-common_8h_source.html
++            const std::array<uint8_t, clockBytes> bytes{
++                0u, bcd(static_cast<unsigned>(time.seconds().count())),
++                bcd(static_cast<unsigned>(time.minutes().count())),
++                bcd(static_cast<unsigned>(time.hours().count())), 0u,
++                bcd(static_cast<unsigned>(date.day())), bcd(static_cast<unsigned>(date.month())),
++                bcd(static_cast<unsigned>(int(date.year()) - 2000)),
++            };
++            return memory.writeRam(destination, bytes.data(), bytes.size());
++        }
++
+         int ensureInterruptEventFlag()
+         {
+             if (interruptEventFlagId == 0)
+@@ -860,6 +905,7 @@ namespace ps2x::iop::detail
+         IopHost &host;
+         IopMemory &memory;
+         IopKernel &kernel;
++        ClockSource clockSource;
+         Callback callback;
+         std::optional<CompletionCallback> completionCallback;
+         bool initialized = false;
+@@ -881,8 +927,8 @@ namespace ps2x::iop::detail
+         std::unordered_map<uint32_t, std::array<uint8_t, kSectorSize>> metadataSectors;
+     };
+ 
+-    IopCdvd::IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel)
+-        : m_impl(std::make_shared<Impl>(host, memory, kernel))
++    IopCdvd::IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel, ClockSource clockSource)
++        : m_impl(std::make_shared<Impl>(host, memory, kernel, std::move(clockSource)))
+     {
+         memory.bindCdvdRegisters(m_impl);
+     }
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 029304db31c7a3021fcf2778cac3f515e6c5d0de..78df9f7a0ed64c0cceb9581a94a7d198f4977628 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
++#include <chrono>
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <optional>
+ 
+@@ -18,6 +20,11 @@ namespace ps2x::iop::detail
+     class IopCdvd
+     {
+     public:
++        // UTC wall-clock input. An empty provider uses the host system clock;
++        // an unavailable sample returns nullopt. Kept internal to the IOP model
++        // so deterministic device tests do not alter the public host interface.
++        using ClockSource = std::function<std::optional<std::chrono::sys_seconds>()>;
++
+         struct CompletionCallback
+         {
+             uint32_t address = 0u;
+@@ -25,7 +32,7 @@ namespace ps2x::iop::detail
+             uint32_t reason = 0u;
+         };
+ 
+-        IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel);
++        IopCdvd(IopHost &host, IopMemory &memory, IopKernel &kernel, ClockSource clockSource = {});
+         ~IopCdvd();
+ 
+         IopCdvd(const IopCdvd &) = delete;
+diff --git a/ps2xIOP/tests/iop_cdvd_clock_tests.cpp b/ps2xIOP/tests/iop_cdvd_clock_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2c68352d13dc0dd4bb62827ed838f52d888e757
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_clock_tests.cpp
+@@ -0,0 +1,228 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/iop_emulator.h"
++#include "iop_compat_test_support.h"
++
++#include <chrono>
++#include <limits>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++    using namespace std::chrono;
++    using iop_test::require;
++    using ClockBytes = std::array<uint8_t, 8u>;
++
++    sys_seconds utc(int y, unsigned m, unsigned d, int h = 0, int minute = 0, int second = 0)
++    {
++        return sys_days{year{y}/month{m}/day{d}} + hours{h} + minutes{minute} + seconds{second};
++    }
++
++    ClockBytes readClockBytes(IopMemory &memory, uint32_t address)
++    {
++        ClockBytes bytes{};
++        require(memory.readRam(address, bytes.data(), bytes.size()), "clock result is not in RAM");
++        return bytes;
++    }
++
++    uint32_t invoke(IopCdvd &cdvd, uint32_t address)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4u] = address;
++        cpu.gpr[2u] = 0xDEADBEEFu;
++        require(cdvd.dispatchImport(24u, cpu), "ReadClock import is absent");
++        return cpu.gpr[2u];
++    }
++
++    void calendarEncodingAndRollover()
++    {
++        struct Example { sys_seconds time; ClockBytes expected; };
++        const Example examples[] = {
++            {utc(1999, 12u, 31u, 15), {0u, 0u, 0u, 0u, 0u, 0x01u, 0x01u, 0u}},
++            {utc(2024, 2u, 28u, 15), {0u, 0u, 0u, 0u, 0u, 0x29u, 0x02u, 0x24u}},
++            {utc(2024, 2u, 29u, 14, 59, 58), {0u, 0x58u, 0x59u, 0x23u, 0u, 0x29u, 0x02u, 0x24u}},
++            {utc(2024, 2u, 29u, 15), {0u, 0u, 0u, 0u, 0u, 0x01u, 0x03u, 0x24u}},
++            {utc(2025, 12u, 31u, 15), {0u, 0u, 0u, 0u, 0u, 0x01u, 0x01u, 0x26u}},
++            {utc(2026, 11u, 27u, 1, 23, 45), {0u, 0x45u, 0x23u, 0x10u, 0u, 0x27u, 0x11u, 0x26u}},
++            {utc(2099, 12u, 31u, 14, 59, 59), {0u, 0x59u, 0x59u, 0x23u, 0u, 0x31u, 0x12u, 0x99u}},
++        };
++        for (const auto &example : examples)
++        {
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            unsigned samples = 0u;
++            IopCdvd cdvd(host, memory, kernel, [&]() -> std::optional<sys_seconds>
++                { ++samples; return example.time; });
++            std::array<uint8_t, 16u> canaries{};
++            canaries.fill(0xCAu);
++            require(memory.writeRam(0x10000u, canaries.data(), canaries.size()), "could not install clock canaries");
++            // The ABI is a byte struct and permits an unaligned complete range.
++            require(invoke(cdvd, 0x10001u) == 1u && samples == 1u &&
++                        readClockBytes(memory, 0x10001u) == example.expected,
++                    "UTC/JST calendar or BCD byte layout is wrong");
++            require(memory.read8(0x10000u) == 0xCAu && memory.read8(0x10009u) == 0xCAu,
++                    "ReadClock wrote beyond its eight-byte result");
++        }
++    }
++
++    void completeAliasesAndInvalidDestinations()
++    {
++        const ClockBytes expected{0u, 0x03u, 0x02u, 0x10u, 0u, 0x04u, 0x05u, 0x26u};
++        for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            IopCdvd cdvd(host, memory, kernel, [] { return utc(2026, 5u, 4u, 1, 2, 3); });
++            std::array<uint8_t, 16u> tail{};
++            tail.fill(0xA5u);
++            require(memory.writeRam(IopMemory::RamSize - tail.size(), tail.data(), tail.size()),
++                    "could not install final RAM canaries");
++            const uint32_t address = IopMemory::RamSize - 8u;
++            require(invoke(cdvd, alias | address) == 1u && readClockBytes(memory, address) == expected,
++                    "complete exact-end RAM alias was rejected or corrupted");
++            require(memory.read8(address - 1u) == 0xA5u, "exact-end write damaged preceding storage");
++        }
++        for (const uint32_t address : {0u, 0x8000u, 0x200000u, 0x1FFFF9u, 0xA01FFFFFu,
++                                      0x20010000u, 0xC0010000u, 0xFFFFFFFFu,
++                                      0xBF800000u, 0xBF402005u, 0xBF801000u, 0x10009u})
++        {
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            unsigned samples = 0u;
++            IopCdvd cdvd(host, memory, kernel, [&]() -> std::optional<sys_seconds>
++                { ++samples; return utc(2026, 1u, 1u); });
++            std::array<uint8_t, 16u> data{};
++            data.fill(0x5Au);
++            require(memory.writeRam(0x10000u, data.data(), data.size()), "could not install owned range");
++            require(memory.writeRam(IopMemory::RamSize - data.size(), data.data(), data.size()),
++                    "could not install RAM-end range");
++            const std::vector<uint8_t> before(memory.ram().begin(), memory.ram().end());
++            IopCpuState cpu{};
++            cpu.gpr[4u] = address;
++            cpu.gpr[2u] = 0xDEADBEEFu;
++            bool rejected = false;
++            try { (void)cdvd.dispatchImport(24u, cpu); }
++            catch (const std::runtime_error &error)
++            {
++                rejected = std::string_view(error.what()).find("clock destination") != std::string_view::npos;
++            }
++            require(rejected && samples == 0u && cpu.gpr[2u] == 0xDEADBEEFu &&
++                        std::equal(before.begin(), before.end(), memory.ram().begin()),
++                    "invalid clock destination sampled time, partially wrote RAM, or reported success");
++        }
++    }
++
++    void unavailableClockPreservesOutput()
++    {
++        const std::optional<sys_seconds> samples[] = {
++            std::nullopt, utc(1999, 12u, 31u, 14, 59, 59), utc(2099, 12u, 31u, 15),
++            sys_seconds::min(), sys_seconds::max(),
++        };
++        for (const auto &sample : samples)
++        {
++            iop_test::Host host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            IopCdvd cdvd(host, memory, kernel, [&] { return sample; });
++            ClockBytes before{};
++            before.fill(0xABu);
++            require(memory.writeRam(0x10000u, before.data(), before.size()), "could not initialize clock result");
++            require(invoke(cdvd, 0x10000u) == 0u && readClockBytes(memory, 0x10000u) == before,
++                    "unavailable/unrepresentable time fabricated a successful fallback date");
++        }
++        iop_test::Host host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel, []() -> std::optional<sys_seconds>
++            { throw std::runtime_error("authored clock failure"); });
++        ClockBytes before{};
++        before.fill(0xBDu);
++        require(memory.writeRam(0x10000u, before.data(), before.size()), "could not initialize throwing clock result");
++        bool rejected = false;
++        try { (void)invoke(cdvd, 0x10000u); }
++        catch (const std::runtime_error &error)
++        {
++            rejected = std::string_view(error.what()) == "authored clock failure";
++        }
++        require(rejected && readClockBytes(memory, 0x10000u) == before,
++                "clock provider failure produced a partial output or success");
++    }
++
++    void clockHasIndependentDeviceState()
++    {
++        iop_test::Host host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        sys_seconds value = utc(2026, 7u, 1u, 1, 2, 3);
++        IopCdvd cdvd(host, memory, kernel, [&] { return value; });
++        require(memory.zeroRam(0x10000u, 8u), "could not initialize independent clock result");
++        std::array<uint8_t, 3u> before{}, after{};
++        const std::array<uint32_t, 3u> ports{0x1F402005u, 0x1F40200Au, 0x1F40200Fu};
++        for (size_t i = 0u; i < ports.size(); ++i)
++            require(cdvd.readRegisterByte(ports[i], before[i]), "supported controller port is unavailable");
++        require(invoke(cdvd, 0x10000u) == 1u, "RTC incorrectly required an initialized disc or media");
++        for (size_t i = 0u; i < ports.size(); ++i)
++            require(cdvd.readRegisterByte(ports[i], after[i]), "controller port disappeared after RTC read");
++        require(before == after && !cdvd.takeCompletionCallback() && !memory.takeDmaStart() &&
++                    memory.interruptStatus() == 0u && host.guestWrites == 0u,
++                "RTC changed disc state or generated DMA/interrupt/EE effects");
++        cdvd.reset();
++        value += seconds{1};
++        require(invoke(cdvd, 0x10000u) == 1u && memory.read8(0x10001u) == 0x04u,
++                "IOP reset froze or reset the external wall-clock source");
++    }
++
++    void authoredImportReadsActualHostClock()
++    {
++        iop_test::Host host;
++        IopEmulator iop(host);
++        iop_test::Irx image;
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu, 0x3C040001u, 0x34840400u,
++            0x0C004045u, 0u, 0x3C080001u, 0xAD020408u,
++            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x24020000u,
++        });
++        image.words(0x100u, {
++            0x41E00000u, 0u, 0x0101u, 0x64766463u, 0x006E616Du,
++            0x03E00008u, 0x24000018u, 0u, 0u,
++        });
++        const auto before = floor<seconds>(system_clock::now());
++        const auto loaded = iop.loadModuleImage("authored-clock-import", image.bytes, nullptr, 0u);
++        const auto after = floor<seconds>(system_clock::now());
++        std::array<uint8_t, 12u> bytes{};
++        require(loaded.moduleId > 0 && loaded.startResult == 0 &&
++                    iop.readMemory(0x10400u, bytes.data(), bytes.size()),
++                "authored RTC import did not complete its real entry");
++        require(bytes[0u] == 0u && bytes[4u] == 0u && bytes[8u] == 1u &&
++                    bytes[9u] == 0u && bytes[10u] == 0u && bytes[11u] == 0u,
++                "live RTC import did not return successful normalized clock data");
++        const auto decimal = [](uint8_t bcd)
++        {
++            require((bcd & 15u) < 10u && (bcd >> 4u) < 10u, "live RTC byte is not BCD");
++            return unsigned(bcd >> 4u) * 10u + unsigned(bcd & 15u);
++        };
++        const auto actual = utc(2000 + static_cast<int>(decimal(bytes[7u])), decimal(bytes[6u]),
++                                decimal(bytes[5u]), static_cast<int>(decimal(bytes[3u])),
++                                static_cast<int>(decimal(bytes[2u])), static_cast<int>(decimal(bytes[1u]))) - hours{9};
++        require(actual >= std::min(before, after) && actual <= std::max(before, after),
++                "live RTC result does not correspond to the observed host wall clock");
++        require(host.guestWrites == 0u, "IOP clock import wrote unrelated EE RAM");
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"RTC encodes real UTC as JST BCD across calendar boundaries", calendarEncodingAndRollover},
++        {"RTC validates complete owned RAM aliases before sampling", completeAliasesAndInvalidDestinations},
++        {"RTC source failures preserve output and report no success", unavailableClockPreservesOutput},
++        {"RTC reads preserve independent disc and interrupt state", clockHasIndependentDeviceState},
++        {"Authored IOP import reads the actual host wall clock", authoredImportReadsActualHostClock},
++    };
++    return iop_test::run(tests);
++}

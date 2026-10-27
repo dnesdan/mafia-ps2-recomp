@@ -1,0 +1,1707 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 79897607b708ed3c01dcbedf271aa4f59547415d..7b4344af2f248f49746e40db31e510f9daa6fe4f 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -29,6 +29,8 @@ namespace ps2x::iop
+         std::vector<uint8_t> bytes;
+         std::vector<uint8_t> rpcInput;
+         bool hasRpcInput = false;
++        std::vector<uint8_t> rebootImage;
++        std::string rebootPath;
+     };
+ 
+     class IopSubsystem
+@@ -43,6 +45,8 @@ namespace ps2x::iop
+         IopSubsystem &operator=(IopSubsystem &&) noexcept;
+ 
+         void reset();
++        [[nodiscard]] std::vector<uint8_t> readRebootImage(std::string_view path) const;
++        void rebootFromImage(std::string path, std::vector<uint8_t> image);
+ 
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+@@ -59,6 +63,11 @@ namespace ps2x::iop
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
++        [[nodiscard]] bool getPacketRpcServer(uint32_t sid, uint32_t &server, uint32_t &buffer,
++                                               uint32_t &callbackBuffer) const;
++        void validatePacketRpc(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const;
++        [[nodiscard]] std::vector<uint8_t> executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
++                                                           std::span<const uint8_t> input, uint32_t receiveSize);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t getSifRegister(uint32_t reg);
+@@ -66,7 +75,7 @@ namespace ps2x::iop
+         [[nodiscard]] bool acceptsSifCommand(uint32_t destination) const noexcept;
+         [[nodiscard]] bool sifCommandsInitialized() const noexcept;
+         void validateSifCommand(const void *packet, size_t size) const;
+-        void validateSifCommandBatch(std::span<const SifCommandPacket> packets) const;
++        void validateSifCommandBatch(std::span<SifCommandPacket> packets) const;
+         void receiveSifCommand(const void *packet, size_t size);
+         void receiveSifCommandPacket(const SifCommandPacket &packet);
+         [[nodiscard]] uint32_t sifRpcBuffer(uint32_t server) const noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 55169821ec36f29f6b58916955fbd7c77617e843..4eec8e627d42f499ce27313b053a3948ce1a565f 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -244,6 +244,16 @@ namespace ps2x::iop::detail
+             return result;
+         }
+ 
++        void validateLoadedImage(const IopImageLoadResult &loaded)
++        {
++            if (!loaded || !loaded.relocationsComplete)
++                throw std::runtime_error("Strict IOP loader: failed image load or incomplete relocations");
++            if (loaded.base < kModuleLoadBase || loaded.base >= kKernelHeapBase || loaded.size == 0u ||
++                loaded.size > kKernelHeapBase - loaded.base || (loaded.entry & 3u) != 0u ||
++                loaded.entry < loaded.base || loaded.entry - loaded.base >= loaded.size)
++                throw std::runtime_error("Strict IOP loader: image does not fit the reserved module arena");
++        }
++
+         std::vector<size_t> argumentOffsets(std::string_view path, const void *arguments, uint32_t argumentSize)
+         {
+             if (path.empty() || path.size() > kMaxModulePathBytes || path.find('\0') != std::string_view::npos ||
+@@ -552,12 +562,8 @@ namespace ps2x::iop::detail
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+             }
+-            if (iequals(call.library, "sifcmd"))
+-            {
+-                return rpc.dispatchSifCmdImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
+-            }
++            if (iequals(call.library, "sifcmd") && rpc.dispatchSifCmdImport(call.ordinal, cpu))
++                return ImportDisposition::Handled;
+             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "secrman"))
+@@ -584,12 +590,8 @@ namespace ps2x::iop::detail
+             }
+             if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+-            if (iequals(call.library, "sifman"))
+-            {
+-                return rpc.dispatchSifManImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
+-            }
++            if (iequals(call.library, "sifman") && rpc.dispatchSifManImport(call.ordinal, cpu))
++                return ImportDisposition::Handled;
+             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+@@ -999,12 +1001,7 @@ namespace ps2x::iop::detail
+             // overwrites a running module or partially mutates its RAM.
+             IopMemory staged = memory;
+             const IopImageLoadResult loaded = IopModuleLoader::load(image, staged, moduleCursor);
+-            if (!loaded || !loaded.relocationsComplete)
+-                throw std::runtime_error("Strict IOP loader: failed image load or incomplete relocations for " + path);
+-            if (loaded.base < kModuleLoadBase || loaded.base >= kKernelHeapBase || loaded.size == 0u ||
+-                loaded.size > kKernelHeapBase - loaded.base || (loaded.entry & 3u) != 0u ||
+-                loaded.entry < loaded.base || loaded.entry - loaded.base >= loaded.size)
+-                throw std::runtime_error("Strict IOP loader: image does not fit the reserved module arena");
++            validateLoadedImage(loaded);
+             for (const auto &[id, existing] : modules)
+             {
+                 (void)id;
+@@ -1244,6 +1241,13 @@ namespace ps2x::iop::detail
+         return m_impl->loadImageStrict(std::string(path), image, arguments, argumentSize);
+     }
+ 
++    void IopEmulator::validateModuleImage(std::span<const uint8_t> image)
++    {
++        (void)inspectStrictImage(image);
++        IopMemory staged;
++        validateLoadedImage(IopModuleLoader::load(image, staged, kModuleLoadBase));
++    }
++
+     ModuleLoadResult IopEmulator::loadModuleIopBuffer(uint32_t address, const void *arguments, uint32_t argumentSize)
+     {
+         return m_impl->loadModuleIopBuffer(address, arguments, argumentSize);
+@@ -1289,6 +1293,45 @@ namespace ps2x::iop::detail
+         return m_impl->lastError.empty() && m_impl->rpc.hasServer(sid);
+     }
+ 
++    bool IopEmulator::getPacketRpcServer(uint32_t sid, uint32_t &serverOut,
++                                        uint32_t &bufferOut, uint32_t &callbackBufferOut) const
++    {
++        serverOut = bufferOut = callbackBufferOut = 0u;
++        checkExecutionFailure();
++        return m_impl->rpc.getPacketServer(sid, serverOut, bufferOut, callbackBufferOut);
++    }
++
++    void IopEmulator::validatePacketRpc(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const
++    {
++        checkExecutionFailure();
++        m_impl->rpc.validatePacketCall(sid, server, sendSize, receiveSize);
++    }
++
++    std::vector<uint8_t> IopEmulator::executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
++                                                    std::span<const uint8_t> input, uint32_t receiveSize)
++    {
++        if (input.size() > IopMemory::RamSize)
++            throw std::runtime_error("Physical IOP packet RPC: payload size exceeds IOP RAM");
++        validatePacketRpc(sid, server, static_cast<uint32_t>(input.size()), receiveSize);
++        const RestoreValue strictGuard(m_impl->strictExecution, true);
++        try
++        {
++            return m_impl->rpc.executePacketCall(sid, server, function, input, receiveSize, *m_impl);
++        }
++        catch (const std::exception &error)
++        {
++            // An executing callback may have changed state before a failed
++            // return or output-range check. Preserve that failure until reset.
++            m_impl->rememberExecutionFailure(error.what());
++            throw;
++        }
++        catch (...)
++        {
++            m_impl->rememberExecutionFailure("Physical IOP packet RPC: unknown callback failure");
++            throw;
++        }
++    }
++
+     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
+     {
+         checkExecutionFailure();
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 92f3f0d7d78e6b82cea7fd44d49f6206e3a31b38..3db70de53c7c1c5d38341eee626a30906cac4ec6 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -27,6 +27,9 @@ namespace ps2x::iop::detail
+         [[nodiscard]] ModuleLoadResult loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] ModuleLoadResult loadModuleImage(std::string_view path, std::span<const uint8_t> image,
+                                                      const void *arguments, uint32_t argumentSize);
++        // Validate a fresh-boot image, including staged relocations and arena
++        // bounds, without executing its entry or touching a live subsystem.
++        static void validateModuleImage(std::span<const uint8_t> image);
+         [[nodiscard]] ModuleLoadResult loadModuleIopBuffer(uint32_t iopAddress, const void *arguments, uint32_t argumentSize);
+         // Background execution cannot throw through the EE cycle accounting API.
+         // Strict failures remain sticky until reset and are surfaced at this gate.
+@@ -36,6 +39,11 @@ namespace ps2x::iop::detail
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
++        [[nodiscard]] bool getPacketRpcServer(uint32_t sid, uint32_t &serverOut,
++                                               uint32_t &bufferOut, uint32_t &callbackBufferOut) const;
++        void validatePacketRpc(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const;
++        [[nodiscard]] std::vector<uint8_t> executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
++                                                          std::span<const uint8_t> input, uint32_t receiveSize);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6ec2553c227dfb6cad1c10ddf3a4c82da3..a00adca80aa85572e2c3ec8d5e9519b60c3b22bd 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -9,10 +9,33 @@
+ #include <array>
+ #include <cstring>
+ #include <limits>
++#include <stdexcept>
++#include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
++    namespace
++    {
++        bool ownedPacketRange(const IopMemory &memory, uint32_t address, size_t size)
++        {
++            // IopMemory's low-level accessors mask addresses. Packet metadata
++            // may use physical, KSEG0 or KSEG1 RAM, never arbitrary aliases.
++            if (address >= IopMemory::RamSize &&
++                !(address >= 0x80000000u && address < 0x80200000u) &&
++                !(address >= 0xA0000000u && address < 0xA0200000u))
++                return false;
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            return size <= IopMemory::RamSize - physical && memory.ownsRamRange(address, size);
++        }
++
++        [[noreturn]] void packetFailure(uint32_t sid, std::string_view cause)
++        {
++            throw std::runtime_error("Physical IOP packet RPC SID " + std::to_string(sid) + ": " + std::string(cause));
++        }
++    }
++
+     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
+         : m_host(host), m_memory(memory), m_kernel(kernel)
+     {
+@@ -23,6 +46,7 @@ namespace ps2x::iop::detail
+         m_servers.clear();
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
++        m_packetCallActive = false;
+     }
+ 
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+@@ -40,6 +64,8 @@ namespace ps2x::iop::detail
+             return true;
+         case 7: // sceSifSetDma
+         {
++            if (m_packetCallActive)
++                throw std::runtime_error("Physical IOP packet RPC: callback SIF DMA requires an ordered packet transport");
+             constexpr uint32_t kDescriptorSize = 16u;
+             constexpr uint32_t kMaxDescriptors = 32u;
+             const uint32_t descriptorAddress = cpu.gpr[4];
+@@ -126,8 +152,7 @@ namespace ps2x::iop::detail
+             setV0(m_sifInitialized ? 1u : 0u);
+             return true;
+         default:
+-            setV0(0u);
+-            return true;
++            return false; // resolve a real export or let the caller apply its strict/legacy missing-import policy
+         }
+     }
+ 
+@@ -140,6 +165,9 @@ namespace ps2x::iop::detail
+         switch (ordinal)
+         {
+         case 4: // InitCmd
++        case 14: // InitRpc
++            setV0(0);
++            return true;
+         case 5:
+         case 6:
+         case 7:
+@@ -147,14 +175,17 @@ namespace ps2x::iop::detail
+         case 9:
+         case 10:
+         case 11:
+-        case 14: // InitRpc
+         case 15:
+         case 16:
++            if (m_packetCallActive)
++                return false;
+             setV0(0);
+             return true;
+         case 12: // sceSifSendCmd
+         case 13: // isceSifSendCmd
+         {
++            if (m_packetCallActive)
++                throw std::runtime_error("Physical IOP packet RPC: callback SIF command requires an ordered packet transport");
+             constexpr uint32_t kHeaderSize = 16u;
+             constexpr uint32_t kMaxPacketSize = 112u;
+             const uint32_t commandId = cpu.gpr[4];
+@@ -231,6 +262,8 @@ namespace ps2x::iop::detail
+             return true;
+         }
+         case 18:
++            if (m_packetCallActive)
++                return false;
+             setV0(0);
+             return true;
+         case 19: // SetRpcQueue
+@@ -238,6 +271,8 @@ namespace ps2x::iop::detail
+             return true;
+         case 20:
+         case 21:
++            if (m_packetCallActive)
++                return false;
+             setV0(0);
+             return true;
+         case 22: // RpcLoop
+@@ -245,6 +280,8 @@ namespace ps2x::iop::detail
+             setV0(0);
+             return true;
+         case 23:
++            if (m_packetCallActive)
++                return false;
+             setV0(0);
+             return true;
+         case 24: // RemoveRpc
+@@ -266,6 +303,8 @@ namespace ps2x::iop::detail
+         case 27:
+         case 28:
+         case 29:
++            if (m_packetCallActive)
++                return false;
+             setV0(0);
+             return true;
+         default:
+@@ -320,6 +359,90 @@ namespace ps2x::iop::detail
+         return result;
+     }
+ 
++    void IopRpcBridge::validatePacketServer(const RpcServer &server) const
++    {
++        // The server pointer is opaque on the wire. Validate the fields already
++        // touched by this RegisterRpc model, without inferring a firmware-specific
++        // complete SifRpcServerData layout from the EE packet ABI.
++        if (server.serverData == 0u || (server.serverData & 3u) != 0u ||
++            !ownedPacketRange(m_memory, server.serverData, 0x30u))
++            packetFailure(server.sid, "registered server data is outside aligned owned IOP RAM");
++        if (server.function == 0u || (server.function & 3u) != 0u ||
++            !ownedPacketRange(m_memory, server.function, 4u))
++            packetFailure(server.sid, "registered callback is outside aligned owned IOP RAM");
++        if (server.buffer != 0u && !ownedPacketRange(m_memory, server.buffer, 1u))
++            packetFailure(server.sid, "registered request buffer is outside owned IOP RAM");
++        if (server.callbackBuffer != 0u && !ownedPacketRange(m_memory, server.callbackBuffer, 1u))
++            packetFailure(server.sid, "registered callback buffer is outside owned IOP RAM");
++    }
++
++    bool IopRpcBridge::getPacketServer(uint32_t sid, uint32_t &serverOut,
++                                       uint32_t &bufferOut, uint32_t &callbackBufferOut) const
++    {
++        serverOut = bufferOut = callbackBufferOut = 0u;
++        const auto server = m_servers.find(sid);
++        if (server == m_servers.end())
++            return false;
++        validatePacketServer(server->second);
++        serverOut = server->second.serverData;
++        bufferOut = server->second.buffer;
++        callbackBufferOut = server->second.callbackBuffer;
++        return true;
++    }
++
++    void IopRpcBridge::validatePacketCall(uint32_t sid, uint32_t serverAddress,
++                                         uint32_t sendSize, uint32_t receiveSize) const
++    {
++        const auto server = m_servers.find(sid);
++        if (server == m_servers.end())
++            packetFailure(sid, "no registered guest server");
++        validatePacketServer(server->second);
++        if (serverAddress != server->second.serverData)
++            packetFailure(sid, "CALL server identity does not match its BIND result");
++        if (sendSize > IopMemory::RamSize || receiveSize > IopMemory::RamSize)
++            packetFailure(sid, "payload size exceeds IOP RAM");
++        if (sendSize != 0u && (server->second.buffer == 0u ||
++                             !ownedPacketRange(m_memory, server->second.buffer, sendSize)))
++            packetFailure(sid, "complete request buffer is outside owned IOP RAM");
++    }
++
++    std::vector<uint8_t> IopRpcBridge::executePacketCall(uint32_t sid, uint32_t serverAddress, uint32_t function,
++                                                       std::span<const uint8_t> input, uint32_t receiveSize,
++                                                       IopGuestExecutor &executor)
++    {
++        if (input.size() > IopMemory::RamSize)
++            packetFailure(sid, "payload size exceeds IOP RAM");
++        validatePacketCall(sid, serverAddress, static_cast<uint32_t>(input.size()), receiveSize);
++        if (m_packetCallActive)
++            packetFailure(sid, "reentrant packet callback is unsupported");
++
++        // The guest may register/remove services while its callback runs. Keep a
++        // value snapshot, never a map reference which that code could invalidate.
++        const RpcServer server = m_servers.at(sid);
++        struct PacketCallGuard
++        {
++            bool &active;
++            explicit PacketCallGuard(bool &value) : active(value) { active = true; }
++            ~PacketCallGuard() { active = false; }
++        } guard(m_packetCallActive);
++        if (!input.empty() && !m_memory.writeRam(server.buffer, input.data(), input.size()))
++            packetFailure(sid, "validated request copy failed");
++
++        const uint32_t resultAddress = executor.executeGuestFunction(server.function, function, server.buffer,
++                                                                     static_cast<uint32_t>(input.size()), 0u, server.gp);
++        if (receiveSize == 0u)
++            return {};
++        if (resultAddress == 0u || !ownedPacketRange(m_memory, resultAddress, receiveSize))
++            packetFailure(sid, "callback did not return the complete requested result in owned IOP RAM");
++
++        std::vector<uint8_t> result(receiveSize);
++        if (!m_memory.readRam(resultAddress, result.data(), result.size()))
++            packetFailure(sid, "validated callback result read failed");
++        // The caller owns EE payload DMA and END-packet ordering. There are no
++        // direct EE reads/writes, zero padding, or null-result substitutions here.
++        return result;
++    }
++
+     void IopRpcBridge::onSifTransfer(const SifTransfer &transfer)
+     {
+         // The EE SIF transport owns the actual directional memory movement.
+@@ -331,10 +454,20 @@ namespace ps2x::iop::detail
+ 
+     void IopRpcBridge::removeServersInRange(uint32_t base, uint32_t size)
+     {
++        const auto overlaps = [base, size](uint32_t address, uint32_t bytes)
++        {
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            return address != 0u && uint64_t(physical) < uint64_t(base) + size &&
++                   uint64_t(base) < uint64_t(physical) + bytes;
++        };
+         for (auto server = m_servers.begin(); server != m_servers.end();)
+         {
+-            const uint32_t function = IopMemory::physicalAddress(server->second.function);
+-            if (function >= base && function < base + size)
++            const RpcServer &entry = server->second;
++            // Registration data can belong to a different module from the
++            // callback. Retiring either owner invalidates the whole binding.
++            if (overlaps(entry.function, 4u) || overlaps(entry.callback, 4u) ||
++                overlaps(entry.serverData, 0x30u) || overlaps(entry.buffer, 1u) ||
++                overlaps(entry.callbackBuffer, 1u) || overlaps(entry.queue, 1u))
+                 server = m_servers.erase(server);
+             else
+                 ++server;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba3c21ef56174780d4821a7469681e1091a..eb3fd48fa642cdeddd7d1bc350759cae83d2ff06 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -4,7 +4,9 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <span>
+ #include <unordered_map>
++#include <vector>
+ 
+ namespace ps2x::iop
+ {
+@@ -49,6 +51,12 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
++        [[nodiscard]] bool getPacketServer(uint32_t sid, uint32_t &serverOut,
++                                           uint32_t &bufferOut, uint32_t &callbackBufferOut) const;
++        void validatePacketCall(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const;
++        [[nodiscard]] std::vector<uint8_t> executePacketCall(uint32_t sid, uint32_t server, uint32_t function,
++                                                           std::span<const uint8_t> input, uint32_t receiveSize,
++                                                           IopGuestExecutor &executor);
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+@@ -68,11 +76,14 @@ namespace ps2x::iop::detail
+             uint32_t queue = 0;
+         };
+ 
++        void validatePacketServer(const RpcServer &server) const;
++
+         IopHost &m_host;
+         IopMemory &m_memory;
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
++        bool m_packetCallActive = false;
+     };
+ }
+diff --git a/ps2xIOP/src/iop_sif_command.cpp b/ps2xIOP/src/iop_sif_command.cpp
+index cec43a32db745a5a3f6f3f1cec4aae7c17bde694..cf01984f9f06ed45580f40233cf0e6517efb377f 100644
+--- a/ps2xIOP/src/iop_sif_command.cpp
++++ b/ps2xIOP/src/iop_sif_command.cpp
+@@ -10,6 +10,7 @@ namespace ps2x::iop::detail
+     {
+         constexpr uint32_t kSetSreg = 0x80000001u;
+         constexpr uint32_t kInit = 0x80000002u;
++        constexpr uint32_t kReset = 0x80000003u;
+         constexpr uint32_t kRpcEnd = 0x80000008u;
+         constexpr uint32_t kRpcBind = 0x80000009u;
+         constexpr uint32_t kRpcCall = 0x8000000Au;
+@@ -43,6 +44,26 @@ namespace ps2x::iop::detail
+             return size <= ramSize && physical <= ramSize - size;
+         }
+ 
++        std::string resetImagePath(std::span<const uint8_t> packet)
++        {
++            // The public RESET command carries a byte count, not necessarily a
++            // NUL-terminated string. The original EE protocol uses 80 bytes.
++            if (packet.size() < 104u || word(packet, 20u) != 0u)
++                throw std::runtime_error("Unsupported or truncated IOP RESET mode/packet");
++            const uint32_t length = word(packet, 16u);
++            if (length == 0u || length > 80u)
++                throw std::runtime_error("IOP RESET argument length exceeds its bounded 80-byte field");
++            const std::string arguments(packet.begin() + 24u, packet.begin() + 24u + length);
++            constexpr std::string_view prefix = "rom0:UDNL ";
++            if (!arguments.starts_with(prefix))
++                throw std::runtime_error("IOP RESET requires a supported UDNL replacement-image request; no ROM firmware is available");
++            const std::string path = arguments.substr(prefix.size());
++            if (path.empty() || std::any_of(path.begin(), path.end(), [](unsigned char value)
++                { return value <= 0x20u || value == 0x7Fu; }))
++                throw std::runtime_error("IOP RESET supports one bounded unquoted replacement-image path");
++            return path;
++        }
++
+         [[noreturn]] void unsupported(uint32_t command)
+         {
+             std::ostringstream out;
+@@ -73,6 +94,8 @@ namespace ps2x::iop::detail
+         m_sregs.fill(0u);
+         m_servers.clear();
+         m_replies.clear();
++        m_pendingRebootImage.clear();
++        m_pendingRebootPath.clear();
+         m_bootstrap.reset();
+     }
+ 
+@@ -91,9 +114,21 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopSifCommand::getRegister(uint32_t reg)
+     {
+-        if (reg == 2u || reg == 4u)
++        if (reg == 4u && !m_pendingRebootImage.empty())
+         {
++            // Completion is observed by the subsequent SMFLAG poll, after the
++            // EE has acknowledged old SIFINIT/CMDINIT bits. A write never boots
++            // the IOP or manufactures BOOTEND.
++            auto image = std::move(m_pendingRebootImage);
++            auto path = std::move(m_pendingRebootPath);
++            m_owner->rebootFromImage(std::move(path), std::move(image));
+             initialize();
++            m_smFlags |= 0x00040000u;
++        }
++        if (reg == 2u || reg == 4u)
++        {
++            if (m_pendingRebootImage.empty())
++                initialize();
+             return reg == 2u ? m_endpoint : m_smFlags;
+         }
+         const auto entry = m_registers.find(reg);
+@@ -102,7 +137,12 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopSifCommand::setRegister(uint32_t reg, uint32_t value)
+     {
+-        const uint32_t previous = getRegister(reg);
++        // Acknowledge writes must not run the deferred boot completion path.
++        if ((reg == 2u || reg == 4u) && m_pendingRebootImage.empty())
++            initialize();
++        const auto entry = m_registers.find(reg);
++        const uint32_t previous = reg == 2u ? m_endpoint : reg == 4u ? m_smFlags :
++            entry == m_registers.end() ? 0u : entry->second;
+         if (reg == 4u)
+             m_smFlags &= ~value; // EE writes acknowledge/clear IOP -> EE flags.
+         else if (reg == 3u)
+@@ -129,18 +169,25 @@ namespace ps2x::iop::detail
+         validateWithState(packet, m_eeReceiveAddress, m_peerRpcInitialized, m_replies.size());
+     }
+ 
+-    void IopSifCommand::validateBatch(std::span<const SifCommandPacket> packets) const
++    void IopSifCommand::validateBatch(std::span<SifCommandPacket> packets) const
+     {
+         uint32_t receiveAddress = m_eeReceiveAddress;
+         bool peerInitialized = m_peerRpcInitialized;
+         size_t replies = m_replies.size();
+         size_t rpcRequests = 0u;
+-        for (const SifCommandPacket &packet : packets)
++        for (SifCommandPacket &packet : packets)
+         {
+             try
+             {
+                 validateWithState(packet.bytes, receiveAddress, peerInitialized, replies);
+                 const uint32_t command = word(packet.bytes, 8u);
++                if (command == kReset)
++                {
++                    if (packets.size() != 1u)
++                        throw std::runtime_error("IOP RESET requires an exclusive command batch");
++                    packet.rebootPath = resetImagePath(packet.bytes);
++                    packet.rebootImage = m_owner->readRebootImage(packet.rebootPath);
++                }
+                 if ((command == kRpcBind || command == kRpcCall || command == kRpcRead) && ++rpcRequests > 1u)
+                     throw std::runtime_error("Multiple RPC requests in one DMA batch require unsupported transactional service execution");
+                 if (command == kRpcCall)
+@@ -156,8 +203,12 @@ namespace ps2x::iop::detail
+                     }
+                     if (input.size() != word(packet.bytes, 36u))
+                         throw std::runtime_error("SIF RPC input snapshot length disagrees with the CALL packet");
+-                    m_bootstrap.validate(serverAt(word(packet.bytes, 52u))->sid, word(packet.bytes, 32u),
+-                                         input, word(packet.bytes, 44u));
++                    const Server &server = *serverAt(word(packet.bytes, 52u));
++                    if (server.guest)
++                        m_owner->validatePacketRpc(server.sid, server.address,
++                                                   static_cast<uint32_t>(input.size()), word(packet.bytes, 44u));
++                    else
++                        m_bootstrap.validate(server.sid, word(packet.bytes, 32u), input, word(packet.bytes, 44u));
+                 }
+                 if (command == kInit)
+                 {
+@@ -188,6 +239,13 @@ namespace ps2x::iop::detail
+             (word(packet, 0u) & 0xFFu) != packet.size())
+             throw std::runtime_error("Malformed or uninitialized IOP SIF command packet");
+         const uint32_t command = word(packet, 8u);
++        if (!m_pendingRebootImage.empty())
++            throw std::runtime_error("SIF command received while the IOP reset is still in progress");
++        if (command == kReset)
++        {
++            (void)resetImagePath(packet);
++            return;
++        }
+         const bool needsReply = (command == kInit && word(packet, 12u) == 0u) ||
+                                 command == kRpcBind || command == kRpcCall || command == kRpcRead;
+         if (needsReply && queuedReplies >= kMaxReplies)
+@@ -223,6 +281,11 @@ namespace ps2x::iop::detail
+         const uint32_t clientSize = command == kRpcRead ? 28u : 40u;
+         if (client == 0u || !eeRange(client, clientSize) || requestAddress == 0u || !eeRange(requestAddress, 64u))
+             throw std::runtime_error("SIF RPC packet contains an invalid EE client or request address");
++        if (command == kRpcBind)
++        {
++            uint32_t server = 0u, buffer = 0u, callback = 0u;
++            (void)m_owner->getPacketRpcServer(word(packet, 32u), server, buffer, callback);
++        }
+         if (command == kRpcCall)
+         {
+             const Server *server = serverAt(word(packet, 52u));
+@@ -235,6 +298,8 @@ namespace ps2x::iop::detail
+                 (receiveSize != 0u && (receiveAddress == 0u || !eeRange(receiveAddress, receiveSize))) ||
+                 word(packet, 48u) > 1u)
+                 throw std::runtime_error("SIF RPC CALL buffer or completion mode is outside supported bounds");
++            if (server->guest)
++                m_owner->validatePacketRpc(server->sid, server->address, sendSize, receiveSize);
+         }
+         else if (command == kRpcRead)
+         {
+@@ -272,9 +337,30 @@ namespace ps2x::iop::detail
+ 
+     IopSifCommand::Server *IopSifCommand::findServer(uint32_t sid)
+     {
+-        for (Server &server : m_servers)
+-            if (server.sid == sid)
+-                return &server;
++        const auto found = std::find_if(m_servers.begin(), m_servers.end(),
++            [sid](const Server &server) { return server.sid == sid; });
++        uint32_t address = 0u, buffer = 0u, callbackBuffer = 0u;
++        if (m_owner->getPacketRpcServer(sid, address, buffer, callbackBuffer))
++        {
++            if (found != m_servers.end())
++            {
++                if (!found->guest)
++                    (void)m_owner->freeMemory(found->address);
++                *found = {sid, address, buffer, callbackBuffer, true};
++                return &*found;
++            }
++            m_servers.push_back({sid, address, buffer, callbackBuffer, true});
++            return &m_servers.back();
++        }
++        if (found != m_servers.end())
++        {
++            if (!found->guest)
++                return &*found;
++            // Unloading a guest service invalidates its handles. Keep its SID
++            // ownership until reset instead of silently substituting a model.
++            found->address = found->buffer = found->callbackBuffer = 0u;
++            return nullptr;
++        }
+         if (!m_bootstrap.supports(sid))
+             return nullptr;
+         const uint32_t allocation = m_owner->allocateMemory(64u + kServerBufferSize, 64u);
+@@ -292,18 +378,34 @@ namespace ps2x::iop::detail
+ 
+     void IopSifCommand::receive(std::span<const uint8_t> packet)
+     {
+-        execute(packet, nullptr);
++        SifCommandPacket prepared;
++        prepared.bytes.assign(packet.begin(), packet.end());
++        validateBatch({&prepared, 1u});
++        execute(prepared.bytes, &prepared);
+     }
+ 
+     void IopSifCommand::receive(const SifCommandPacket &packet)
+     {
+-        execute(packet.bytes, packet.hasRpcInput ? &packet.rpcInput : nullptr);
++        execute(packet.bytes, &packet);
+     }
+ 
+-    void IopSifCommand::execute(std::span<const uint8_t> packet, const std::vector<uint8_t> *rpcInput)
++    void IopSifCommand::execute(std::span<const uint8_t> packet, const SifCommandPacket *prepared)
+     {
+         validate(packet);
+         const uint32_t command = word(packet, 8u);
++        if (command == kReset)
++        {
++            const std::string path = resetImagePath(packet);
++            if (!prepared || prepared->rebootPath != path || prepared->rebootImage.empty())
++                throw std::runtime_error("IOP RESET lacks its prevalidated replacement-image snapshot");
++            auto image = prepared->rebootImage;
++            // Stop old IOP threads and discard old handles/replies immediately.
++            // Boot completion is deferred until the normal subsequent flag poll.
++            m_owner->reset();
++            m_pendingRebootPath = path;
++            m_pendingRebootImage = std::move(image);
++            return;
++        }
+         if (command == kInit)
+         {
+             if (word(packet, 12u) == 0u)
+@@ -327,12 +429,14 @@ namespace ps2x::iop::detail
+             {
+                 put(reply.packet, 36u, server->address);
+                 put(reply.packet, 40u, server->buffer);
++                put(reply.packet, 44u, server->callbackBuffer);
+             }
+         }
+         else if (command == kRpcCall)
+         {
+-            const Server &server = *serverAt(word(packet, 52u));
++            const Server server = *serverAt(word(packet, 52u));
+             std::vector<uint8_t> input(word(packet, 36u));
++            const std::vector<uint8_t> *rpcInput = prepared && prepared->hasRpcInput ? &prepared->rpcInput : nullptr;
+             if (rpcInput)
+             {
+                 if (rpcInput->size() != input.size())
+@@ -342,7 +446,9 @@ namespace ps2x::iop::detail
+             else if (!m_owner->readMemory(server.buffer, input.data(), input.size()))
+                 throw std::runtime_error("Cannot read SIF RPC request bytes from IOP RAM");
+             reply.dataAddress = word(packet, 40u);
+-            reply.data = m_bootstrap.call(server.sid, word(packet, 32u), input, word(packet, 44u));
++            reply.data = server.guest
++                ? m_owner->executePacketRpc(server.sid, server.address, word(packet, 32u), input, word(packet, 44u))
++                : m_bootstrap.call(server.sid, word(packet, 32u), input, word(packet, 44u));
+             if (reply.data.size() > word(packet, 44u))
+                 throw std::runtime_error("IOP SIF RPC service exceeded the requested reply size");
+             if (word(packet, 48u) == 0u)
+diff --git a/ps2xIOP/src/iop_sif_command.h b/ps2xIOP/src/iop_sif_command.h
+index 707a7da20234b5f70d87d014f2ef03cb99352b05..90b2dd5b59dde6b5ed8cdb200b09e323e55fec1c 100644
+--- a/ps2xIOP/src/iop_sif_command.h
++++ b/ps2xIOP/src/iop_sif_command.h
+@@ -21,7 +21,7 @@ namespace ps2x::iop::detail
+         bool accepts(uint32_t destination) const noexcept;
+         bool initialized() const noexcept { return m_endpoint != 0u; }
+         void validate(std::span<const uint8_t> packet) const;
+-        void validateBatch(std::span<const SifCommandPacket> packets) const;
++        void validateBatch(std::span<SifCommandPacket> packets) const;
+         void receive(std::span<const uint8_t> packet);
+         void receive(const SifCommandPacket &packet);
+         uint32_t rpcBuffer(uint32_t server) const noexcept;
+@@ -36,12 +36,14 @@ namespace ps2x::iop::detail
+             uint32_t sid = 0u;
+             uint32_t address = 0u;
+             uint32_t buffer = 0u;
++            uint32_t callbackBuffer = 0u;
++            bool guest = false;
+         };
+         void initialize();
+         void validateWithState(std::span<const uint8_t> packet, uint32_t eeReceiveAddress,
+                                bool peerRpcInitialized, size_t queuedReplies) const;
+         void queueReady();
+-        void execute(std::span<const uint8_t> packet, const std::vector<uint8_t> *rpcInput);
++        void execute(std::span<const uint8_t> packet, const SifCommandPacket *prepared);
+         SifEeReply makeEnd(std::span<const uint8_t> request) const;
+         Server *findServer(uint32_t sid);
+         const Server *serverAt(uint32_t address) const;
+@@ -56,5 +58,7 @@ namespace ps2x::iop::detail
+         std::array<uint32_t, 32> m_sregs{};
+         std::vector<Server> m_servers;
+         std::deque<SifEeReply> m_replies;
++        std::vector<uint8_t> m_pendingRebootImage;
++        std::string m_pendingRebootPath;
+     };
+ }
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b3f58371fce870ead3b23858aef2939444d8a4a6..92b61020500f702f81e81a364f115b704e9420c6 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -3,11 +3,13 @@
+ #include "iop_service.h"
+ #include "iop_module_manager.h"
+ #include "iop_sif_command.h"
++#include "iop_boot_image.h"
+ #include "emulator/iop_emulator.h"
+ #include "module_factories.h"
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include <sstream>
++#include <algorithm>
+ #include <stdexcept>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -15,6 +17,20 @@
+ 
+ namespace ps2x::iop
+ {
++    namespace
++    {
++        detail::BootImageEntry loadfileEntry(std::span<const uint8_t> image)
++        {
++            const auto directory = detail::parseBootImage(image);
++            const auto entry = std::find_if(directory.entries.begin(), directory.entries.end(),
++                [](const auto &candidate) { return candidate.name == "LOADFILE"; });
++            if (entry == directory.entries.end())
++                throw std::runtime_error("IOP reset image lacks LOADFILE; no ROM firmware provider is available");
++            detail::IopEmulator::validateModuleImage(detail::bootImageEntryBytes(image, *entry));
++            return *entry;
++        }
++    }
++
+     class IopSubsystem::Impl
+     {
+     public:
+@@ -90,6 +106,9 @@ namespace ps2x::iop
+         detail::IopModuleManager moduleManager;
+         detail::IopEmulator emulator;
+         detail::IopSifCommand sifCommand;
++        std::string bootImagePath;
++        std::vector<uint8_t> bootImage;
++        std::string bootFailure;
+     };
+ 
+     IopSubsystem::IopSubsystem(IopHost &host)
+@@ -118,6 +137,9 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::reset()
+     {
++        m_impl->bootFailure.clear();
++        m_impl->bootImagePath.clear();
++        m_impl->bootImage.clear();
+         m_impl->moduleManager.reset();
+         m_impl->loadOutcomes.clear();
+         m_impl->loggedLoadPaths.clear();
+@@ -134,8 +156,84 @@ namespace ps2x::iop
+         m_impl->rebuildRoutes();
+     }
+ 
++    std::vector<uint8_t> IopSubsystem::readRebootImage(std::string_view path) const
++    {
++        auto &host = m_impl->host;
++        const std::string translated = host.translateGuestPath(path);
++        if (translated.empty())
++            throw std::runtime_error("Cannot resolve IOP reset image through the mounted guest filesystem: " + std::string(path));
++        const uint64_t handle = host.openHostFile(translated);
++        if (handle == 0u)
++            throw std::runtime_error("Cannot open requested IOP reset image: " + std::string(path));
++        struct CloseFile
++        {
++            IopHost &host;
++            uint64_t handle;
++            ~CloseFile() { host.closeHostFile(handle); }
++        } close{host, handle};
++        uint64_t size = 0u;
++        if (!host.hostFileSize(handle, size) || size < 64u || size > detail::kMaxBootImageBytes)
++            throw std::runtime_error("IOP reset image size is outside the bounded ROMDIR parser range");
++        std::vector<uint8_t> image(static_cast<size_t>(size));
++        size_t bytesRead = 0u;
++        if (!host.readHostFile(handle, 0u, image.data(), image.size(), bytesRead) || bytesRead != image.size())
++            throw std::runtime_error("Cannot read complete requested IOP reset image");
++        (void)loadfileEntry(image);
++        return image;
++    }
++
++    void IopSubsystem::rebootFromImage(std::string path, std::vector<uint8_t> image)
++    {
++        // ROMDIR is an inventory, not the firmware boot order. This model resets
++        // its owned kernel/allocator and executes the supplied LOADFILE service;
++        // it never invokes SYSMEM/LOADCORE with a guessed ordinary IRX ABI.
++        const auto entry = loadfileEntry(image);
++        reset();
++        try
++        {
++            m_impl->bootImagePath = std::move(path);
++            m_impl->bootImage = std::move(image);
++            (void)m_impl->sifCommand.getRegister(2u);
++            const auto loaded = loadModuleImage("rom0:LOADFILE",
++                detail::bootImageEntryBytes(m_impl->bootImage, entry));
++            if (loaded.moduleId <= 0 || (static_cast<uint32_t>(loaded.startResult) & 3u) == 1u)
++                throw std::runtime_error("IOP reset LOADFILE entry did not return resident");
++            bool registered = false;
++            for (uint32_t slice = 0u; slice < 1024u; ++slice)
++            {
++                uint32_t server = 0u, buffer = 0u, callback = 0u;
++                if (getPacketRpcServer(0x80000006u, server, buffer, callback))
++                {
++                    registered = true;
++                    break;
++                }
++                runEeCycles(8192u);
++                checkExecutionFailure();
++            }
++            if (!registered)
++                throw std::runtime_error("IOP reset LOADFILE service did not register its RPC server within the bounded boot interval");
++            const std::string diagnostic = "[IOP:modeled-reset] image='" + m_impl->bootImagePath +
++                "' kernel/allocator modeled; original LOADFILE entry and RPC registration completed; ROM firmware was not executed";
++            m_impl->loadOutcomes.push_back(diagnostic);
++            m_impl->host.log(LogLevel::Info, diagnostic);
++        }
++        catch (const std::exception &error)
++        {
++            m_impl->bootFailure = std::string("IOP reset failed: ") + error.what();
++            m_impl->sifCommand.reset();
++            throw std::runtime_error(m_impl->bootFailure);
++        }
++        catch (...)
++        {
++            m_impl->bootFailure = "IOP reset failed with an unknown exception";
++            m_impl->sifCommand.reset();
++            throw;
++        }
++    }
++
+     ModuleLoadResult IopSubsystem::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        checkExecutionFailure();
+         const ParsedPs2Path parsed = parsePs2Path(path);
+         if (!parsed)
+             return {true, -1, -1};
+@@ -167,11 +265,13 @@ namespace ps2x::iop
+ 
+     ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+     {
++        checkExecutionFailure();
+         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
+     ModuleLoadResult IopSubsystem::loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize)
+     {
++        checkExecutionFailure();
+         ModuleLoadResult result = m_impl->emulator.loadModuleStrict(path, arguments, argumentSize);
+         if (result.moduleId > 0 && (static_cast<uint32_t>(result.startResult) & 3u) != 1u)
+         {
+@@ -184,6 +284,7 @@ namespace ps2x::iop
+     ModuleLoadResult IopSubsystem::loadModuleImage(std::string_view path, std::span<const uint8_t> image,
+                                                  const void *arguments, uint32_t argumentSize)
+     {
++        checkExecutionFailure();
+         ModuleLoadResult result = m_impl->emulator.loadModuleImage(path, image, arguments, argumentSize);
+         if (result.moduleId > 0 && (static_cast<uint32_t>(result.startResult) & 3u) != 1u)
+         {
+@@ -195,11 +296,13 @@ namespace ps2x::iop
+ 
+     ModuleLoadResult IopSubsystem::loadModuleIopBuffer(uint32_t iopAddress, const void *arguments, uint32_t argumentSize)
+     {
++        checkExecutionFailure();
+         return m_impl->emulator.loadModuleIopBuffer(iopAddress, arguments, argumentSize);
+     }
+ 
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+     {
++        checkExecutionFailure();
+         if (m_impl->moduleManager.stopHle(moduleId, result))
+         {
+             m_impl->rebuildRoutes();
+@@ -214,11 +317,14 @@ namespace ps2x::iop
+ 
+     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        if (!m_impl->bootFailure.empty())
++            return;
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
+     uint32_t IopSubsystem::callCdvdImport(uint16_t ordinal, uint32_t a0)
+     {
++        checkExecutionFailure();
+         return m_impl->emulator.callCdvdImport(ordinal, a0);
+     }
+ 
+@@ -240,6 +346,8 @@ namespace ps2x::iop
+ 
+     bool IopSubsystem::canBindRpc(uint32_t sid) const noexcept
+     {
++        if (!m_impl->bootFailure.empty())
++            return false;
+         if (m_impl->routes.find(sid) != m_impl->routes.end())
+         {
+             return true;
+@@ -249,6 +357,7 @@ namespace ps2x::iop
+ 
+     RpcResult IopSubsystem::handleRpc(const RpcRequest &request)
+     {
++        checkExecutionFailure();
+         const auto route = m_impl->routes.find(request.sid);
+         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+ 
+@@ -260,8 +369,29 @@ namespace ps2x::iop
+         return hle->handleRpc(request);
+     }
+ 
++    bool IopSubsystem::getPacketRpcServer(uint32_t sid, uint32_t &server, uint32_t &buffer,
++                                           uint32_t &callbackBuffer) const
++    {
++        checkExecutionFailure();
++        return m_impl->emulator.getPacketRpcServer(sid, server, buffer, callbackBuffer);
++    }
++
++    void IopSubsystem::validatePacketRpc(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const
++    {
++        checkExecutionFailure();
++        m_impl->emulator.validatePacketRpc(sid, server, sendSize, receiveSize);
++    }
++
++    std::vector<uint8_t> IopSubsystem::executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
++                                                       std::span<const uint8_t> input, uint32_t receiveSize)
++    {
++        checkExecutionFailure();
++        return m_impl->emulator.executePacketRpc(sid, server, function, input, receiveSize);
++    }
++
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+     {
++        checkExecutionFailure();
+         for (auto &service : m_impl->coreServices)
+         {
+             if (service && m_impl->serviceActive(*service))
+@@ -272,48 +402,82 @@ namespace ps2x::iop
+         m_impl->emulator.onSifTransfer(transfer);
+     }
+ 
+-    uint32_t IopSubsystem::getSifRegister(uint32_t reg) { return m_impl->sifCommand.getRegister(reg); }
+-    uint32_t IopSubsystem::setSifRegister(uint32_t reg, uint32_t value) { return m_impl->sifCommand.setRegister(reg, value); }
+-    bool IopSubsystem::acceptsSifCommand(uint32_t destination) const noexcept { return m_impl->sifCommand.accepts(destination); }
+-    bool IopSubsystem::sifCommandsInitialized() const noexcept { return m_impl->sifCommand.initialized(); }
++    uint32_t IopSubsystem::getSifRegister(uint32_t reg)
++    {
++        checkExecutionFailure();
++        return m_impl->sifCommand.getRegister(reg);
++    }
++    uint32_t IopSubsystem::setSifRegister(uint32_t reg, uint32_t value)
++    {
++        checkExecutionFailure();
++        return m_impl->sifCommand.setRegister(reg, value);
++    }
++    bool IopSubsystem::acceptsSifCommand(uint32_t destination) const noexcept
++    {
++        return m_impl->bootFailure.empty() && m_impl->sifCommand.accepts(destination);
++    }
++    bool IopSubsystem::sifCommandsInitialized() const noexcept
++    {
++        return m_impl->bootFailure.empty() && m_impl->sifCommand.initialized();
++    }
+     void IopSubsystem::validateSifCommand(const void *packet, size_t size) const
+     {
++        checkExecutionFailure();
+         if (!packet && size != 0u)
+             throw std::invalid_argument("Null SIF command packet");
+         m_impl->sifCommand.validate({static_cast<const uint8_t *>(packet), size});
+     }
+     void IopSubsystem::receiveSifCommand(const void *packet, size_t size)
+     {
++        checkExecutionFailure();
+         if (!packet && size != 0u)
+             throw std::invalid_argument("Null SIF command packet");
+         m_impl->sifCommand.receive({static_cast<const uint8_t *>(packet), size});
+     }
+     void IopSubsystem::receiveSifCommandPacket(const SifCommandPacket &packet)
+     {
++        checkExecutionFailure();
+         m_impl->sifCommand.receive(packet);
+     }
+     uint32_t IopSubsystem::sifRpcBuffer(uint32_t server) const noexcept { return m_impl->sifCommand.rpcBuffer(server); }
+-    void IopSubsystem::checkExecutionFailure() const { m_impl->emulator.checkExecutionFailure(); }
++    void IopSubsystem::checkExecutionFailure() const
++    {
++        if (!m_impl->bootFailure.empty())
++            throw std::runtime_error(m_impl->bootFailure);
++        m_impl->emulator.checkExecutionFailure();
++    }
+ 
+-    void IopSubsystem::validateSifCommandBatch(std::span<const SifCommandPacket> packets) const
++    void IopSubsystem::validateSifCommandBatch(std::span<SifCommandPacket> packets) const
+     {
++        checkExecutionFailure();
+         m_impl->sifCommand.validateBatch(packets);
+     }
+     uint32_t IopSubsystem::sifEeReceiveAddress() const noexcept { return m_impl->sifCommand.eeReceiveAddress(); }
+-    bool IopSubsystem::peekSifReply(SifEeReply &reply) const { return m_impl->sifCommand.peekReply(reply); }
+-    void IopSubsystem::consumeSifReply() { m_impl->sifCommand.consumeReply(); }
++    bool IopSubsystem::peekSifReply(SifEeReply &reply) const
++    {
++        checkExecutionFailure();
++        return m_impl->sifCommand.peekReply(reply);
++    }
++    void IopSubsystem::consumeSifReply()
++    {
++        checkExecutionFailure();
++        m_impl->sifCommand.consumeReply();
++    }
+     bool IopSubsystem::queueSifCommand(uint32_t command, const void *packet, size_t size)
+     {
++        checkExecutionFailure();
+         return packet && m_impl->sifCommand.queueCommand(command, {static_cast<const uint8_t *>(packet), size});
+     }
+ 
+     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+     {
++        checkExecutionFailure();
+         return m_impl->emulator.allocateMemory(size, alignment);
+     }
+ 
+     bool IopSubsystem::freeMemory(uint32_t address)
+     {
++        checkExecutionFailure();
+         return m_impl->emulator.freeMemory(address);
+     }
+ 
+@@ -346,6 +510,8 @@ namespace ps2x::iop
+         snapshot.emulatorThreads = m_impl->emulator.threadCount();
+         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
+         snapshot.diagnostics = m_impl->loadOutcomes;
++        if (!m_impl->bootFailure.empty())
++            snapshot.diagnostics.push_back(m_impl->bootFailure);
+         if (!m_impl->lastError.empty())
+         {
+             snapshot.diagnostics.push_back(m_impl->lastError);
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index e782bea46e16d33a047f12b31d27cd10adbe3708..6c8173975ec8bd80eb4d758c157794613226c2d2 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -191,7 +191,7 @@ namespace
+ 
+     void missingImport()
+     {
+-        for (std::string_view name : {"absent", "dmacman"})
++        for (std::string_view name : {"absent", "dmacman", "sifman"})
+         {
+             Host host;
+             IopEmulator iop(host);
+@@ -201,6 +201,12 @@ namespace
+             require(iop.loadedModuleCount() == 0u && iop.rpcServerCount() == 0u,
+                     "unimplemented import created a successful physical module");
+         }
++        Host host;
++        IopEmulator legacy(host);
++        host.file = callsImport("sifman", 0x123u).bytes;
++        const auto result = legacy.loadModule("legacy-missing-import", nullptr, 0u);
++        require(result.moduleId > 0 && result.startResult == 0,
++                "legacy missing-import behavior changed when strict SIFMAN dispatch was fixed");
+     }
+ 
+     void exceptionAndBadPc()
+@@ -359,6 +365,229 @@ namespace
+         rejects([&] { (void)iop.handleRpc(call); }, "exception");
+     }
+ 
++    void packetRpcOriginalCallback()
++    {
++        Host host;
++        IopEmulator iop(host);
++        constexpr uint32_t sid = 0x80000006u;
++        Irx image = rpcServer(sid, 0xAABBCCDDu);
++        // The authored guest consumes the request and returns a distinct buffer.
++        // Its first result is input[0] + function + input byte count.
++        image.words(0x300u, {0x8CA80000u, 0u, 0x01044021u, 0x01064021u,
++            0x3C020001u, 0x34420450u, 0xAC480000u, 0xAC440004u,
++            0xAC460008u, 0xAC47000Cu, 0x03E00008u, 0u});
++        require(iop.loadModuleImage("packet-server", image.bytes, nullptr, 0u).moduleId > 0,
++                "authored physical service did not start");
++        uint32_t server = 0u, buffer = 0u, callbackBuffer = 1u;
++        const uint64_t before = iop.instructions();
++        require(iop.getPacketRpcServer(sid, server, buffer, callbackBuffer) &&
++                server == 0x10200u && buffer == 0x10400u && callbackBuffer == 0u,
++                "BIND metadata does not come from actual RegisterRpc arguments");
++        iop.validatePacketRpc(sid, server, 8u, 16u);
++        require(iop.instructions() == before, "packet preflight invoked guest code");
++        const std::array<uint8_t, 8> input{4u, 3u, 2u, 1u, 9u, 8u, 7u, 6u};
++        const auto output = iop.executePacketRpc(sid, server, 0x12u, input, 16u);
++        const std::vector<uint8_t> expected{0x1Eu, 3u, 2u, 1u, 0x12u, 0u, 0u, 0u,
++                                             8u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
++        require(output == expected && iop.instructions() > before,
++                "packet reply did not preserve actual callback results and ABI");
++        require(word(iop, buffer) == 0x01020304u && word(iop, buffer + 8u) == 0xAABBCCDDu,
++                "packet copy omitted request bytes or modified bytes past the request");
++        require(host.guestReads == 0u && host.guestWrites == 0u,
++                "physical packet execution bypassed ordered transport with direct EE access");
++    }
++
++    void packetRpcPreflightAndAliases()
++    {
++        constexpr uint32_t sid = 0x80000006u;
++        Host host;
++        IopEmulator iop(host);
++        const Irx image = rpcServer(sid, 0x13579BDFu);
++        const auto loaded = iop.loadModuleImage("packet-server", image.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0, "physical service did not start");
++        uint32_t server = 1u, buffer = 2u, callbackBuffer = 3u;
++        require(!iop.getPacketRpcServer(123u, server, buffer, callbackBuffer) &&
++                server == 0u && buffer == 0u && callbackBuffer == 0u,
++                "absent BIND leaked stale metadata or claimed a server");
++        require(iop.getPacketRpcServer(sid, server, buffer, callbackBuffer), "actual BIND failed");
++        const uint64_t before = iop.instructions();
++        const std::vector<uint8_t> oversized(257u, 0xFFu); // one byte beyond owned module data
++        rejects([&] { (void)iop.executePacketRpc(sid, server + 4u, 0u, {}, 4u); }, "identity");
++        rejects([&] { (void)iop.executePacketRpc(sid, server, 0u, oversized, 4u); }, "complete request buffer");
++        rejects([&] { iop.validatePacketRpc(sid, server, 0u, 0x200001u); }, "payload size");
++        rejects([&] { iop.validatePacketRpc(123u, server, 0u, 4u); }, "no registered guest server");
++        require(iop.instructions() == before && word(iop, buffer) == 0x13579BDFu &&
++                word(iop, 0x10500u) == 0u, "failed preflight executed code or partially copied the request");
++        iop.checkExecutionFailure();
++        require(iop.executePacketRpc(sid, server, 0u, {}, 4u) ==
++                std::vector<uint8_t>({0xDFu, 0x9Bu, 0x57u, 0x13u}),
++                "preflight rejection poisoned a valid later call");
++        require(iop.stopModule(loaded.moduleId, nullptr), "packet server did not unload");
++        require(!iop.getPacketRpcServer(sid, server, buffer, callbackBuffer),
++                "unloaded module remained a physical BIND target");
++
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Host aliasHost;
++            IopEmulator aliasIop(aliasHost);
++            Irx aliased = rpcServer(sid, 0x04030201u);
++            aliased.words(0x08u, {0x3C040001u | (alias >> 16u)});
++            aliased.words(0x18u, {0x3C060001u | (alias >> 16u)});
++            aliased.words(0x20u, {0x3C070001u | (alias >> 16u)});
++            aliased.words(0x300u, {0x3C020001u | (alias >> 16u)});
++            require(aliasIop.loadModuleImage("alias-server", aliased.bytes, nullptr, 0u).moduleId > 0,
++                    "alias fixture did not start");
++            require(aliasIop.getPacketRpcServer(sid, server, buffer, callbackBuffer) &&
++                    server == (alias | 0x10200u) && buffer == (alias | 0x10400u),
++                    "BIND changed the registered IOP RAM alias");
++            require(aliasIop.executePacketRpc(sid, server, 0u, {}, 4u) == std::vector<uint8_t>({1u, 2u, 3u, 4u}),
++                    "supported RAM alias failed at physical callback/result access");
++        }
++        for (unsigned variant = 0u; variant < 3u; ++variant)
++        {
++            Host badHost;
++            IopEmulator bad(badHost);
++            Irx malformed = rpcServer(sid, 0u);
++            if (variant == 0u)
++                malformed.words(0x20u, {0x3C074001u}); // arbitrary segment must not mask to RAM
++            else if (variant == 1u)
++                malformed.words(0x24u, {0x34E71000u}); // valid RAM but no owned backing
++            else
++                malformed.words(0x1Cu, {0x34C60302u}); // misaligned callback
++            require(bad.loadModuleImage("bad-metadata", malformed.bytes, nullptr, 0u).moduleId > 0,
++                    "metadata fixture failed before BIND validation");
++            rejects([&] { (void)bad.getPacketRpcServer(sid, server, buffer, callbackBuffer); }, "owned IOP RAM");
++        }
++    }
++
++    void packetRpcResultsAndRegistrationLifetime()
++    {
++        constexpr uint32_t sid = 0x80000006u;
++        for (uint32_t address : {0u, 0x10500u, 0x40010400u, 0x1FFFFEu})
++        {
++            Host host;
++            IopEmulator iop(host);
++            Irx image = rpcServer(sid, 0x11223344u);
++            image.words(0x300u, {0x3C020000u | (address >> 16u),
++                                0x34420000u | (address & 0xFFFFu), 0x03E00008u, 0u});
++            require(iop.loadModuleImage("invalid-result", image.bytes, nullptr, 0u).moduleId > 0,
++                    "invalid-result fixture did not start");
++            rejects([&] { (void)iop.executePacketRpc(sid, 0x10200u, 0u, {}, 4u); }, "complete requested result");
++            rejects([&] { iop.checkExecutionFailure(); }, "complete requested result");
++            require(!iop.hasRpcServer(sid) && host.guestWrites == 0u,
++                    "invalid callback output became successful service data");
++        }
++        Host host;
++        IopEmulator iop(host);
++        Irx image = rpcServer(sid, 0u);
++        image.words(0x300u, {0x03E00008u, 0x00001021u}); // void result is valid only for receiveSize=0
++        require(iop.loadModuleImage("void-result", image.bytes, nullptr, 0u).moduleId > 0,
++                "void-result fixture did not start");
++        require(iop.executePacketRpc(sid, 0x10200u, 0u, {}, 0u).empty(), "zero-receive call invented output");
++        iop.checkExecutionFailure();
++
++        iop.reset();
++        image = rpcServer(sid, 0x12345678u);
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x63666973u, 0x0000646Du,
++                              0x03E00008u, 0x24000018u, 0u, 0u});
++        image.words(0x300u, {0x27BDFFE0u, 0xAFBF001Cu, 0x3C040001u, 0x34840200u,
++            jal(0x10114u), 0u, 0x8FBF001Cu, 0x27BD0020u,
++            0x3C020001u, 0x34420400u, 0x03E00008u, 0u});
++        require(iop.loadModuleImage("self-remove", image.bytes, nullptr, 0u).moduleId > 0,
++                "self-removing service did not start");
++        require(iop.executePacketRpc(sid, 0x10200u, 0u, {}, 4u) ==
++                std::vector<uint8_t>({0x78u, 0x56u, 0x34u, 0x12u}) && !iop.hasRpcServer(sid),
++                "callback registry removal invalidated result handling or was ignored");
++    }
++
++    void packetRpcStrictExecutionAndOrdering()
++    {
++        constexpr uint32_t sid = 0x80000006u;
++        for (unsigned variant = 0u; variant < 9u; ++variant)
++        {
++            Host host;
++            IopEmulator iop(host);
++            Irx image = rpcServer(sid, 0u);
++            if (variant == 0u)
++                image.words(0x300u, {0x0000000Cu});
++            else
++            {
++                const bool dma = variant == 1u || variant == 3u;
++                constexpr std::array<uint16_t, 5> unsupportedCommands{15u, 16u, 23u, 28u, 29u};
++                const uint32_t ordinal = variant == 3u ? 0x123u : variant >= 4u ? unsupportedCommands[variant - 4u] :
++                                         dma ? 7u : 12u;
++                image.words(0x100u, {0x41E00000u, 0u, 0x0101u,
++                    dma ? 0x6D666973u : 0x63666973u, dma ? 0x00006E61u : 0x0000646Du,
++                    0x03E00008u, 0x24000000u | ordinal, 0u, 0u});
++                image.words(0x300u, {0x3C040001u, 0x34840480u, 0x24050001u, jal(0x10114u), 0u});
++                image.words(0x480u, {0x10400u, 0x800u, 4u, 0u});
++            }
++            // Even a service registered through the legacy loader must execute
++            // strictly when it is called by the packet transport.
++            host.file = image.bytes;
++            require(iop.loadModule("legacy-registration", nullptr, 0u).moduleId > 0,
++                    "legacy service registration failed");
++            const char *cause = variant == 0u ? "exception" : variant == 3u ? "missing import sifman:291" :
++                                variant >= 4u ? "missing import sifcmd:" : "ordered packet transport";
++            rejects([&] { (void)iop.executePacketRpc(sid, 0x10200u, 0u, {}, 4u); }, cause);
++            require(host.guestReads == 0u && host.guestWrites == 0u,
++                    "callback wrote EE data before ordered packet completion");
++            rejects([&] { iop.checkExecutionFailure(); }, cause);
++        }
++    }
++
++    void packetRpcSplitOwnership()
++    {
++        constexpr uint32_t firstSid = 0x80000006u, secondSid = 0x80000007u;
++        for (unsigned variant = 0u; variant < 3u; ++variant)
++        {
++            Host host;
++            IopEmulator iop(host);
++            const Irx callbackOwner = rpcServer(firstSid, 0x04030201u);
++            require(iop.loadModuleImage("callback-owner", callbackOwner.bytes, nullptr, 0u).moduleId > 0,
++                    "callback owner did not start");
++            Irx dataOwner(0x11000u);
++            const uint32_t serverAddress = variant == 0u ? 0x11200u : 0x10280u;
++            const uint32_t requestBuffer = variant == 1u ? 0x11400u : 0x10400u;
++            const uint32_t callbackBuffer = variant == 2u ? 0x11400u : 0u;
++            dataOwner.words(0u, {0x27BDFFE0u, 0xAFBF001Cu,
++                0x3C040001u, 0x34840000u | (serverAddress & 0xFFFFu),
++                0x3C058000u, 0x34A50007u, 0x3C060001u, 0x34C60300u,
++                0x3C070001u, 0x34E70000u | (requestBuffer & 0xFFFFu),
++                0x3C080000u | (callbackBuffer >> 16u), 0x35080000u | (callbackBuffer & 0xFFFFu),
++                0xAFA00010u, 0xAFA80014u, 0xAFA00018u, jal(0x11114u), 0u,
++                0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00001021u});
++            dataOwner.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x63666973u, 0x0000646Du,
++                0x03E00008u, 0x24000011u, 0u, 0u});
++            const auto loaded = iop.loadModuleImage("data-owner", dataOwner.bytes, nullptr, 0u);
++            uint32_t server = 0u, buffer = 0u, callback = 0u;
++            require(loaded.moduleId > 0 && iop.getPacketRpcServer(secondSid, server, buffer, callback),
++                    "split-ownership server did not register");
++            require(iop.stopModule(loaded.moduleId, nullptr), "data owner did not retire");
++            require(!iop.getPacketRpcServer(secondSid, server, buffer, callback) && iop.hasRpcServer(firstSid),
++                    "binding retained retired server/request/callback data or removed the unrelated live owner");
++            require(iop.executePacketRpc(firstSid, 0x10200u, 0u, {}, 4u) == std::vector<uint8_t>({1u, 2u, 3u, 4u}),
++                    "retiring shared data incorrectly disabled the still-loaded callback owner");
++        }
++    }
++
++    void freshModuleImagePreflight()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Irx image = returns();
++        require(iop.loadModuleImage("existing", image.bytes, nullptr, 0u).moduleId > 0, "existing module failed");
++        const uint64_t before = iop.instructions();
++        image.words(0u, {0x08004000u, 0u}); // infinite entry must never run in static preflight
++        IopEmulator::validateModuleImage(image.bytes);
++        rejects([&] { IopEmulator::validateModuleImage(relocationImage(0xFFu).bytes); }, "relocation");
++        const Irx outside(0x120000u);
++        rejects([&] { IopEmulator::validateModuleImage(outside.bytes); }, "module arena");
++        require(iop.instructions() == before && iop.loadedModuleCount() == 1u && word(iop, 0x10000u) == 0x03E00008u,
++                "fresh image validation ran guest code or changed live subsystem RAM");
++        iop.checkExecutionFailure();
++    }
++
+     void backgroundFailure()
+     {
+         Host host;
+@@ -457,6 +686,12 @@ int main()
+         {"Strict files and real IOP buffers use their correct memory spaces", fileAndIopSources},
+         {"Overlap is atomic and legacy EE API remains compatible", overlapAndLegacyCompatibility},
+         {"Later physical RPC callback failures remain strict", callbackCompletion},
++        {"Packet RPC invokes the registered callback and returns its real IOP bytes", packetRpcOriginalCallback},
++        {"Packet RPC preflights identities, complete ranges and supported aliases", packetRpcPreflightAndAliases},
++        {"Packet RPC rejects null/invalid results and survives registry removal", packetRpcResultsAndRegistrationLifetime},
++        {"Packet callbacks remain strict and cannot bypass ordered SIF delivery", packetRpcStrictExecutionAndOrdering},
++        {"Retiring any physical registration data owner invalidates its packet binding", packetRpcSplitOwnership},
++        {"Fresh module preflight stages relocation without live mutation or execution", freshModuleImagePreflight},
+         {"Background strict execution failure survives noexcept scheduling", backgroundFailure},
+         {"Unloaded and nonresident strict callback code cannot execute or be reused", retiredCallbacks},
+         {"Original start result controls residency and CDVD uses existing model", returnDispositionAndCdvd},
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index 9a1e415630405feb36e3feaea6148aa1ca139bd6..5649675b7a03467f2ad48708ec08c5acf6de7c35 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -746,6 +746,8 @@ namespace ps2_stubs
+ 
+     void sceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        if (auto *const iop = PS2IopTransport::subsystem(runtime))
++            iop->checkExecutionFailure();
+         const uint32_t dmatAddr = getRegU32(ctx, 4);
+         const uint32_t count = getRegU32(ctx, 5);
+ 
+@@ -850,15 +852,16 @@ namespace ps2_stubs
+                         // Overlay earlier DMA writes into a temporary service
+                         // input, without committing any descriptor. This makes
+                         // path/argument/reply validation happen before effects.
++                        const uint32_t bufferPhysical = buffer & 0x1FFFFFFFu;
+                         for (uint32_t previous = 0u; previous + 1u < pendingCount; ++previous)
+                         {
+                             const uint32_t destination = pending[previous].dest & 0x1FFFFFFFu;
+-                            const uint32_t start = std::max(destination, buffer);
++                            const uint32_t start = std::max(destination, bufferPhysical);
+                             const uint32_t end = std::min(destination + static_cast<uint32_t>(payloads[previous].size()),
+-                                                          buffer + static_cast<uint32_t>(packet.rpcInput.size()));
++                                                          bufferPhysical + static_cast<uint32_t>(packet.rpcInput.size()));
+                             if (start < end)
+                                 std::copy_n(payloads[previous].begin() + (start - destination), end - start,
+-                                            packet.rpcInput.begin() + (start - buffer));
++                                            packet.rpcInput.begin() + (start - bufferPhysical));
+                         }
+                         packet.hasRpcInput = true;
+                     }
+@@ -870,7 +873,17 @@ namespace ps2_stubs
+         if (ok)
+         {
+             if (!commands.empty())
++            {
++                for (const auto &command : commands)
++                {
++                    const auto &bytes = command.bytes;
++                    const uint32_t cid = uint32_t(bytes.at(8u)) | (uint32_t(bytes.at(9u)) << 8u) |
++                                         (uint32_t(bytes.at(10u)) << 16u) | (uint32_t(bytes.at(11u)) << 24u);
++                    if (cid == 0x80000003u && pendingCount != 1u)
++                        throw std::runtime_error("IOP RESET requires an exclusive DMA descriptor batch");
++                }
+                 PS2IopTransport::subsystem(runtime)->validateSifCommandBatch(commands);
++            }
+             size_t commandIndex = 0u;
+             for (uint32_t i = 0; i < pendingCount; ++i)
+             {
+@@ -930,7 +943,7 @@ namespace ps2_stubs
+         }
+ 
+         auto *const iop = PS2IopTransport::subsystem(runtime);
+-        if (iop && iop->sifCommandsInitialized())
++        if (iop && (!commands.empty() || iop->sifCommandsInitialized()))
+         {
+             runtime->memory().m_dmaStartCount.fetch_add(1u, std::memory_order_relaxed);
+             pumpSifCommands(rdram, runtime);
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+index 46d1ab82645f8ec1648ae1c83924d06080ca7e44..91345ae6679a3e239c80e04755714b35ff7e801f 100644
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -60,6 +60,58 @@ namespace
+         return bytes;
+     }
+ 
++    std::vector<uint8_t> bootImage(const std::vector<uint8_t> &module, std::string_view name = "LOADFILE")
++    {
++        constexpr uint32_t directoryBytes = 80u;
++        std::vector<uint8_t> bytes(directoryBytes + ((module.size() + 15u) & ~size_t{15u}), 0u);
++        const std::array<std::string_view, 4u> names{"RESET", "ROMDIR", "EXTINFO", name};
++        for (size_t index = 0u; index < names.size(); ++index)
++            std::copy(names[index].begin(), names[index].end(), bytes.begin() + index * 16u);
++        put(bytes, 28u, directoryBytes);
++        put(bytes, 60u, static_cast<uint32_t>(module.size()));
++        std::copy(module.begin(), module.end(), bytes.begin() + directoryBytes);
++        return bytes;
++    }
++
++    struct ResetImageFixture
++    {
++        PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
++        std::filesystem::path directory;
++        explicit ResetImageFixture(const std::vector<uint8_t> &bytes)
++        {
++            const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
++            directory = std::filesystem::temp_directory_path() / ("ps2-sif-reset-" + std::to_string(suffix));
++            if (!std::filesystem::create_directory(directory))
++                throw std::runtime_error("cannot create unique reset image fixture");
++            replace(bytes);
++            PS2Runtime::IoPaths paths{};
++            paths.cdRoot = paths.hostRoot = directory.string();
++            PS2Runtime::setIoPaths(paths);
++        }
++        ~ResetImageFixture()
++        {
++            PS2Runtime::setIoPaths(saved);
++            std::error_code error;
++            std::filesystem::remove_all(directory, error);
++        }
++        void replace(const std::vector<uint8_t> &bytes) const
++        {
++            std::ofstream file(directory / "IOPRP.IMG", std::ios::binary | std::ios::trunc);
++            file.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
++            file.close();
++            if (!file) throw std::runtime_error("cannot write synthetic reset image");
++        }
++        std::vector<uint8_t> resetPacket() const
++        {
++            auto bytes = packet(0x80000003u, 104u);
++            constexpr std::string_view arguments = "rom0:UDNL cdrom0:\\IOPRP.IMG;1";
++            put(bytes, 16u, static_cast<uint32_t>(arguments.size()));
++            put(bytes, 20u, 0u);
++            std::copy(arguments.begin(), arguments.end(), bytes.begin() + 24u);
++            return bytes;
++        }
++    };
++
+     void mainStop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         ctx->pc = 0u;
+@@ -529,6 +581,193 @@ void register_ps2_sif_packet_tests()
+                      "pending IOP error must escape polling even with no queued reply or armed channel");
+         });
+ 
++        tc.Run("RESET executes the supplied authored image service before publishing BOOTEND", [](TestCase &t)
++        {
++            constexpr uint32_t originalReply = 0x78563412u;
++            ResetImageFixture fixture(bootImage(iop_test::rpcServer(0x80000006u, originalReply).bytes));
++            PacketEnv env;
++            const uint32_t oldServer = env.bindHeap();
++            env.init(); // An old pending reply must not survive reset.
++            env.submit(fixture.resetPacket());
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(!env.iop().peekSifReply(reply) && env.iop().sifRpcBuffer(oldServer) == 0u,
++                     "accepting RESET immediately invalidates old replies and bindings");
++            t.Equals(env.iop().getSifRegister(2u), 0u, "an IOP still rebooting must not advertise an endpoint");
++            t.Equals(env.iop().setSifRegister(4u, 0x10000u), 0u, "SIFINIT acknowledgement cannot complete boot");
++            t.Equals(env.iop().setSifRegister(4u, 0x20000u), 0u, "CMDINIT acknowledgement cannot complete boot");
++            (void)env.iop().setSifRegister(0x80000002u, 0u);
++            (void)env.iop().setSifRegister(0x80000000u, 0u);
++            t.Equals(env.iop().debugSnapshot().emulatorInstructions, uint64_t{0u},
++                     "acknowledgement writes cannot run the original service or manufacture readiness");
++            const uint32_t flags = env.iop().getSifRegister(4u);
++            const auto boot = env.iop().debugSnapshot();
++            t.IsTrue((flags & 0x70000u) == 0x70000u && boot.emulatorLoadedModules == 1u &&
++                         boot.emulatorInstructions > 0u && boot.emulatorRpcServers == 1u,
++                     "BOOTEND follows actual original entry execution and RPC registration");
++            env.endpoint = env.iop().getSifRegister(2u);
++            const uint32_t server = env.bindService(0x80000006u);
++            t.Equals(server, 0x10200u, "BIND must expose the original registered IOP server");
++            t.Equals(word(env.rdram.data(), kClient + 20u), 0x10400u,
++                     "BIND must expose its actual original request buffer");
++            env.submitRpc(server, 0xFFu, {}, 4u);
++            t.Equals(word(env.rdram.data(), kResult), 0u, "callback output waits for real receive DMA");
++            env.installHandler();
++            env.arm();
++            env.runtime.eeScheduler().run();
++            t.Equals(word(env.rdram.data(), kResult), originalReply,
++                     "original IOP callback bytes reach the EE result buffer");
++            t.IsTrue(receivedRpcResults.size() == 1u && receivedRpcResults.front() == originalReply,
++                     "the guest END handler observes original result bytes before completion");
++            t.IsTrue(env.iop().debugSnapshot().emulatorInstructions > boot.emulatorInstructions,
++                     "CALL must execute actual guest callback instructions");
++        });
++
++        tc.Run("RESET preflight rejects invalid images and mixed DMA before mutation", [](TestCase &t)
++        {
++            const auto valid = bootImage(iop_test::rpcServer(0x80000006u, 0x10203040u).bytes);
++            ResetImageFixture fixture(valid);
++            PacketEnv env;
++            const uint32_t oldServer = env.bindHeap();
++            const std::array<uint8_t, 4u> sentinel{0xA1u, 0xB2u, 0xC3u, 0xD4u};
++            t.IsTrue(env.iop().writeMemory(env.endpoint, sentinel.data(), sentinel.size()), "prepare old endpoint bytes");
++            for (const auto &bad : {std::vector<uint8_t>(128u, 0u),
++                                   bootImage(iop_test::rpcServer(0x80000006u, 1u).bytes, "OTHER")})
++            {
++                fixture.replace(bad);
++                t.IsTrue(env.fails(fixture.resetPacket()), "invalid or incomplete replacement images must fail preflight");
++                std::array<uint8_t, 4u> readback{};
++                t.IsTrue(env.iop().readMemory(env.endpoint, readback.data(), readback.size()) && readback == sentinel &&
++                             env.iop().sifRpcBuffer(oldServer) != 0u,
++                         "failed image preflight must preserve old IOP memory and live bindings");
++            }
++            fixture.replace(valid);
++            auto malformed = fixture.resetPacket();
++            put(malformed, 16u, 81u);
++            t.IsTrue(env.fails(malformed), "oversized RESET arguments cannot cross the packet field");
++            malformed = fixture.resetPacket();
++            put(malformed, 20u, 1u);
++            t.IsTrue(env.fails(malformed), "unsupported reset mode cannot reset IOP state");
++            malformed = fixture.resetPacket();
++            constexpr std::string_view unresolved = "rom0:UDNL unknown-device:IOPRP.IMG";
++            std::fill(malformed.begin() + 24u, malformed.end(), 0u);
++            std::copy(unresolved.begin(), unresolved.end(), malformed.begin() + 24u);
++            put(malformed, 16u, static_cast<uint32_t>(unresolved.size()));
++            t.IsTrue(env.fails(malformed) && env.iop().sifRpcBuffer(oldServer) != 0u,
++                     "unresolved guest devices cannot fall back to arbitrary native filesystem paths");
++
++            const auto reset = fixture.resetPacket();
++            std::memcpy(env.rdram.data() + kSource, reset.data(), reset.size());
++            env.rdram[kSource + 128u] = 0x55u;
++            constexpr uint32_t destination = 0x30000u;
++            t.IsTrue(env.iop().writeMemory(destination, sentinel.data(), sentinel.size()), "prepare ordinary DMA sentinel");
++            const std::array<uint32_t, 8u> descriptors{
++                kSource + 128u, destination, 1u, 0u, kSource, env.endpoint, 104u, 0x44u};
++            std::memcpy(env.rdram.data() + kDescriptors, descriptors.data(), sizeof(descriptors));
++            SET_GPR_U32(&env.context, 4, kDescriptors);
++            SET_GPR_U32(&env.context, 5, 2u);
++            bool failed = false;
++            try { ps2_stubs::sceSifSetDma(env.rdram.data(), &env.context, &env.runtime); }
++            catch (const std::runtime_error &) { failed = true; }
++            std::array<uint8_t, 4u> readback{};
++            t.IsTrue(failed && env.iop().readMemory(destination, readback.data(), readback.size()) && readback == sentinel,
++                     "an unsupported mixed RESET batch cannot partially commit ordinary DMA");
++        });
++
++        tc.Run("RESET executes the prevalidated image snapshot and rejects absent registration", [](TestCase &t)
++        {
++            const auto valid = bootImage(iop_test::rpcServer(0x80000006u, 0x11223344u).bytes);
++            ResetImageFixture fixture(valid);
++            PacketEnv env;
++            ps2x::iop::SifCommandPacket command;
++            command.bytes = fixture.resetPacket();
++            command.destination = env.endpoint;
++            env.iop().validateSifCommandBatch({&command, 1u});
++            fixture.replace(std::vector<uint8_t>(128u, 0u));
++            env.iop().receiveSifCommandPacket(command);
++            t.IsTrue((env.iop().getSifRegister(4u) & 0x40000u) != 0u,
++                     "boot must use the checked byte snapshot even if the host file subsequently changes");
++
++            iop_test::Irx noServer;
++            noServer.words(0u, {0x03E00008u, 0x00001021u});
++            fixture.replace(bootImage(noServer.bytes));
++            env.endpoint = env.iop().getSifRegister(2u);
++            env.submit(fixture.resetPacket());
++            bool failed = false;
++            try { (void)env.iop().getSifRegister(4u); }
++            catch (const std::runtime_error &) { failed = true; }
++            t.IsTrue(failed && !env.iop().sifCommandsInitialized() &&
++                         !env.iop().acceptsSifCommand(env.endpoint) && !env.iop().canBindRpc(0x80000006u),
++                     "an entry without a real RPC registration cannot publish a usable endpoint or service");
++            const auto failsWithBootError = [](auto &&operation)
++            {
++                try { operation(); }
++                catch (const std::runtime_error &error)
++                {
++                    return std::string_view(error.what()).find("IOP reset failed: IOP reset LOADFILE service did not register") == 0u;
++                }
++                return false;
++            };
++            auto bind = packet(0x80000009u);
++            put(bind, 32u, 0x80000006u);
++            t.IsTrue(failsWithBootError([&] { (void)env.iop().getSifRegister(4u); }) &&
++                         failsWithBootError([&] { (void)env.iop().getSifRegister(2u); }) &&
++                         failsWithBootError([&] { (void)env.iop().setSifRegister(4u, 0x70000u); }) &&
++                         failsWithBootError([&] { env.iop().receiveSifCommand(bind.data(), bind.size()); }) &&
++                         failsWithBootError([&] { (void)env.iop().allocateMemory(16u); }) &&
++                         failsWithBootError([&] { ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime); }),
++                     "every later poll, BIND, allocator request and idle pump must retain the original boot failure");
++            const uint64_t instructions = env.iop().debugSnapshot().emulatorInstructions;
++            env.iop().runEeCycles(8192u);
++            t.Equals(env.iop().debugSnapshot().emulatorInstructions, instructions,
++                     "a failed reboot cannot continue executing background instructions");
++            env.iop().reset();
++            fixture.replace(valid);
++            env.endpoint = env.iop().getSifRegister(2u);
++            env.submit(fixture.resetPacket());
++            t.IsTrue((env.iop().getSifRegister(4u) & 0x40000u) != 0u,
++                     "an explicit reset clears the failure and allows a fresh validated boot");
++        });
++
++        tc.Run("BIND follows the current guest registry and never revives an unloaded guest service", [](TestCase &t)
++        {
++            PacketEnv env;
++            const uint32_t bootstrap = env.bindService(0x80000006u);
++            const auto image = iop_test::rpcServer(0x80000006u, 0x12345678u);
++            const auto loaded = env.iop().loadModuleImage("loadfile.irx", image.bytes);
++            const uint32_t physical = env.bindService(0x80000006u);
++            t.IsTrue(loaded.moduleId > 0 && physical == 0x10200u && physical != bootstrap &&
++                         env.iop().sifRpcBuffer(bootstrap) == 0u,
++                     "a real registered service supersedes and invalidates the earlier bootstrap binding");
++            t.IsTrue(env.iop().stopModule(loaded.moduleId), "unload the actual service");
++            t.Equals(env.bindService(0x80000006u), 0u,
++                     "BIND after unload must not advertise a stale handle or substitute a bootstrap service");
++            t.Equals(env.iop().sifRpcBuffer(physical), 0u, "unloaded physical handles are invalidated");
++        });
++
++        tc.Run("physical RPC snapshots earlier DMA through every supported IOP buffer alias", [](TestCase &t)
++        {
++            for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++            {
++                PacketEnv env;
++                constexpr uint32_t sid = 0x80001234u;
++                auto image = iop_test::rpcServer(sid, 0xDEADBEEFu);
++                image.words(0x20u, {0x3C070000u | ((alias | 0x10000u) >> 16u)});
++                image.words(0x300u, {0x3C020000u | ((alias | 0x10000u) >> 16u)});
++                t.IsTrue(env.iop().loadModuleImage("alias-callback.irx", image.bytes).moduleId > 0,
++                         "authored entry must register its actual aliased request buffer");
++                const uint32_t server = env.bindService(sid);
++                t.Equals(word(env.rdram.data(), kClient + 20u), alias | 0x10400u,
++                         "BIND preserves the actual registered buffer alias");
++                const std::vector<uint8_t> input{0x12u, 0x34u, 0x56u, 0x78u};
++                env.submitRpc(server, 0u, input, 4u);
++                ps2x::iop::SifEeReply reply;
++                t.IsTrue(env.iop().peekSifReply(reply) && reply.data == input,
++                         "callback must receive this batch's preceding DMA bytes, not stale aliased-buffer data");
++                t.Equals(word(env.rdram.data(), kResult), 0u,
++                         "physical result still waits for the real receive transport");
++            }
++        });
++
+         tc.Run("IOP reset discards packet replies and bindings before a new handshake", [](TestCase &t)
+         {
+             PacketEnv env;

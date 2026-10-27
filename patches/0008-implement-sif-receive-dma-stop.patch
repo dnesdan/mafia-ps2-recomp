@@ -1,0 +1,79 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index cce50934e48c9d0dae8694a52ccccd92a4a1e7d6..9a1e415630405feb36e3feaea6148aa1ca139bd6 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -1023,6 +1023,15 @@ namespace ps2_stubs
+ 
+     void sceSifStopDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        // PS2SDK kernel.h: this syscall disables SIF0 (IOP -> EE).
++        // Completed transfers stay completed; queued packets remain owned by
++        // the sender until the guest rearms the receive chain or resets IOP.
++        if (runtime)
++        {
++            constexpr uint32_t sif0 = 0x1000C000u;
++            auto &memory = runtime->memory();
++            memory.writeIORegister(sif0, memory.readIORegister(sif0) & ~0x100u);
++        }
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+index 121fcc7105d5585c502bdafd44547403a13eae3a..00e26383df1feee4aa3ef9aa0f5c6a47de32b3ad 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+@@ -256,6 +256,9 @@ namespace ps2_syscalls
+         case static_cast<uint32_t>(-0x68):
+             iFlushCache(rdram, ctx, runtime);
+             return true;
++        case 0x6B:
++            ps2_stubs::sceSifStopDma(rdram, ctx, runtime);
++            return true;
+         case 0x6E:
+             SetOsdConfigParam2(rdram, ctx, runtime);
+             return true;
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+index f6b5c86a79c84eaefbb60ed4156a61b9cf00d2a7..46d1ab82645f8ec1648ae1c83924d06080ca7e44 100644
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_iop_transport.h"
+ #include "ps2_runtime_macros.h"
+ #include "Kernel/Stubs/SIF.h"
++#include "Kernel/Syscalls/Dispatcher.h"
+ #include "runtime/ee_scheduler.h"
+ #include "iop_strict_fixtures.h"
+ 
+@@ -228,6 +229,32 @@ void register_ps2_sif_packet_tests()
+             t.Equals(receivedValues.size(), size_t{1}, "exactly one guest interrupt delivery");
+         });
+ 
++        tc.Run("SifStopDma syscall pauses the receive chain until guest rearm", [](TestCase &t)
++        {
++            PacketEnv env;
++            env.installHandler(false);
++            env.init();
++            env.arm();
++            env.runtime.memory().m_ioRegisters[0x1000D000u] = 0x105u;
++            t.IsTrue(ps2_syscalls::dispatchNumericSyscall(0x6Bu, env.rdram.data(), &env.context, &env.runtime),
++                     "the documented numeric syscall must dispatch to the real channel operation");
++            t.Equals(env.runtime.memory().readIORegister(0x1000C000u) & 0x100u, 0u,
++                     "SIF0 must become unarmed");
++            t.Equals(env.runtime.memory().m_ioRegisters[0x1000D000u], 0x105u,
++                     "stopping the receive channel must not cancel the other SIF direction");
++            env.runtime.eeScheduler().setIrqCauseEnabled(true, 5u, true);
++            ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply) && env.rdram[kReceive] == 0u &&
++                         word(env.rdram.data(), kSregs) == 0u,
++                     "stopped DMA must preserve the pending packet without guest memory or IRQ effects");
++            env.arm();
++            env.runtime.eeScheduler().run();
++            t.Equals(word(env.rdram.data(), kSregs), 1u,
++                     "rearming delivers the retained packet through the guest interrupt handler");
++            t.Equals(receivedValues.size(), size_t{1u}, "the retained packet is delivered exactly once");
++        });
++
+         tc.Run("queued command replies respect guest buffer ownership and receive-chain rearming", [](TestCase &t)
+         {
+             PacketEnv env;

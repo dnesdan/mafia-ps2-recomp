@@ -1,0 +1,1088 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 004570afbeea09b302fc264f8876635e28b566a3..ab318a0a2b0bda9495fba8f5c896a82952c57ef2 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -47,6 +47,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_modload_policy_tests tests/iop_modload_policy_tests.cpp)
++    target_link_libraries(ps2_iop_modload_policy_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_modload_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_modload_policy_tests COMMAND ps2_iop_modload_policy_tests)
++
+     add_executable(ps2_iop_cdvd_memory_tests tests/iop_cdvd_memory_tests.cpp)
+     target_link_libraries(ps2_iop_cdvd_memory_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_cdvd_memory_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 4eec8e627d42f499ce27313b053a3948ce1a565f..6cc32d4b47786fff309c7d0483f634e82cdd0cb1 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -16,6 +16,7 @@
+ #include "imports/iop_timrman.h"
+ #include "imports/iop_vblank.h"
+ #include "iop_emulator_const.h"
++#include "ps2x/iop/ps2_path.h"
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -313,7 +314,9 @@ namespace ps2x::iop::detail
+             uint32_t gp = 0;
+             bool resident = false;
+             bool strict = false;
++            bool starting = false;
+             uint32_t metadata = 0u;
++            uint64_t metadataIdentity = 0u;
+         };
+ 
+         struct GuestCallback
+@@ -515,6 +518,113 @@ namespace ps2x::iop::detail
+             Missing,
+         };
+ 
++        std::string modulePathFromRam(uint32_t address) const
++        {
++            if (address == 0u || !iopRamRange(address, 1u))
++                throw std::runtime_error("Modeled MODLOAD: path is outside owned IOP RAM");
++            std::string path;
++            for (size_t offset = 0u; offset <= kMaxModulePathBytes; ++offset)
++            {
++                if (!iopRamRange(address, offset + 1u) ||
++                    !memory.ownsRamRange(address + static_cast<uint32_t>(offset), 1u))
++                    throw std::runtime_error("Modeled MODLOAD: path is not terminated within owned IOP RAM");
++                const char value = static_cast<char>(memory.read8(address + static_cast<uint32_t>(offset)));
++                if (value == '\0')
++                    return path;
++                path.push_back(value);
++            }
++            throw std::runtime_error("Modeled MODLOAD: path exceeds the bounded NUL-terminated string limit");
++        }
++
++        std::string mountedModulePath(std::string_view path) const
++        {
++            // IsIllegalBootDevice's public PS2SDK body is explicitly unofficial.
++            // Model only paths this host can serve; do not claim firmware policy.
++            const ParsedPs2Path parsed = parsePs2Path(path);
++            HostPathKind mount;
++            switch (parsed.device)
++            {
++            case Ps2PathDevice::Cdrom: mount = HostPathKind::CdRoot; break;
++            case Ps2PathDevice::Host: mount = HostPathKind::HostRoot; break;
++            case Ps2PathDevice::MemoryCard0: mount = HostPathKind::MemoryCardRoot; break;
++            default: return {};
++            }
++            if (path.empty() || path.size() > kMaxModulePathBytes ||
++                path.find('\0') != std::string_view::npos || host.hostPath(mount).empty() ||
++                parsed.path.empty() || parsed.path.find(':') != std::string::npos ||
++                parsed.path.find(';') != std::string::npos ||
++                std::any_of(path.begin(), path.end(), [](unsigned char value)
++                    { return value < 0x20u || value == 0x7Fu; }))
++                return {};
++            // Reject traversal as written, including a/../b. Translation is
++            // delegated once to the host's mounted-device VFS, preserving case.
++            bool hasFilename = false;
++            for (size_t start = 0u; start <= parsed.path.size();)
++            {
++                const size_t end = parsed.path.find('/', start);
++                const std::string_view part(parsed.path.data() + start,
++                    (end == std::string::npos ? parsed.path.size() : end) - start);
++                if (part == "..")
++                    return {};
++                hasFilename = hasFilename || (!part.empty() && part != ".");
++                if (end == std::string::npos)
++                    break;
++                start = end + 1u;
++            }
++            if (!hasFilename)
++                return {};
++            const std::string translated = host.translateGuestPath(path);
++            return translated.find('\0') == std::string::npos ? translated : std::string{};
++        }
++
++        int32_t loadStartModuleFromRam(uint32_t pathAddress, uint32_t argumentSize,
++                                      uint32_t argumentAddress, uint32_t resultAddress)
++        {
++            checkExecutionFailure();
++            const std::string path = modulePathFromRam(pathAddress);
++            if (argumentSize > kMaxModuleArgumentBytes ||
++                (argumentSize != 0u && (argumentAddress == 0u || !iopRamRange(argumentAddress, argumentSize) ||
++                                       !memory.ownsRamRange(argumentAddress, argumentSize))))
++                throw std::runtime_error("Modeled MODLOAD: argument buffer is outside bounded owned IOP RAM");
++            std::vector<uint8_t> arguments(argumentSize);
++            if (argumentSize != 0u && !memory.readRam(argumentAddress, arguments.data(), arguments.size()))
++                throw std::runtime_error("Modeled MODLOAD: failed to snapshot the argument buffer");
++            (void)argumentOffsets(path, arguments.data(), argumentSize);
++
++            const uint32_t resultPhysical = physicalAddress(resultAddress);
++            std::optional<IopMemory::Allocation> resultOwner;
++            if (resultAddress != 0u)
++            {
++                if ((resultAddress & 3u) != 0u || !iopRamRange(resultAddress, 4u) ||
++                    !memory.ownsRamRange(resultAddress, 4u))
++                    throw std::runtime_error("Modeled MODLOAD: result word is outside aligned owned IOP RAM");
++                resultOwner = memory.allocationContaining(resultPhysical);
++                if (resultPhysical >= kKernelHeapBase && resultPhysical < kKernelHeapLimit &&
++                    (!resultOwner || 4u > resultOwner->size - (resultPhysical - resultOwner->address)))
++                    throw std::runtime_error("Modeled MODLOAD: result word lacks a complete live allocation");
++            }
++
++            const std::string translated = mountedModulePath(path);
++            if (translated.empty())
++                return -201; // KE_ILLEGAL_OBJECT: unsupported modeled boot path.
++            std::vector<uint8_t> image;
++            const IopFileReadResult read = IopModuleLoader::readTranslatedHostFile(host, translated,
++                                                                                kMaxStrictImageBytes, image);
++            if (read != IopFileReadResult::Success)
++                return read == IopFileReadResult::NotFound ? -203 : -204; // KE_NOFILE / KE_FILEERR.
++            const ModuleLoadResult result = loadImageStrict(path, image, arguments.data(), argumentSize);
++            if (resultAddress != 0u)
++            {
++                const auto currentOwner = memory.allocationContaining(resultPhysical);
++                if (!memory.ownsRamRange(resultAddress, 4u) ||
++                    (resultOwner.has_value() != currentOwner.has_value()) ||
++                    (resultOwner && currentOwner->identity != resultOwner->identity))
++                    throw std::runtime_error("Modeled MODLOAD: result allocation was released or replaced during module startup");
++                memory.write32(resultAddress, static_cast<uint32_t>(result.startResult));
++            }
++            return result.moduleId;
++        }
++
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -582,11 +692,26 @@ namespace ps2x::iop::detail
+                     break;
+                 }
+             }
+-            if (iequals(call.library, "modload") && call.ordinal == 13u)
++            if (iequals(call.library, "modload"))
+             {
+-                checkKelfPathCallback = {a0, cpu.gpr[28]};
+-                setV0(0);
+-                return ImportDisposition::Handled;
++                // Public normal-module ABI: LoadStartModule(name, arglen,
++                // packed_args, result), and IsIllegalBootDevice(path).
++                // https://ps2dev.github.io/ps2sdk/modload_8h_source.html
++                switch (call.ordinal)
++                {
++                case 7u:
++                    setV0(static_cast<uint32_t>(loadStartModuleFromRam(a0, cpu.gpr[5], cpu.gpr[6], cpu.gpr[7])));
++                    return ImportDisposition::Handled;
++                case 13u:
++                    checkKelfPathCallback = {a0, cpu.gpr[28]};
++                    setV0(0);
++                    return ImportDisposition::Handled;
++                case 15u:
++                    setV0(mountedModulePath(modulePathFromRam(a0)).empty() ? 1u : 0u);
++                    return ImportDisposition::Handled;
++                default:
++                    break;
++                }
+             }
+             if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+@@ -985,7 +1110,7 @@ namespace ps2x::iop::detail
+                 }
+             }
+             if (module.metadata != 0u)
+-                freeAllocation(module.metadata);
++                (void)memory.freeAllocation(module.metadata, module.metadataIdentity);
+         }
+ 
+         ModuleLoadResult loadImageStrict(std::string path, std::span<const uint8_t> image,
+@@ -1025,6 +1150,7 @@ namespace ps2x::iop::detail
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
+             module.strict = true;
++            module.starting = true;
+ 
+             // The public MODLOAD start_module ABI is (argc, argv, 0, ModuleInfo*).
+             // argv[0] is the requested path; args contains bounded NUL-separated
+@@ -1038,6 +1164,8 @@ namespace ps2x::iop::detail
+             module.metadata = staged.allocate(48u + static_cast<uint32_t>(module.name.size()) + 1u, 16u);
+             if (argumentAllocation == 0u || module.metadata == 0u)
+                 throw std::runtime_error("Strict IOP loader: insufficient IOP heap for arguments and ModuleInfo");
++            const uint64_t argumentIdentity = staged.allocationContaining(argumentAllocation)->identity;
++            module.metadataIdentity = staged.allocationContaining(module.metadata)->identity;
+ 
+             const uint32_t pathAddress = argumentAllocation + tableBytes;
+             const uint32_t argsAddress = pathAddress + pathBytes;
+@@ -1063,6 +1191,10 @@ namespace ps2x::iop::detail
+             staged.write32(module.metadata + 32u, info.dataSize);
+             staged.write32(module.metadata + 36u, info.bssSize);
+ 
++            // A nested LoadStartModule must see its caller's reserved ID and
++            // complete image range, even before that caller has returned.
++            modules.emplace(module.id, module);
++            ++nextModuleId;
+             memory = std::move(staged);
+             moduleCursor = std::max(moduleCursor, loaded.base + loaded.size);
+             const RestoreValue strictGuard(strictExecution, true);
+@@ -1074,34 +1206,48 @@ namespace ps2x::iop::detail
+             catch (const std::exception &error)
+             {
+                 rememberExecutionFailure("Strict IOP module '" + module.path + "': " + error.what());
+-                freeAllocation(argumentAllocation);
++                (void)memory.freeAllocation(argumentAllocation, argumentIdentity);
+                 discardModuleExecution(module);
++                modules.erase(module.id);
+                 throw;
+             }
+             catch (...)
+             {
+                 rememberExecutionFailure("Strict IOP module '" + module.path + "': unknown startup exception");
+-                freeAllocation(argumentAllocation);
++                (void)memory.freeAllocation(argumentAllocation, argumentIdentity);
+                 discardModuleExecution(module);
++                modules.erase(module.id);
+                 throw;
+             }
+-            freeAllocation(argumentAllocation);
++            (void)memory.freeAllocation(argumentAllocation, argumentIdentity);
+             const uint32_t disposition = startResult & 3u;
+             if (static_cast<int32_t>(startResult) < 0 || disposition == 3u)
+             {
+                 discardModuleExecution(module);
++                modules.erase(module.id);
+                 return {true, -1, static_cast<int32_t>(startResult)};
+             }
+-            ++nextModuleId;
++            module.starting = false;
+             module.resident = disposition == 0u || disposition == 2u;
+             const ModuleLoadResult result{true, module.id, static_cast<int32_t>(startResult)};
+             if (module.resident)
+             {
++                const auto metadataOwner = memory.allocationContaining(module.metadata);
++                if (!metadataOwner || metadataOwner->identity != module.metadataIdentity)
++                {
++                    discardModuleExecution(module);
++                    modules.erase(module.id);
++                    rememberExecutionFailure("Strict IOP loader: ModuleInfo allocation was released or replaced during startup");
++                    throw std::runtime_error(lastError);
++                }
+                 memory.write16(module.metadata + 10u, disposition == 2u ? 0x13u : 3u);
+-                modules.emplace(module.id, std::move(module));
++                modules.at(module.id) = std::move(module);
+             }
+             else
++            {
+                 discardModuleExecution(module);
++                modules.erase(module.id);
++            }
+             std::ostringstream out;
+             out << "[IOP] strict IRX entry returned id=" << result.moduleId
+                 << " entry=0x" << std::hex << loaded.entry << " base=0x" << loaded.base
+@@ -1162,7 +1308,7 @@ namespace ps2x::iop::detail
+         bool stopModule(int32_t moduleId, int32_t *result)
+         {
+             auto it = modules.find(moduleId);
+-            if (it == modules.end())
++            if (it == modules.end() || it->second.starting)
+                 return false;
+             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
+             discardModuleExecution(it->second);
+@@ -1389,7 +1535,8 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopEmulator::loadedModuleCount() const noexcept
+     {
+-        return static_cast<uint32_t>(m_impl->modules.size());
++        return static_cast<uint32_t>(std::count_if(m_impl->modules.begin(), m_impl->modules.end(),
++            [](const auto &entry) { return !entry.second.starting; }));
+     }
+ 
+     uint32_t IopEmulator::threadCount() const noexcept
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 80e59d6bc350aaacef325f042256a8300f4602dd..329358ead60c23742b4870a77985227c70c4f1b5 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -320,6 +320,33 @@ namespace ps2x::iop::detail
+         return ok;
+     }
+ 
++    IopFileReadResult IopModuleLoader::readTranslatedHostFile(IopHost &host, std::string_view hostPath,
++                                                             size_t maximumBytes, std::vector<uint8_t> &bytes)
++    {
++        bytes.clear();
++        if (hostPath.empty() || hostPath.find('\0') != std::string_view::npos || maximumBytes == 0u)
++            return IopFileReadResult::NotFound;
++        const uint64_t handle = host.openHostFile(hostPath);
++        if (handle == 0u)
++            return IopFileReadResult::NotFound;
++        struct CloseFile
++        {
++            IopHost &host;
++            uint64_t handle;
++            ~CloseFile() noexcept { try { host.closeHostFile(handle); } catch (...) {} }
++        } close{host, handle};
++
++        uint64_t size = 0u;
++        if (!host.hostFileSize(handle, size) || size == 0u || size > maximumBytes)
++            return IopFileReadResult::InvalidSize;
++        std::vector<uint8_t> contents(static_cast<size_t>(size));
++        size_t bytesRead = 0u;
++        if (!host.readHostFile(handle, 0u, contents.data(), contents.size(), bytesRead) || bytesRead != contents.size())
++            return IopFileReadResult::ReadFailure;
++        bytes = std::move(contents);
++        return IopFileReadResult::Success;
++    }
++
+     bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
+     {
+         Elf32Ehdr header{};
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.h b/ps2xIOP/src/emulator/services/iop_module_loader.h
+index 6cd9ef6c1817b60d86fedb7087f2f667597a5f44..968a48c09a0352f465166d05d31acea792d0dbb8 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.h
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <span>
+ #include <string_view>
+@@ -22,6 +23,14 @@ namespace ps2x::iop::detail
+         MalformedImage,
+     };
+ 
++    enum class IopFileReadResult : uint8_t
++    {
++        Success,
++        NotFound,
++        InvalidSize,
++        ReadFailure,
++    };
++
+     struct IopImageLoadResult
+     {
+         IopImageLoadError error = IopImageLoadError::MalformedImage;
+@@ -42,6 +51,10 @@ namespace ps2x::iop::detail
+     {
+     public:
+         [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes);
++        // The caller has already validated and translated a mounted guest path.
++        // This entry point never translates again or falls back to a raw path.
++        [[nodiscard]] static IopFileReadResult readTranslatedHostFile(IopHost &host, std::string_view hostPath,
++                                                                     size_t maximumBytes, std::vector<uint8_t> &bytes);
+         [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
+         [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
+     };
+diff --git a/ps2xIOP/tests/iop_modload_policy_tests.cpp b/ps2xIOP/tests/iop_modload_policy_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc1b8cac7f6736e77d9d7da2bc877093bcde588e
+--- /dev/null
++++ b/ps2xIOP/tests/iop_modload_policy_tests.cpp
+@@ -0,0 +1,233 @@
++#include "iop_compat_test_support.h"
++#include "emulator/iop_emulator.h"
++
++#include <array>
++#include <cstdint>
++#include <string>
++#include <string_view>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using ps2x::iop::detail::IopEmulator;
++    using iop_test::require;
++
++    class PolicyHost final : public IopHost
++    {
++    public:
++        bool readGuest(uint32_t, void *, size_t) const override { return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { return false; }
++        bool zeroGuest(uint32_t, size_t) override { return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 0u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind kind) const override
++        {
++            if (!mounted)
++                return {};
++            switch (kind)
++            {
++            case HostPathKind::CdRoot: return "/authored/cd";
++            case HostPathKind::HostRoot: return "/authored/host";
++            case HostPathKind::MemoryCardRoot: return "/authored/mc0";
++            default: return {};
++            }
++        }
++        std::string translateGuestPath(std::string_view path) const override
++        {
++            ++translations;
++            translatedGuest.assign(path);
++            if (!translated)
++                return {};
++            if (invalidTranslation)
++                return std::string("/authored/file\0suffix", 21u);
++            return "/authored/translated/file.irx";
++        }
++        uint64_t openHostFile(std::string_view) override { ++opens; return 1u; }
++        bool hostFileSize(uint64_t, uint64_t &) const override { ++sizeCalls; return false; }
++        bool readHostFile(uint64_t, uint64_t, void *, size_t, size_t &) override { ++reads; return false; }
++        void closeHostFile(uint64_t) override { ++closes; }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        {
++            return false;
++        }
++        void log(LogLevel, std::string_view) override {}
++
++        bool mounted = true;
++        bool translated = true;
++        bool invalidTranslation = false;
++        mutable uint32_t translations = 0u, sizeCalls = 0u;
++        mutable std::string translatedGuest;
++        uint32_t opens = 0u, reads = 0u, closes = 0u;
++    };
++
++    constexpr uint32_t kPath = 0x10200u;
++    constexpr uint32_t kResult = 0x10C00u;
++    constexpr uint32_t kCanary = 0xA5A5A5A5u;
++
++    iop_test::Irx policyEntry(uint32_t pathAddress, std::string_view path)
++    {
++        iop_test::Irx image(0x10000u, 0x1000u);
++        // Authored caller saves its real return address, calls import 15 and
++        // records that import's result before returning resident from _start.
++        image.words(0u, {
++            0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C040000u | (pathAddress >> 16u), 0x34840000u | (pathAddress & 0xFFFFu),
++            0x0C004025u, 0u, // jal 0x10094: modload:15
++            0x3C080001u, 0x35080C00u, 0xAD020000u,
++            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x24020000u,
++        });
++        image.words(0x80u, {
++            0x41E00000u, 0u, 0x0106u, 0x6C646F6Du, 0x0064616Fu,
++            0x03E00008u, 0x2400000Fu, 0u, 0u,
++        });
++        require(path.size() < 0x900u, "authored path overlaps result storage");
++        std::copy(path.begin(), path.end(), image.bytes.begin() + 0x300u);
++        image.words(0xC00u, {kCanary});
++        return image;
++    }
++
++    uint32_t word(IopEmulator &iop, uint32_t address)
++    {
++        std::array<uint8_t, 4u> bytes{};
++        require(iop.readMemory(address, bytes.data(), bytes.size()), "authored result is outside IOP RAM");
++        return uint32_t(bytes[0u]) | (uint32_t(bytes[1u]) << 8u) |
++               (uint32_t(bytes[2u]) << 16u) | (uint32_t(bytes[3u]) << 24u);
++    }
++
++    void noFileOperation(const PolicyHost &host)
++    {
++        require(host.opens == 0u && host.sizeCalls == 0u && host.reads == 0u && host.closes == 0u,
++                "device policy opened or inspected a host file");
++    }
++
++    uint32_t evaluate(PolicyHost &host, std::string_view path, uint32_t alias = 0u)
++    {
++        IopEmulator iop(host);
++        const auto image = policyEntry(kPath | alias, path);
++        const auto loaded = iop.loadModuleImage("authored-policy", image.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0 && loaded.startResult == 0, "authored policy caller did not return");
++        iop.checkExecutionFailure();
++        noFileOperation(host);
++        return word(iop, kResult);
++    }
++
++    void mountedDevicesAndAliases()
++    {
++        for (const std::string_view path : {
++                 "cdrom0:\\MODULES\\CHILD.IRX;1", "CdRoM:Folder/Child.irx;27",
++                 "host0:modules/child.irx", "host:modules/child with space.irx",
++                 "mc0:/MODULES/child.irx"})
++        {
++            for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++            {
++                PolicyHost host;
++                require(evaluate(host, path, alias) == 0u, "mapped supported device was rejected");
++                require(host.translations == 1u && host.translatedGuest == path,
++                        "policy changed path spelling or translated more than once");
++            }
++        }
++    }
++
++    void illegalDevicesAndPaths()
++    {
++        const std::array<std::string, 17u> paths{
++            "rom0:LOADFILE", "rom1:MODULE", "flash0:MODULE", "mass:MODULE", "mc1:MODULE",
++            "C:\\native\\module.irx", "cdrom0:../MODULE.IRX", "cdrom0:a/../MODULE.IRX",
++            "host:a\\..\\MODULE.IRX", "mc0:../MODULE.IRX", "cdrom0:MODULE.IRX;bad",
++            "cdrom0:MODULE.IRX;", "cdrom0:MODULE.IRX;1;2", "cdrom0:.", "cdrom0:", "",
++            std::string("cdrom0:bad") + char(1) + "name.irx",
++        };
++        for (const auto &path : paths)
++        {
++            PolicyHost host;
++            require(evaluate(host, path) != 0u, "unsupported or malformed boot path was approved");
++            require(host.translations == 0u, "invalid path reached the mounted-device translator");
++        }
++    }
++
++    void absentMountOrTranslation()
++    {
++        for (const std::string_view path : {"cdrom0:CHILD.IRX;1", "host:CHILD.IRX", "mc0:CHILD.IRX"})
++        {
++            PolicyHost absentMount;
++            absentMount.mounted = false;
++            require(evaluate(absentMount, path) != 0u && absentMount.translations == 0u,
++                    "unmounted path fell back to a raw host path");
++            PolicyHost absentTranslation;
++            absentTranslation.translated = false;
++            require(evaluate(absentTranslation, path) != 0u && absentTranslation.translations == 1u,
++                    "missing translation approved an unavailable path");
++            PolicyHost invalidTranslation;
++            invalidTranslation.invalidTranslation = true;
++            require(evaluate(invalidTranslation, path) != 0u && invalidTranslation.translations == 1u,
++                    "NUL-containing host translation was accepted");
++        }
++    }
++
++    void boundedGuestStrings()
++    {
++        for (const uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            PolicyHost host;
++            IopEmulator iop(host);
++            const std::string path = "cdrom0:LAST.IRX;1";
++            const uint32_t address = 0x200000u - static_cast<uint32_t>(path.size() + 1u);
++            require(iop.writeMemory(address, path.c_str(), path.size() + 1u), "could not install exact-end path");
++            auto image = policyEntry(address | alias, {});
++            require(iop.loadModuleImage("authored-boundary", image.bytes, nullptr, 0u).moduleId > 0 &&
++                        word(iop, kResult) == 0u, "bounded exact-end alias path was rejected");
++            noFileOperation(host);
++        }
++        for (const uint32_t address : {0u, 0x8000u, 0xBF801000u, 0xBFFFFFFFu})
++        {
++            PolicyHost host;
++            IopEmulator iop(host);
++            const auto image = policyEntry(address, {});
++            bool failed = false;
++            try { (void)iop.loadModuleImage("authored-invalid-pointer", image.bytes, nullptr, 0u); }
++            catch (const std::runtime_error &error)
++            {
++                failed = std::string_view(error.what()).find("MODLOAD: path") != std::string_view::npos;
++            }
++            require(failed && word(iop, kResult) == kCanary && host.translations == 0u,
++                    "invalid path pointer produced a policy result or reached the translator");
++            noFileOperation(host);
++        }
++        for (const bool atRamEnd : {false, true})
++        {
++            PolicyHost host;
++            IopEmulator iop(host);
++            auto image = policyEntry(atRamEnd ? 0xA01FFFFFu : kPath, std::string(1025u, 'x'));
++            if (atRamEnd)
++            {
++                const uint8_t byte = 'x';
++                require(iop.writeMemory(0x1FFFFFu, &byte, 1u), "could not install unterminated end byte");
++            }
++            bool failed = false;
++            try { (void)iop.loadModuleImage("authored-unterminated", image.bytes, nullptr, 0u); }
++            catch (const std::runtime_error &error)
++            {
++                failed = std::string_view(error.what()).find("MODLOAD: path") != std::string_view::npos;
++            }
++            require(failed && host.translations == 0u && word(iop, kResult) == kCanary,
++                    "overlong or RAM-wrapping path escaped string preflight");
++            noFileOperation(host);
++        }
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"modeled MODLOAD mounted devices and aliases", mountedDevicesAndAliases},
++        {"modeled MODLOAD rejects illegal devices and paths", illegalDevicesAndPaths},
++        {"modeled MODLOAD requires mount and translation", absentMountOrTranslation},
++        {"modeled MODLOAD bounds original guest strings", boundedGuestStrings},
++    };
++    return iop_test::run(tests);
++}
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index 6c8173975ec8bd80eb4d758c157794613226c2d2..e1b53a39cfc36ad3ccd12323ce6705e7f7c07dc4 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -2,6 +2,8 @@
+ #include "emulator/iop_emulator.h"
+ 
+ #include <functional>
++#include <map>
++#include <optional>
+ 
+ namespace
+ {
+@@ -56,6 +58,179 @@ namespace
+         offset += 4u;
+     }
+ 
++    void constant(Irx &image, uint32_t &offset, uint32_t reg, uint32_t value)
++    {
++        emit(image, offset, 0x3C000000u | (reg << 16u) | (value >> 16u));
++        emit(image, offset, 0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu));
++    }
++
++    class ModuleHost final : public IopHost
++    {
++    public:
++        bool readGuest(uint32_t a, void *d, size_t n) const override { return ee.readGuest(a, d, n); }
++        bool writeGuest(uint32_t a, const void *d, size_t n) override { return ee.writeGuest(a, d, n); }
++        bool zeroGuest(uint32_t a, size_t n) override { return ee.zeroGuest(a, n); }
++        bool normalizeGuestAddress(uint32_t a, uint32_t &n) const override { return ee.normalizeGuestAddress(a, n); }
++        uint32_t allocateIopHandle(IopHandleKind k) override { return ee.allocateIopHandle(k); }
++        uint32_t allocateGuest(uint32_t n, uint32_t a) override { return ee.allocateGuest(n, a); }
++        void freeGuest(uint32_t a) override { ee.freeGuest(a); }
++        void audioCommand(uint32_t s, uint32_t f, GuestBuffer a, GuestBuffer b) override { ee.audioCommand(s, f, a, b); }
++        std::string hostPath(HostPathKind kind) const override
++        {
++            if (!mounted)
++                return {};
++            switch (kind)
++            {
++            case HostPathKind::CdRoot: return "/authored/cd";
++            case HostPathKind::HostRoot: return "/authored/host";
++            case HostPathKind::MemoryCardRoot: return "/authored/mc";
++            default: return {};
++            }
++        }
++        std::string translateGuestPath(std::string_view path) const override
++        {
++            translated.emplace_back(path);
++            const auto found = translations.find(std::string(path));
++            return found == translations.end() ? std::string{} : found->second;
++        }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            opened.emplace_back(path);
++            const auto found = files.find(std::string(path));
++            if (found == files.end())
++                return 0u;
++            const uint64_t handle = ++nextHandle;
++            active.emplace(handle, &found->second);
++            return handle;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            const auto found = active.find(handle);
++            if (found == active.end())
++                return false;
++            size = advertisedSize.value_or(found->second->size());
++            return true;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size,
++                          size_t &bytesRead) override
++        {
++            if (throwOnRead)
++                throw std::runtime_error("authored host read failure");
++            bytesRead = 0u;
++            const auto found = active.find(handle);
++            if (found == active.end() || offset > found->second->size())
++                return false;
++            bytesRead = std::min(size, found->second->size() - static_cast<size_t>(offset));
++            if (shortRead && bytesRead != 0u)
++                --bytesRead;
++            if (bytesRead != 0u)
++                std::memcpy(destination, found->second->data() + offset, bytesRead);
++            return true;
++        }
++        void closeHostFile(uint64_t handle) override { active.erase(handle); ++closed; }
++        int32_t memoryCard(const MemoryCardRequest &r) override { return ee.memoryCard(r); }
++        bool hasGuestFunction(uint32_t a) const override { return ee.hasGuestFunction(a); }
++        bool invokeGuestFunction(uint64_t t, uint32_t a, uint32_t b, uint32_t c, uint32_t d,
++                                 uint32_t e, uint32_t *f) override { return ee.invokeGuestFunction(t, a, b, c, d, e, f); }
++        void log(LogLevel level, std::string_view message) override { ee.log(level, message); }
++
++        void file(std::string path, const Irx &image)
++        {
++            const std::string destination = "/authored/cd/module-" + std::to_string(files.size()) + ".irx";
++            translations.emplace(std::move(path), destination);
++            files.emplace(destination, image.bytes);
++        }
++
++        Host ee;
++        bool mounted = true, shortRead = false, throwOnRead = false;
++        std::optional<uint64_t> advertisedSize;
++        std::map<std::string, std::string> translations;
++        std::map<std::string, std::vector<uint8_t>> files;
++        mutable std::vector<std::string> translated;
++        std::vector<std::string> opened;
++        std::map<uint64_t, const std::vector<uint8_t> *> active;
++        uint64_t nextHandle = 0u;
++        size_t closed = 0u;
++    };
++
++    constexpr uint32_t kModloadSid = 0x80000006u;
++    constexpr uint32_t kModloadPath = 0x10800u, kModloadArgs = 0x10900u;
++    constexpr uint32_t kModloadResult = 0x10A00u, kModloadReply = 0x10B00u;
++
++    Irx modloadCallback(uint16_t ordinal, std::string_view path, uint32_t argumentSize = 0u,
++                        uint32_t argumentAddress = 0u, uint32_t resultAddress = kModloadResult,
++                        uint32_t pathAddress = kModloadPath)
++    {
++        Irx image = rpcServer(kModloadSid, 0u);
++        image.bytes.resize(0x1100u, 0u);
++        put32(image.bytes, 68u, 0x1000u);
++        put32(image.bytes, 72u, 0x1000u);
++        image.words(0x100u, {0x41E00000u, 0u, 0x0106u, 0x6C646F6Du, 0x0064616Fu,
++                             0x03E00008u, 0x24000000u | ordinal, 0u, 0u});
++        uint32_t pc = 0x300u;
++        emit(image, pc, 0x27BDFFE0u);
++        emit(image, pc, 0xAFBF001Cu);
++        constant(image, pc, 4u, pathAddress);
++        constant(image, pc, 5u, argumentSize);
++        constant(image, pc, 6u, argumentAddress);
++        constant(image, pc, 7u, resultAddress);
++        constant(image, pc, 28u, 0x13572468u); // suspended caller GP must survive nested start.
++        emit(image, pc, jal(0x10114u));
++        emit(image, pc, 0u);
++        constant(image, pc, 8u, kModloadReply);
++        emit(image, pc, 0xAD020000u); // actual import return
++        emit(image, pc, 0xAD1C0004u); // actual caller GP after nested return
++        emit(image, pc, 0x01001021u); // result is the actual reply buffer
++        emit(image, pc, 0x8FBF001Cu);
++        emit(image, pc, 0x27BD0020u);
++        emit(image, pc, 0x03E00008u);
++        emit(image, pc, 0u);
++        require(pc < 0x400u, "authored callback overlaps its request buffer");
++        require(path.size() + 1u <= 0x800u, "authored path does not fit");
++        std::copy(path.begin(), path.end(), image.bytes.begin() + 0x900u);
++        image.bytes[0x900u + path.size()] = 0u;
++        image.words(0xA00u, {0xDEADBEEFu});
++        return image;
++    }
++
++    std::vector<uint8_t> invokeModload(IopEmulator &iop)
++    {
++        uint32_t server = 0u, buffer = 0u, callback = 0u;
++        require(iop.getPacketRpcServer(kModloadSid, server, buffer, callback), "authored LOADFILE server absent");
++        return iop.executePacketRpc(kModloadSid, server, 0u, {}, 8u);
++    }
++
++    Irx moduleArgumentRecorder(std::span<const std::string> expected, uint16_t start = 0u)
++    {
++        Irx image(0x20000u, 0x1000u);
++        uint32_t pc = 0u;
++        constant(image, pc, 8u, 0x20C00u);
++        emit(image, pc, 0xAD040000u); // argc
++        emit(image, pc, 0x8CE9000Cu); // ModuleInfo ID and adjacent state
++        emit(image, pc, 0u);
++        emit(image, pc, 0xAD090004u);
++        for (uint32_t index = 0u; index <= expected.size(); ++index)
++        {
++            emit(image, pc, 0x8CA90000u | (index * 4u));
++            emit(image, pc, 0u);
++            emit(image, pc, 0xAD090020u | (index * 4u));
++            if (index == expected.size())
++                continue;
++            require(expected[index].size() < 0x80u, "authored recorded argument too long");
++            for (uint32_t byte = 0u; byte <= expected[index].size(); ++byte)
++            {
++                emit(image, pc, 0x912A0000u | byte);
++                emit(image, pc, 0u);
++                emit(image, pc, 0xA10A0000u | (0x80u + index * 0x80u + byte));
++            }
++        }
++        constant(image, pc, 28u, 0xBAD0CAFEu); // must not leak into the suspended caller.
++        emit(image, pc, 0x03E00008u);
++        emit(image, pc, 0x24020000u | start);
++        require(pc < 0xC00u, "authored child overlaps its captures");
++        return image;
++    }
++
+     Irx snapshotArguments(std::span<const std::string> expected)
+     {
+         Irx image(0u, 0x1000u);
+@@ -649,6 +824,275 @@ namespace
+                 "legacy trampoline bypassed retired strict range protection");
+     }
+ 
++    void modloadGuestBufferPreflight()
++    {
++        constexpr std::string_view path = "cdrom0:\\MODULES\\child.IRX;1";
++        struct Invalid { uint32_t path, size, args, result; const char *reason; };
++        const Invalid invalid[] = {
++            {0u, 0u, 0u, kModloadResult, "path"},
++            {0x80080000u, 0u, 0u, kModloadResult, "path"},
++            {0xC0010800u, 0u, 0u, kModloadResult, "path"},
++            {0xA01FFFFEu, 0u, 0u, kModloadResult, "path"},
++            {kModloadPath, 65537u, kModloadArgs, kModloadResult, "argument buffer"},
++            {kModloadPath, 1u, 0u, kModloadResult, "argument buffer"},
++            {kModloadPath, 4u, 0xA01FFFFEu, kModloadResult, "argument buffer"},
++            {kModloadPath, 1u, 0x80080000u, kModloadResult, "argument buffer"},
++            {kModloadPath, 0u, 0u, kModloadResult + 1u, "result word"},
++            {kModloadPath, 0u, 0u, 0x200000u, "result word"},
++            {kModloadPath, 0u, 0u, 0xC0010A00u, "result word"},
++            {kModloadPath, 0u, 0u, 0x80080000u, "result word"},
++        };
++        for (const Invalid &item : invalid)
++        {
++            ModuleHost host;
++            host.file(std::string(path), returns());
++            IopEmulator iop(host);
++            const Irx caller = modloadCallback(7u, path, item.size, item.args, item.result, item.path);
++            require(iop.loadModuleImage("authored-invalid-buffer", caller.bytes, nullptr, 0u).moduleId > 0,
++                    "invalid-buffer caller did not start");
++            constexpr std::array<char, 2> tail{'x', 'x'};
++            require(iop.writeMemory(0x1FFFFEu, tail.data(), tail.size()), "tail fixture failed");
++            rejects([&] { (void)invokeModload(iop); }, item.reason);
++            require(host.opened.empty() && host.translated.empty() && iop.loadedModuleCount() == 1u &&
++                    word(iop, kModloadResult) == 0xDEADBEEFu,
++                    "bad guest buffer reached I/O/start or changed its result canary");
++        }
++        for (bool overlongPath : {false, true})
++        {
++            ModuleHost host;
++            host.file(std::string(path), returns());
++            IopEmulator iop(host);
++            const Irx caller = modloadCallback(7u, overlongPath ? std::string(1025u, 'x') : std::string(path),
++                                               overlongPath ? 0u : 2u, kModloadArgs);
++            require(iop.loadModuleImage("authored-unterminated", caller.bytes, nullptr, 0u).moduleId > 0,
++                    "unterminated caller did not start");
++            if (!overlongPath)
++            {
++                constexpr std::array<char, 2> bad{'a', 'b'};
++                require(iop.writeMemory(kModloadArgs, bad.data(), bad.size()), "argument fixture failed");
++            }
++            rejects([&] { (void)invokeModload(iop); }, "NUL");
++            require(host.opened.empty(), "unterminated input reached the host file");
++        }
++    }
++
++    void modloadOriginalEntryAndAliases()
++    {
++        const std::array<std::string, 3> expected{"cdrom0:\\MODULES\\MiXeD.IRX;1", "alpha beta", ""};
++        constexpr std::array<char, 12> packed{'a','l','p','h','a',' ','b','e','t','a','\0','\0'};
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            ModuleHost host;
++            host.file(expected[0], moduleArgumentRecorder(expected, 2u));
++            IopEmulator iop(host);
++            const Irx caller = modloadCallback(7u, expected[0], packed.size(), alias | kModloadArgs,
++                                               alias | kModloadResult, alias | kModloadPath);
++            const auto parent = iop.loadModuleImage("authored-loadfile", caller.bytes, nullptr, 0u);
++            require(parent.moduleId > 0 && iop.writeMemory(kModloadArgs, packed.data(), packed.size()),
++                    "authored LOADFILE input setup failed");
++            const auto reply = invokeModload(iop);
++            const uint32_t childId = word(iop, kModloadReply);
++            require(reply.size() == 8u && childId > static_cast<uint32_t>(parent.moduleId) &&
++                    word(iop, kModloadResult) == 2u && iop.loadedModuleCount() == 2u,
++                    "module ID, real startup result or residency was fabricated");
++            require(word(iop, kModloadReply + 4u) == 0x13572468u && word(iop, 0x20C00u) == expected.size() &&
++                    (word(iop, 0x20C04u) & 0xFFFFu) == childId &&
++                    word(iop, 0x20C20u + static_cast<uint32_t>(expected.size()) * 4u) == 0u,
++                    "nested start corrupted caller GP or used the wrong argc/argv/ModuleInfo");
++            for (size_t index = 0u; index < expected.size(); ++index)
++            {
++                std::vector<char> actual(expected[index].size() + 1u);
++                require(iop.readMemory(0x20C80u + static_cast<uint32_t>(index) * 0x80u,
++                                       actual.data(), actual.size()) && actual.back() == '\0' &&
++                        std::string(actual.data()) == expected[index],
++                        "original entry did not see the exact guest path and packed arguments");
++            }
++            require(host.translated == std::vector<std::string>{expected[0]} &&
++                    host.opened == std::vector<std::string>{host.translations.at(expected[0])} &&
++                    host.closed == 1u && host.active.empty() && host.ee.guestWrites == 0u,
++                    "MODLOAD translated twice, opened a raw path, leaked a handle or wrote EE RAM");
++        }
++        for (uint16_t disposition : {0u, 1u, 2u, 0xFFFFu})
++        {
++            ModuleHost host;
++            Irx child(0x20000u);
++            child.words(0u, {0x03E00008u, 0x24020000u | disposition});
++            host.file(expected[0], child);
++            IopEmulator iop(host);
++            const Irx caller = modloadCallback(7u, expected[0]);
++            require(iop.loadModuleImage("authored-result-caller", caller.bytes, nullptr, 0u).moduleId > 0,
++                    "disposition caller did not start");
++            (void)invokeModload(iop);
++            const uint32_t expectedResult = disposition == 0xFFFFu ? 0xFFFFFFFFu : disposition;
++            require(word(iop, kModloadResult) == expectedResult &&
++                    (static_cast<int32_t>(word(iop, kModloadReply)) > 0) == (disposition != 0xFFFFu) &&
++                    iop.loadedModuleCount() == ((disposition == 0u || disposition == 2u) ? 2u : 1u),
++                    "LoadStartModule ignored the actual original return disposition");
++        }
++        ModuleHost host;
++        Irx child(0x20000u);
++        child.words(0u, {0x03E00008u, 0x24020000u});
++        host.file(expected[0], child);
++        IopEmulator iop(host);
++        const Irx caller = modloadCallback(7u, expected[0], 0u, 0xFFFFFFFFu, 0u);
++        require(iop.loadModuleImage("authored-null-result", caller.bytes, nullptr, 0u).moduleId > 0,
++                "null-result caller did not start");
++        (void)invokeModload(iop);
++        require(static_cast<int32_t>(word(iop, kModloadReply)) > 0 && word(iop, kModloadResult) == 0xDEADBEEFu,
++                "zero argument length or optional result pointer lost compatibility");
++    }
++
++    void modloadBoundedHostRead()
++    {
++        constexpr std::string_view path = "cdrom0:\\MODULES\\child.IRX;1";
++        for (unsigned variant = 0u; variant < 5u; ++variant)
++        {
++            ModuleHost host;
++            Irx child(0x20000u);
++            child.words(0u, {0x03E00008u, 0x24020000u});
++            host.file(std::string(path), child);
++            if (variant == 0u) host.files.clear();
++            if (variant == 1u) host.advertisedSize = 0u;
++            if (variant == 2u) host.advertisedSize = 16u * 1024u * 1024u + 1u;
++            if (variant == 3u) host.shortRead = true;
++            if (variant == 4u) host.throwOnRead = true;
++            IopEmulator iop(host);
++            const Irx caller = modloadCallback(7u, path);
++            require(iop.loadModuleImage("authored-file-failure", caller.bytes, nullptr, 0u).moduleId > 0,
++                    "read-failure caller did not start");
++            if (variant == 4u)
++                rejects([&] { (void)invokeModload(iop); }, "authored host read failure");
++            else
++            {
++                (void)invokeModload(iop);
++                require(word(iop, kModloadReply) == static_cast<uint32_t>(variant == 0u ? -203 : -204),
++                        "host file failure became a successful module result");
++            }
++            require(host.opened.size() == 1u && host.closed == (variant == 0u ? 0u : 1u) &&
++                    host.active.empty() && word(iop, kModloadResult) == 0xDEADBEEFu &&
++                    word(iop, 0x20000u) == 0u && iop.loadedModuleCount() == 1u,
++                    "failed bounded file read leaked a handle or partially started a module");
++        }
++    }
++
++    Irx nestedModuleStart(std::string_view path)
++    {
++        Irx image(0x10000u, 0x1000u);
++        image.words(0x180u, {0x41E00000u, 0u, 0x0106u, 0x6C646F6Du, 0x0064616Fu,
++                             0x03E00008u, 0x24000007u, 0u, 0u});
++        std::copy(path.begin(), path.end(), image.bytes.begin() + 0x900u);
++        uint32_t pc = 0u;
++        emit(image, pc, 0x27BDFFE0u);
++        emit(image, pc, 0xAFBF001Cu);
++        emit(image, pc, 0xAFB00018u);
++        emit(image, pc, 0x00E08021u); // preserve the starting parent's ModuleInfo pointer.
++        constant(image, pc, 4u, kModloadPath);
++        constant(image, pc, 5u, 0u);
++        constant(image, pc, 6u, 0u);
++        constant(image, pc, 7u, kModloadResult);
++        constant(image, pc, 28u, 0x13572468u);
++        emit(image, pc, jal(0x10194u));
++        emit(image, pc, 0u);
++        constant(image, pc, 8u, kModloadReply);
++        emit(image, pc, 0xAD020000u); // child ID
++        emit(image, pc, 0x8E09000Cu); // starting parent ID
++        emit(image, pc, 0u);
++        emit(image, pc, 0xAD090004u);
++        emit(image, pc, 0xAD1C0008u);
++        emit(image, pc, 0x8FB00018u);
++        emit(image, pc, 0x8FBF001Cu);
++        emit(image, pc, 0x27BD0020u);
++        emit(image, pc, 0x03E00008u);
++        emit(image, pc, 0x24020000u);
++        require(pc < 0x180u, "authored nested entry overlaps imports");
++        return image;
++    }
++
++    void modloadStartingModuleReservation()
++    {
++        const std::array<std::string, 1> expected{"cdrom0:\\MODULES\\nested.IRX;1"};
++        ModuleHost host;
++        host.file(expected[0], moduleArgumentRecorder(expected));
++        IopEmulator iop(host);
++        const Irx parent = nestedModuleStart(expected[0]);
++        const auto result = iop.loadModuleImage("authored-parent-entry", parent.bytes, nullptr, 0u);
++        const uint32_t childId = word(iop, kModloadReply);
++        require(result.moduleId > 0 && childId != static_cast<uint32_t>(result.moduleId) &&
++                (word(iop, kModloadReply + 4u) & 0xFFFFu) == static_cast<uint32_t>(result.moduleId) &&
++                (word(iop, 0x20C04u) & 0xFFFFu) == childId &&
++                word(iop, kModloadReply + 8u) == 0x13572468u && iop.loadedModuleCount() == 2u,
++                "nested startup reused its parent's ID or lost active CPU/ModuleInfo state");
++        require(iop.stopModule(result.moduleId, nullptr) && iop.loadedModuleCount() == 1u &&
++                iop.stopModule(static_cast<int32_t>(childId), nullptr) && iop.loadedModuleCount() == 0u,
++                "nested modules do not have distinct lifetimes");
++
++        ModuleHost overlapHost;
++        overlapHost.file(expected[0], returns()); // fixed image would overwrite the still-starting parent.
++        IopEmulator overlap(overlapHost);
++        rejects([&] { (void)overlap.loadModuleImage("authored-overlap-parent", parent.bytes, nullptr, 0u); },
++                "overlaps an existing module");
++        require(word(overlap, 0x10000u) == 0x27BDFFE0u && overlap.loadedModuleCount() == 0u &&
++                overlapHost.closed == 1u && overlapHost.active.empty(),
++                "overlapping nested image overwrote its caller or left a successful reservation");
++        rejects([&] { overlap.checkExecutionFailure(); }, "overlaps an existing module");
++    }
++
++    void modloadCallbackFailureAndResultLifetime()
++    {
++        constexpr std::string_view path = "cdrom0:\\MODULES\\child.IRX;1";
++        {
++            ModuleHost host;
++            Irx child = callsImport("absent", 0x123u);
++            // Keep the authored missing-import child separate from its LOADFILE caller.
++            put32(child.bytes, 24u, 0x20000u);
++            put32(child.bytes, 60u, 0x20000u);
++            put32(child.bytes, 64u, 0x20000u);
++            put32(child.bytes, 0x108u, jal(0x20094u));
++            host.file(std::string(path), child);
++            IopEmulator iop(host);
++            const Irx caller = modloadCallback(7u, path);
++            require(iop.loadModuleImage("authored-failed-child-caller", caller.bytes, nullptr, 0u).moduleId > 0,
++                    "failed-child caller did not start");
++            rejects([&] { (void)invokeModload(iop); }, "missing import absent:291");
++            rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:291");
++            require(iop.loadedModuleCount() == 1u && word(iop, kModloadResult) == 0xDEADBEEFu &&
++                    host.closed == 1u && host.ee.guestWrites == 0u,
++                    "failed original child produced a result or successful module");
++        }
++        ModuleHost host;
++        IopEmulator iop(host);
++        // Reserve a genuine caller-owned result allocation before constructing the guest fixture.
++        const uint32_t resultAddress = iop.allocateMemory(16u, 16u);
++        require(resultAddress != 0u, "result lifetime fixture allocation failed");
++        Irx child(0x20000u);
++        child.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x6D737973u, 0x00006D65u,
++                             0x03E00008u, 0x24000005u, 0x03E00008u, 0x24000004u, 0u, 0u});
++        uint32_t pc = 0u;
++        emit(child, pc, 0x27BDFFE0u);
++        emit(child, pc, 0xAFBF001Cu);
++        constant(child, pc, 4u, resultAddress);
++        emit(child, pc, jal(0x20114u)); // actual FreeSysMemory of the caller's result lifetime.
++        emit(child, pc, 0u);
++        constant(child, pc, 4u, 2u);
++        constant(child, pc, 5u, 16u);
++        constant(child, pc, 6u, resultAddress);
++        emit(child, pc, jal(0x2011Cu)); // actual fixed-address replacement allocation.
++        emit(child, pc, 0u);
++        constant(child, pc, 8u, 0x12345678u);
++        emit(child, pc, 0xAC480000u); // sw t0,0(v0): replacement owner's canary.
++        emit(child, pc, 0x8FBF001Cu);
++        emit(child, pc, 0x27BD0020u);
++        emit(child, pc, 0x03E00008u);
++        emit(child, pc, 0x24020000u);
++        host.file(std::string(path), child);
++        const Irx caller = modloadCallback(7u, path, 0u, 0u, resultAddress);
++        require(iop.loadModuleImage("authored-result-lifetime", caller.bytes, nullptr, 0u).moduleId > 0,
++                "result-lifetime caller did not start");
++        rejects([&] { (void)invokeModload(iop); }, "result allocation was released or replaced");
++        require(word(iop, resultAddress) == 0x12345678u && iop.freeMemory(resultAddress),
++                "result write or cleanup corrupted a replacement allocation");
++    }
++
+     void returnDispositionAndCdvd()
+     {
+         for (uint16_t value : std::array<uint16_t, 5>{0u, 1u, 2u, 4u, 0xFFFFu})
+@@ -695,6 +1139,11 @@ int main()
+         {"Background strict execution failure survives noexcept scheduling", backgroundFailure},
+         {"Unloaded and nonresident strict callback code cannot execute or be reused", retiredCallbacks},
+         {"Original start result controls residency and CDVD uses existing model", returnDispositionAndCdvd},
++        {"MODLOAD validates complete guest buffers before opening or starting", modloadGuestBufferPreflight},
++        {"MODLOAD executes original entry with exact argv, aliases and return disposition", modloadOriginalEntryAndAliases},
++        {"MODLOAD opens one bounded translated file and closes it on failure", modloadBoundedHostRead},
++        {"Nested startup reserves distinct IDs and protects the still-starting image", modloadStartingModuleReservation},
++        {"MODLOAD propagates child failure and preserves result allocation ownership", modloadCallbackFailureAndResultLifetime},
+     };
+     return run(tests);
+ }

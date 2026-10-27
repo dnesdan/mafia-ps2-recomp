@@ -1,0 +1,643 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36d1938fe721616bcfaa68fbe540faa1c20..8239b9be8d976fe13eaf7e0ce7db59feda08d655 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -284,17 +284,23 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
+     {
++        if (m_nextAllocationIdentity == 0u)
++            return 0u; // Never recycle an exhausted lifetime-token space.
++        if (size > HeapLimit - HeapBase ||
++            (alignment != 0u && (alignment & (alignment - 1u)) != 0u) || alignment > HeapLimit)
++            return 0u;
+         size = alignUp(std::max(size, 1u), 16u);
+         alignment = std::max<uint32_t>(alignment, 4u);
+         if (fixed)
+         {
+             const uint32_t address = *fixed;
+-            if (address < HeapBase || address + size > HeapLimit)
++            if (address < HeapBase || address >= HeapLimit || size > HeapLimit - address ||
++                (address & (alignment - 1u)) != 0u)
+                 return 0u;
+             for (const auto &block : m_allocations)
+                 if (address < block.address + block.size && block.address < address + size)
+                     return 0u;
+-            m_allocations.push_back({address, size});
++            m_allocations.push_back({address, size, m_nextAllocationIdentity++});
+             markOwned(address, size);
+             return address;
+         }
+@@ -317,7 +323,7 @@ namespace ps2x::iop::detail
+         }
+         if (candidate > HeapLimit || size > HeapLimit - candidate)
+             return 0u;
+-        m_allocations.push_back({candidate, size});
++        m_allocations.push_back({candidate, size, m_nextAllocationIdentity++});
+         markOwned(candidate, size);
+         m_heapCursor = std::max(m_heapCursor, candidate + size);
+         return candidate;
+@@ -330,6 +336,8 @@ namespace ps2x::iop::detail
+                                         { return candidate.address == address; });
+         if (block == m_allocations.end())
+             return false;
++        if (block->address >= RamSize || block->size > RamSize - block->address)
++            return false;
+         std::fill(m_owned.begin() + block->address,
+                   m_owned.begin() + block->address + block->size,
+                   uint8_t{0});
+@@ -337,6 +345,13 @@ namespace ps2x::iop::detail
+         return true;
+     }
+ 
++    bool IopMemory::freeAllocation(uint32_t address, uint64_t identity)
++    {
++        const auto allocation = allocationContaining(address);
++        return identity != 0u && allocation && allocation->address == address &&
++               allocation->identity == identity && freeAllocation(address);
++    }
++
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+         return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+@@ -348,7 +363,7 @@ namespace ps2x::iop::detail
+                                         [&](const Allocation &candidate)
+                                         {
+                                             return address >= candidate.address &&
+-                                                   address < candidate.address + candidate.size;
++                                                   address - candidate.address < candidate.size;
+                                         });
+         if (block == m_allocations.end())
+             return std::nullopt;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d87be94287e9df007838db5a0a8932692e..2f427999297bb65b50afdc658058d86042a5a107 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -29,6 +29,7 @@ namespace ps2x::iop::detail
+         {
+             uint32_t address = 0;
+             uint32_t size = 0;
++            uint64_t identity = 0u;
+         };
+ 
+         struct DmaStart
+@@ -57,6 +58,9 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+         [[nodiscard]] bool freeAllocation(uint32_t address);
++        // An owner can release only its own allocation lifetime, even if another
++        // allocation subsequently reuses the same guest address and size.
++        [[nodiscard]] bool freeAllocation(uint32_t address, uint64_t identity);
+         [[nodiscard]] uint32_t maxFreeMemory() const;
+         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+ 
+@@ -82,6 +86,7 @@ namespace ps2x::iop::detail
+         std::vector<uint8_t> m_scratch;
+         std::unordered_map<uint32_t, uint32_t> m_hardware;
+         std::vector<Allocation> m_allocations;
++        uint64_t m_nextAllocationIdentity = 1u; // survives RAM reset and ordinary staged copies
+         uint32_t m_heapCursor = HeapBase;
+         uint32_t m_interruptStatus = 0;
+         uint32_t m_interruptMask = 0;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 0f7da6da8113c6c28b00f148a205b5192a388327..46673d73c54e5d0df42373d76a043091a9171ed4 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
++#include <stdexcept>
+ #include <string>
+ #include <system_error>
+ #include <unordered_map>
+@@ -39,6 +40,12 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdStreamTimeout = 5000u;
+         constexpr uint32_t kCdvdSyncTimeout = 15000u;
+         constexpr uint32_t kCdvdmanVersion = 0x0226u;
++        // Capacity of the modeled CDVDMAN service's persistent FSV workspace.
++        // Public PS2SDK cdvdman.c declares g_cdvdman_fsvrbuf[42128] and returns
++        // its address from sceGetFsvRbuf. This is not an original game's address
++        // or an inference about the size of its firmware module's BSS.
++        // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html
++        constexpr uint32_t kModeledFsvReadBufferBytes = 42128u;
+ 
+         uint32_t alignSectors(uint64_t bytes)
+         {
+@@ -183,11 +190,13 @@ namespace ps2x::iop::detail
+         ~Impl()
+         {
+             closeFiles();
++            releaseFsvReadBuffer();
+         }
+ 
+         void reset()
+         {
+             closeFiles();
++            releaseFsvReadBuffer();
+             callback = {};
+             initialized = false;
+             mediaMode = 0u;
+@@ -204,6 +213,42 @@ namespace ps2x::iop::detail
+             imageHandle = 0u;
+         }
+ 
++        void releaseFsvReadBuffer() noexcept
++        {
++            if (fsvReadBuffer != 0u)
++                (void)memory.freeAllocation(fsvReadBuffer, fsvReadBufferIdentity);
++            fsvReadBuffer = 0u;
++            fsvReadBufferIdentity = 0u;
++        }
++
++        uint32_t getFsvReadBuffer()
++        {
++            if (fsvReadBuffer != 0u)
++            {
++                const auto allocation = memory.allocationContaining(fsvReadBuffer);
++                if (!allocation || allocation->address != fsvReadBuffer ||
++                    allocation->identity != fsvReadBufferIdentity ||
++                    allocation->size < kModeledFsvReadBufferBytes ||
++                    !memory.ownsRamRange(fsvReadBuffer, kModeledFsvReadBufferBytes))
++                    throw std::runtime_error("IOP CDVDMAN FSV read-buffer backing was released before reset");
++                return fsvReadBuffer;
++            }
++            const uint32_t address = memory.allocate(kModeledFsvReadBufferBytes, 64u);
++            if (address == 0u)
++                throw std::runtime_error("IOP CDVDMAN cannot allocate its modeled 42128-byte FSV read buffer");
++            if (!memory.zeroRam(address, kModeledFsvReadBufferBytes))
++            {
++                (void)memory.freeAllocation(address);
++                throw std::runtime_error("IOP CDVDMAN FSV read buffer is outside IOP RAM");
++            }
++            const auto allocation = memory.allocationContaining(address);
++            if (!allocation)
++                throw std::runtime_error("IOP CDVDMAN FSV read buffer has no allocation identity");
++            fsvReadBuffer = address;
++            fsvReadBufferIdentity = allocation->identity;
++            return address;
++        }
++
+         bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -292,6 +337,10 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+ 
++            case 47: // sceGetFsvRbuf(void)
++                cpu.gpr[2] = getFsvReadBuffer();
++                return true;
++
+             case 50: // sceCdSC
+             {
+                 const int32_t code = static_cast<int32_t>(a0);
+@@ -738,6 +787,8 @@ namespace ps2x::iop::detail
+         uint32_t lastError = kCdvdErrorNone;
+         uint32_t streamFlag = 0u;
+         uint32_t lastReadTimeout = 0u;
++        uint32_t fsvReadBuffer = 0u;
++        uint64_t fsvReadBufferIdentity = 0u;
+         int interruptEventFlagId = 0;
+         uint64_t imageHandle = 0u;
+         bool virtualIsoBuilt = false;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 92b61020500f702f81e81a364f115b704e9420c6..34e934c322ab54a705716f0b741d6e036782b3b9 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -19,15 +19,33 @@ namespace ps2x::iop
+ {
+     namespace
+     {
+-        detail::BootImageEntry loadfileEntry(std::span<const uint8_t> image)
++        struct BootServiceEntry
++        {
++            detail::BootImageEntry entry;
++            uint32_t sid;
++        };
++
++        std::vector<BootServiceEntry> bootServiceEntries(std::span<const uint8_t> image)
+         {
+             const auto directory = detail::parseBootImage(image);
+-            const auto entry = std::find_if(directory.entries.begin(), directory.entries.end(),
+-                [](const auto &candidate) { return candidate.name == "LOADFILE"; });
+-            if (entry == directory.entries.end())
+-                throw std::runtime_error("IOP reset image lacks LOADFILE; no ROM firmware provider is available");
+-            detail::IopEmulator::validateModuleImage(detail::bootImageEntryBytes(image, *entry));
+-            return *entry;
++            std::vector<BootServiceEntry> services;
++            // These are explicitly selected service providers for the modeled
++            // kernel, not a reconstruction of the firmware's IOPBTCONF order.
++            for (const auto &[name, sid] : {std::pair{"LOADFILE", 0x80000006u},
++                                            std::pair{"CDVDFSV", 0x80000593u}})
++            {
++                const auto entry = std::find_if(directory.entries.begin(), directory.entries.end(),
++                    [name](const auto &candidate) { return candidate.name == name; });
++                if (entry == directory.entries.end())
++                {
++                    if (services.empty())
++                        throw std::runtime_error("IOP reset image lacks LOADFILE; no ROM firmware provider is available");
++                    continue;
++                }
++                detail::IopEmulator::validateModuleImage(detail::bootImageEntryBytes(image, *entry));
++                services.push_back({*entry, sid});
++            }
++            return services;
+         }
+     }
+ 
+@@ -178,42 +196,51 @@ namespace ps2x::iop
+         size_t bytesRead = 0u;
+         if (!host.readHostFile(handle, 0u, image.data(), image.size(), bytesRead) || bytesRead != image.size())
+             throw std::runtime_error("Cannot read complete requested IOP reset image");
+-        (void)loadfileEntry(image);
++        (void)bootServiceEntries(image);
+         return image;
+     }
+ 
+     void IopSubsystem::rebootFromImage(std::string path, std::vector<uint8_t> image)
+     {
+         // ROMDIR is an inventory, not the firmware boot order. This model resets
+-        // its owned kernel/allocator and executes the supplied LOADFILE service;
++        // its owned kernel/allocator and executes selected supplied services;
+         // it never invokes SYSMEM/LOADCORE with a guessed ordinary IRX ABI.
+-        const auto entry = loadfileEntry(image);
++        const auto services = bootServiceEntries(image);
+         reset();
+         try
+         {
+             m_impl->bootImagePath = std::move(path);
+             m_impl->bootImage = std::move(image);
+             (void)m_impl->sifCommand.getRegister(2u);
+-            const auto loaded = loadModuleImage("rom0:LOADFILE",
+-                detail::bootImageEntryBytes(m_impl->bootImage, entry));
+-            if (loaded.moduleId <= 0 || (static_cast<uint32_t>(loaded.startResult) & 3u) == 1u)
+-                throw std::runtime_error("IOP reset LOADFILE entry did not return resident");
+-            bool registered = false;
+-            for (uint32_t slice = 0u; slice < 1024u; ++slice)
++            std::string serviceNames;
++            for (const auto &service : services)
+             {
+-                uint32_t server = 0u, buffer = 0u, callback = 0u;
+-                if (getPacketRpcServer(0x80000006u, server, buffer, callback))
++                const auto loaded = loadModuleImage("rom0:" + service.entry.name,
++                    detail::bootImageEntryBytes(m_impl->bootImage, service.entry));
++                if (loaded.moduleId <= 0 || (static_cast<uint32_t>(loaded.startResult) & 3u) == 1u)
++                    throw std::runtime_error("IOP reset " + service.entry.name + " entry did not return resident");
++                bool registered = false;
++                for (uint32_t slice = 0u; slice < 1024u; ++slice)
+                 {
+-                    registered = true;
+-                    break;
++                    uint32_t server = 0u, buffer = 0u, callback = 0u;
++                    if (getPacketRpcServer(service.sid, server, buffer, callback))
++                    {
++                        registered = true;
++                        break;
++                    }
++                    runEeCycles(8192u);
++                    checkExecutionFailure();
+                 }
+-                runEeCycles(8192u);
+-                checkExecutionFailure();
++                if (!registered)
++                    throw std::runtime_error("IOP reset " + service.entry.name +
++                        " service did not register its RPC server within the bounded boot interval");
++                if (!serviceNames.empty())
++                    serviceNames += ",";
++                serviceNames += service.entry.name;
+             }
+-            if (!registered)
+-                throw std::runtime_error("IOP reset LOADFILE service did not register its RPC server within the bounded boot interval");
+             const std::string diagnostic = "[IOP:modeled-reset] image='" + m_impl->bootImagePath +
+-                "' kernel/allocator modeled; original LOADFILE entry and RPC registration completed; ROM firmware was not executed";
++                "' kernel/allocator modeled; supplied original services=" + serviceNames +
++                " completed entry and RPC registration; ROM firmware was not executed";
+             m_impl->loadOutcomes.push_back(diagnostic);
+             m_impl->host.log(LogLevel::Info, diagnostic);
+         }
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 30356184430c72848a7292158ace0edf219a40e1..c8a78fa6ed491982ad9e50629567fa7542f0be1e 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -16,6 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ #include <string_view>
++#include <stdexcept>
+ 
+ namespace
+ {
+@@ -274,6 +275,203 @@ namespace
+         return passed;
+     }
+ 
++    bool testCdvdFsvBuffer()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        // This capacity is the public modeled CDVDMAN workspace contract, not
++        // the size or address of any proprietary module's data section.
++        constexpr uint32_t bytes = 42128u;
++        const uint32_t prefix = memory.allocate(16u);
++        memory.write32(prefix, 0x12345678u);
++        IopCpuState cpu{};
++        if (!expect(cdvd.dispatchImport(47u, cpu), "cdvdman:47 was not handled"))
++            return false;
++        const uint32_t address = cpu.gpr[2];
++        if (!expect(address != 0u && (address & 63u) == 0u, "FSV workspace is not a real aligned IOP address") ||
++            !expect(memory.ownsRamRange(address, bytes), "FSV workspace lacks its complete owned backing") ||
++            !expect(!memory.ownsRamRange(address, bytes + 1u), "FSV workspace exposes unallocated trailing bytes") ||
++            !expect(memory.read32(address) == 0u && memory.read8(address + bytes - 1u) == 0u,
++                    "new FSV workspace did not have BSS-like zero contents"))
++            return false;
++        const uint32_t suffix = memory.allocate(16u);
++        memory.write32(suffix, 0x87654321u);
++        memory.write32(address, 0xAABBCCDDu);
++        memory.write8(address + bytes - 1u, 0xEFu);
++        const uint32_t freeBefore = memory.maxFreeMemory();
++        cpu = {};
++        if (!expect(cdvd.dispatchImport(47u, cpu) && cpu.gpr[2] == address,
++                    "repeated FSV lookup changed the persistent pointer") ||
++            !expect(memory.maxFreeMemory() == freeBefore && memory.read32(address) == 0xAABBCCDDu &&
++                    memory.read8(address + bytes - 1u) == 0xEFu, "repeated FSV lookup reallocated or erased guest data") ||
++            !expect(memory.read32(prefix) == 0x12345678u && memory.read32(suffix) == 0x87654321u,
++                    "FSV lookup overwrote neighboring allocations"))
++            return false;
++        cpu = {};
++        if (!expect(cdvd.dispatchImport(13u, cpu) && cpu.gpr[2] == 6u,
++                    "allocating workspace falsely initialized the disc or reported media readiness"))
++            return false;
++        cdvd.reset();
++        if (!expect(!memory.ownsRamRange(address, bytes), "component reset retained old FSV backing") ||
++            !expect(memory.read32(prefix) == 0x12345678u && memory.read32(suffix) == 0x87654321u,
++                    "component reset changed unrelated allocations"))
++            return false;
++        cpu = {};
++        if (!expect(cdvd.dispatchImport(47u, cpu) && cpu.gpr[2] != 0u &&
++                    memory.ownsRamRange(cpu.gpr[2], bytes) && memory.read32(cpu.gpr[2]) == 0u,
++                    "component reset did not start a new zeroed FSV lifetime"))
++            return false;
++        // Match the enclosing emulator's reset order: RAM first, model second.
++        memory.reset();
++        cdvd.reset();
++        cpu = {};
++        return expect(cdvd.dispatchImport(47u, cpu) && memory.ownsRamRange(cpu.gpr[2], bytes),
++                      "full IOP reset retained a stale workspace pointer");
++    }
++
++    bool testCdvdFsvBufferFailure()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        const uint32_t occupied = memory.allocate(memory.maxFreeMemory());
++        if (!expect(occupied != 0u, "could not reserve the heap for exhaustion fixture"))
++            return false;
++        memory.write32(occupied, 0xDEADBEEFu);
++        IopCpuState cpu{};
++        cpu.gpr[2] = 0x13579BDFu;
++        bool failed = false;
++        try { (void)cdvd.dispatchImport(47u, cpu); }
++        catch (const std::runtime_error &error)
++        {
++            failed = std::string_view(error.what()).find("cannot allocate") != std::string_view::npos;
++        }
++        if (!expect(failed && cpu.gpr[2] == 0x13579BDFu && memory.read32(occupied) == 0xDEADBEEFu,
++                    "FSV exhaustion fabricated a result or changed existing heap contents"))
++            return false;
++        memory.reset();
++        cdvd.reset();
++        if (!expect(cdvd.dispatchImport(47u, cpu), "FSV allocation did not recover after full reset"))
++            return false;
++        const uint32_t address = cpu.gpr[2];
++        if (!expect(memory.freeAllocation(address), "could not release backing for invalid-lifetime fixture"))
++            return false;
++        failed = false;
++        try { (void)cdvd.dispatchImport(47u, cpu); }
++        catch (const std::runtime_error &error)
++        {
++            failed = std::string_view(error.what()).find("backing was released") != std::string_view::npos;
++        }
++        return expect(failed, "FSV lookup returned a stale address after its backing was released");
++    }
++
++    bool testCdvdFsvAllocationIdentity()
++    {
++        for (const uint32_t replacementSize : {16u, 42128u})
++        {
++            for (const bool componentReset : {false, true})
++            {
++                NullHost host;
++                IopMemory memory;
++                IopKernel kernel(memory);
++                uint32_t replacement = 0u;
++                uint64_t identity = 0u;
++                {
++                    IopCdvd cdvd(host, memory, kernel);
++                    IopCpuState cpu{};
++                    if (!expect(cdvd.dispatchImport(47u, cpu), "FSV fixture allocation failed"))
++                        return false;
++                    const uint32_t address = cpu.gpr[2];
++                    if (!expect(memory.freeAllocation(address), "FSV fixture free failed"))
++                        return false;
++                    replacement = memory.allocate(replacementSize, 64u, address);
++                    if (!expect(replacement == address, "fixed-address replacement fixture failed"))
++                        return false;
++                    identity = memory.allocationContaining(replacement)->identity;
++                    memory.write32(replacement, 0x2468ACE0u);
++                    bool failed = false;
++                    try { (void)cdvd.dispatchImport(47u, cpu); }
++                    catch (const std::runtime_error &) { failed = true; }
++                    if (!expect(failed, "FSV lookup accepted another allocation at its old address"))
++                        return false;
++                    if (componentReset)
++                        cdvd.reset();
++                }
++                const auto allocation = memory.allocationContaining(replacement);
++                if (!expect(allocation && allocation->identity == identity &&
++                            memory.ownsRamRange(replacement, replacementSize) &&
++                            memory.read32(replacement) == 0x2468ACE0u,
++                            "CDVD component reset/destruction released an unrelated replacement allocation"))
++                    return false;
++            }
++        }
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopCdvd cdvd(host, memory, kernel);
++        IopCpuState cpu{};
++        if (!expect(cdvd.dispatchImport(47u, cpu), "FSV reset-identity fixture failed"))
++            return false;
++        const uint32_t address = cpu.gpr[2];
++        const uint64_t oldIdentity = memory.allocationContaining(address)->identity;
++        memory.reset();
++        const uint32_t replacement = memory.allocate(42128u, 64u, address);
++        if (!expect(replacement == address && memory.allocationContaining(address)->identity != oldIdentity,
++                    "RAM reset recycled an allocation lifetime token"))
++            return false;
++        memory.write32(replacement, 0x10203040u);
++        cdvd.reset();
++        return expect(memory.ownsRamRange(replacement, 42128u) && memory.read32(replacement) == 0x10203040u,
++                      "late component reset freed a new post-RAM-reset allocation");
++    }
++
++    bool testIopAllocationBoundsAndIdentity()
++    {
++        IopMemory memory;
++        const uint32_t address = memory.allocate(16u);
++        const auto original = memory.allocationContaining(address);
++        if (!expect(address != 0u && original && original->identity != 0u, "allocation lacks its lifetime identity"))
++            return false;
++        memory.write32(address, 0xAABBCCDDu);
++        const uint32_t freeBefore = memory.maxFreeMemory();
++        if (!expect(memory.allocate(32u, 16u, 0xFFFFFFF0u) == 0u &&
++                    memory.allocate(32u, 16u, IopMemory::HeapLimit - 16u) == 0u &&
++                    memory.allocate(16u, 16u, IopMemory::HeapBase - 16u) == 0u &&
++                    memory.allocate(16u, 16u, IopMemory::HeapBase + 1u) == 0u &&
++                    memory.allocate(0xFFFFFFFFu) == 0u && memory.allocate(16u, 0x80000000u) == 0u &&
++                    memory.allocate(16u, 3u) == 0u,
++                    "malformed fixed, rounded-size or alignment ranges were accepted") ||
++            !expect(!memory.freeAllocation(0xFFFFFFF0u) && memory.maxFreeMemory() == freeBefore &&
++                    memory.read32(address) == 0xAABBCCDDu,
++                    "failed allocation inserted a corrupt block or changed valid heap state"))
++            return false;
++        const uint32_t boundary = memory.allocate(16u, 16u, IopMemory::HeapLimit - 16u);
++        if (!expect(boundary != 0u && memory.ownsRamRange(boundary, 16u) && memory.freeAllocation(boundary),
++                    "valid exact-end fixed allocation was rejected"))
++            return false;
++        IopMemory staged = memory;
++        const uint32_t next = staged.allocate(16u);
++        if (!expect(next != 0u && staged.allocationContaining(address)->identity == original->identity &&
++                    staged.allocationContaining(next)->identity != original->identity,
++                    "staged memory copy changed old ownership or recycled its identity"))
++            return false;
++        memory = std::move(staged);
++        if (!expect(!memory.freeAllocation(address, 0u) &&
++                    !memory.freeAllocation(address, memory.allocationContaining(next)->identity) &&
++                    memory.ownsRamRange(address, 16u), "wrong allocation identity released live storage"))
++            return false;
++        memory.reset();
++        const uint32_t reused = memory.allocate(16u, 16u, address);
++        const auto replacement = memory.allocationContaining(reused);
++        return expect(reused == address && replacement && replacement->identity != original->identity &&
++                      !memory.freeAllocation(reused, original->identity) &&
++                      memory.freeAllocation(reused, replacement->identity),
++                      "post-reset release did not require the matching allocation lifetime");
++    }
++
+     bool testTimrmanPeriodicCallback()
+     {
+         IopTimrman timrman;
+@@ -331,7 +529,8 @@ namespace
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testTimrmanPeriodicCallback())
++        !testCdvdFsvBuffer() || !testCdvdFsvBufferFailure() || !testCdvdFsvAllocationIdentity() ||
++        !testIopAllocationBoundsAndIdentity() || !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+index 91345ae6679a3e239c80e04755714b35ff7e801f..4812dff069b26f3299831c34b7a92b3949dd64d8 100644
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -14,6 +14,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <stdexcept>
++#include <utility>
+ #include <vector>
+ 
+ namespace
+@@ -60,19 +61,45 @@ namespace
+         return bytes;
+     }
+ 
+-    std::vector<uint8_t> bootImage(const std::vector<uint8_t> &module, std::string_view name = "LOADFILE")
++    std::vector<uint8_t> bootImage(const std::vector<std::pair<std::string_view, std::vector<uint8_t>>> &modules)
+     {
+-        constexpr uint32_t directoryBytes = 80u;
+-        std::vector<uint8_t> bytes(directoryBytes + ((module.size() + 15u) & ~size_t{15u}), 0u);
+-        const std::array<std::string_view, 4u> names{"RESET", "ROMDIR", "EXTINFO", name};
++        const uint32_t directoryBytes = static_cast<uint32_t>(modules.size() + 4u) * 16u;
++        std::vector<uint8_t> bytes(directoryBytes, 0u);
++        const std::array<std::string_view, 3u> names{"RESET", "ROMDIR", "EXTINFO"};
+         for (size_t index = 0u; index < names.size(); ++index)
+             std::copy(names[index].begin(), names[index].end(), bytes.begin() + index * 16u);
+         put(bytes, 28u, directoryBytes);
+-        put(bytes, 60u, static_cast<uint32_t>(module.size()));
+-        std::copy(module.begin(), module.end(), bytes.begin() + directoryBytes);
++        for (size_t index = 0u; index < modules.size(); ++index)
++        {
++            const auto &[name, module] = modules[index];
++            std::copy(name.begin(), name.end(), bytes.begin() + (index + 3u) * 16u);
++            put(bytes, (index + 3u) * 16u + 12u, static_cast<uint32_t>(module.size()));
++            const size_t start = bytes.size();
++            bytes.resize(start + ((module.size() + 15u) & ~size_t{15u}), 0u);
++            std::copy(module.begin(), module.end(), bytes.begin() + start);
++        }
+         return bytes;
+     }
+ 
++    std::vector<uint8_t> bootImage(const std::vector<uint8_t> &module, std::string_view name = "LOADFILE")
++    {
++        return bootImage({{name, module}});
++    }
++
++    iop_test::Irx secondRpcServer(uint32_t sid, uint32_t reply)
++    {
++        auto image = iop_test::rpcServer(sid, reply);
++        put(image.bytes, 24u, 0x20000u);
++        put(image.bytes, 60u, 0x20000u);
++        put(image.bytes, 64u, 0x20000u);
++        image.words(0x08u, {0x3C040002u}); // server 0x20200
++        image.words(0x18u, {0x3C060002u}); // callback 0x20300
++        image.words(0x20u, {0x3C070002u}); // buffer 0x20400
++        image.words(0x34u, {0x0C00801Du}); // RegisterRpc import 0x20074
++        image.words(0x300u, {0x3C020002u}); // return 0x20400
++        return image;
++    }
++
+     struct ResetImageFixture
+     {
+         PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
+@@ -622,6 +649,34 @@ void register_ps2_sif_packet_tests()
+                      "CALL must execute actual guest callback instructions");
+         });
+ 
++        tc.Run("RESET preflights and executes an optional supplied CDVDFSV service", [](TestCase &t)
++        {
++            const auto loadfile = iop_test::rpcServer(0x80000006u, 0x11223344u);
++            const auto cdvd = secondRpcServer(0x80000593u, 0x55667788u);
++            ResetImageFixture fixture(bootImage({{"LOADFILE", loadfile.bytes}, {"CDVDFSV", cdvd.bytes}}));
++            PacketEnv env;
++            env.submit(fixture.resetPacket());
++            t.IsTrue((env.iop().getSifRegister(4u) & 0x40000u) != 0u &&
++                         env.iop().debugSnapshot().emulatorLoadedModules == 2u &&
++                         env.iop().debugSnapshot().emulatorRpcServers == 2u,
++                     "BOOTEND must follow actual registration by both supplied authored entries");
++            env.endpoint = env.iop().getSifRegister(2u);
++            const uint32_t server = env.bindService(0x80000593u);
++            t.Equals(server, 0x20200u, "SCMD BIND exposes the actual second provider's server");
++            env.submitRpc(server, 0u, {}, 4u);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply) && word(reply.data, 0u) == 0x55667788u,
++                     "SCMD result comes from its supplied guest callback");
++            env.iop().consumeSifReply();
++
++            fixture.replace(bootImage({{"LOADFILE", loadfile.bytes},
++                                       {"CDVDFSV", std::vector<uint8_t>(128u, 0u)}}));
++            t.IsTrue(env.fails(fixture.resetPacket()) && env.iop().sifRpcBuffer(server) == 0x20400u &&
++                         env.iop().debugSnapshot().emulatorLoadedModules == 2u,
++                     "invalid optional service bytes must fail before discarding either active provider");
++            env.iop().checkExecutionFailure();
++        });
++
+         tc.Run("RESET preflight rejects invalid images and mixed DMA before mutation", [](TestCase &t)
+         {
+             const auto valid = bootImage(iop_test::rpcServer(0x80000006u, 0x10203040u).bytes);

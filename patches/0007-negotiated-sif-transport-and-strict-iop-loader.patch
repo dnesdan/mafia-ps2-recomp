@@ -1,0 +1,3835 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index f8d3e4437a9b71c1e87a51b8de75bca0b5922f99..3225faf71d2263fda91dde38ebd2a60aef5c2a33 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -8,6 +8,9 @@ add_library(ps2_iop STATIC
+     src/ps2_path.cpp
+     src/iop_module_manager.cpp
+     src/iop_subsystem.cpp
++    src/iop_sif_command.cpp
++    src/iop_boot_image.cpp
++    src/iop_bootstrap_rpc.cpp
+     src/emulator/iop_emulator.cpp
+     src/emulator/core/iop_cpu.cpp
+     src/emulator/core/iop_kernel.cpp
+@@ -44,6 +47,16 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_boot_image_tests tests/iop_boot_image_tests.cpp)
++    target_link_libraries(ps2_iop_boot_image_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_boot_image_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_boot_image_tests COMMAND ps2_iop_boot_image_tests)
++
++    add_executable(ps2_iop_strict_loader_tests tests/iop_strict_loader_tests.cpp)
++    target_link_libraries(ps2_iop_strict_loader_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_strict_loader_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_strict_loader_tests COMMAND ps2_iop_strict_loader_tests)
++
+     add_executable(ps2_iop_emulator_tests tests/iop_emulator_tests.cpp)
+     target_link_libraries(ps2_iop_emulator_tests PRIVATE ps2_iop)
+     add_test(NAME ps2_iop_emulator_tests COMMAND ps2_iop_emulator_tests)
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81cfb00d935d71e3c18c3d871e5450533b0..79897607b708ed3c01dcbedf271aa4f59547415d 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -4,12 +4,33 @@
+ #include "ps2x/iop/iop_types.h"
+ 
+ #include <memory>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+ 
+ namespace ps2x::iop
+ {
++    // One IOP -> EE transfer: optional result bytes precede either a command
++    // packet in the negotiated receive buffer or a direct RPC completion.
++    struct SifEeReply
++    {
++        std::vector<uint8_t> packet;
++        std::vector<uint8_t> data;
++        uint32_t dataAddress = 0u;
++        uint32_t packetAddress = 0u;
++        bool command = true;
++    };
++
++    struct SifCommandPacket
++    {
++        uint32_t source = 0u;
++        uint32_t destination = 0u;
++        std::vector<uint8_t> bytes;
++        std::vector<uint8_t> rpcInput;
++        bool hasRpcInput = false;
++    };
++
+     class IopSubsystem
+     {
+     public:
+@@ -25,14 +46,36 @@ namespace ps2x::iop
+ 
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
++        // Strict packet-service loaders keep IOP/EE address spaces distinct and
++        // require the original IRX entry to complete without unsupported work.
++        [[nodiscard]] ModuleLoadResult loadModuleStrict(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
++        [[nodiscard]] ModuleLoadResult loadModuleImage(std::string_view path, std::span<const uint8_t> image,
++                                                      const void *arguments = nullptr, uint32_t argumentSize = 0);
++        [[nodiscard]] ModuleLoadResult loadModuleIopBuffer(uint32_t iopAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        [[nodiscard]] uint32_t callCdvdImport(uint16_t ordinal, uint32_t a0);
+ 
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
++        [[nodiscard]] uint32_t getSifRegister(uint32_t reg);
++        [[nodiscard]] uint32_t setSifRegister(uint32_t reg, uint32_t value);
++        [[nodiscard]] bool acceptsSifCommand(uint32_t destination) const noexcept;
++        [[nodiscard]] bool sifCommandsInitialized() const noexcept;
++        void validateSifCommand(const void *packet, size_t size) const;
++        void validateSifCommandBatch(std::span<const SifCommandPacket> packets) const;
++        void receiveSifCommand(const void *packet, size_t size);
++        void receiveSifCommandPacket(const SifCommandPacket &packet);
++        [[nodiscard]] uint32_t sifRpcBuffer(uint32_t server) const noexcept;
++        void checkExecutionFailure() const;
++        [[nodiscard]] uint32_t sifEeReceiveAddress() const noexcept;
++        [[nodiscard]] bool peekSifReply(SifEeReply &reply) const;
++        void consumeSifReply();
++        [[nodiscard]] bool queueSifCommand(uint32_t command, const void *packet, size_t size);
++
+         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
+         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+         [[nodiscard]] bool freeMemory(uint32_t address);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4e436d8a411053512855a6276382e8f6a2..0f7da6da8113c6c28b00f148a205b5192a388327 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -277,7 +277,7 @@ namespace ps2x::iop::detail
+                 return true;
+ 
+             case 13: // sceCdDiskReady
+-                cpu.gpr[2] = kCdvdReadyComplete;
++                cpu.gpr[2] = initialized && mediaAvailable() ? kCdvdReadyComplete : 6u; // SCECdNotReady
+                 return true;
+ 
+             case 28: // sceCdStatus
+@@ -385,6 +385,26 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        bool mediaAvailable()
++        {
++            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++            if (!imagePath.empty())
++            {
++                if (imageHandle == 0u)
++                    imageHandle = host.openHostFile(imagePath);
++                uint64_t size = 0u;
++                std::array<uint8_t, 7u> header{};
++                size_t bytesRead = 0u;
++                if (imageHandle != 0u && host.hostFileSize(imageHandle, size) &&
++                    size >= uint64_t(kPrimaryVolumeDescriptorLsn + 1u) * kSectorSize &&
++                    host.readHostFile(imageHandle, uint64_t(kPrimaryVolumeDescriptorLsn) * kSectorSize,
++                                      header.data(), header.size(), bytesRead) && bytesRead == header.size() &&
++                    header[0u] == 1u && std::memcmp(header.data() + 1u, "CD001", 5u) == 0 && header[6u] == 1u)
++                    return true;
++            }
++            return buildVirtualIso();
++        }
++
+         bool addDirectory(size_t parent, const std::filesystem::path &path)
+         {
+             std::error_code error;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9fe2419333caac0597ac94ef751af05c17..55169821ec36f29f6b58916955fbd7c77617e843 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -19,10 +19,13 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstring>
++#include <limits>
+ #include <map>
+ #include <optional>
+ #include <span>
+ #include <sstream>
++#include <stdexcept>
+ #include <utility>
+ 
+ namespace ps2x::iop::detail
+@@ -37,6 +40,227 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCallStackSize = 0x2000u;
+         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
+         constexpr uint64_t kCdvdCompletionCycles = 128u;
++        constexpr size_t kMaxStrictImageBytes = 16u * 1024u * 1024u;
++        constexpr size_t kMaxModulePathBytes = 1024u;
++        constexpr size_t kMaxModuleArgumentBytes = 64u * 1024u;
++
++        template <typename T> class RestoreValue
++        {
++        public:
++            RestoreValue(T &slot, T value) : slot_(slot), previous_(slot) { slot_ = value; }
++            ~RestoreValue() { slot_ = previous_; }
++            RestoreValue(const RestoreValue &) = delete;
++            RestoreValue &operator=(const RestoreValue &) = delete;
++        private:
++            T &slot_;
++            T previous_;
++        };
++
++        bool byteRange(std::span<const uint8_t> bytes, size_t offset, size_t size)
++        {
++            return offset <= bytes.size() && size <= bytes.size() - offset;
++        }
++
++        uint32_t imageWord(std::span<const uint8_t> bytes, size_t offset)
++        {
++            if (!byteRange(bytes, offset, 4u))
++                throw std::runtime_error("Strict IOP loader: truncated ELF field");
++            return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1u]) << 8u) |
++                   (uint32_t(bytes[offset + 2u]) << 16u) | (uint32_t(bytes[offset + 3u]) << 24u);
++        }
++
++        uint16_t imageHalf(std::span<const uint8_t> bytes, size_t offset)
++        {
++            if (!byteRange(bytes, offset, 2u))
++                throw std::runtime_error("Strict IOP loader: truncated ELF field");
++            return static_cast<uint16_t>(uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1u]) << 8u));
++        }
++
++        bool iopRamRange(uint32_t address, size_t size)
++        {
++            if (address >= IopMemory::RamSize &&
++                !(address >= 0x80000000u && address < 0x80200000u) &&
++                !(address >= 0xA0000000u && address < 0xA0200000u))
++                return false;
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
++        }
++
++        struct StrictImageInfo
++        {
++            size_t requiredBytes = 52u;
++            std::string name;
++            uint16_t version = 0u;
++            uint32_t textSize = 0u, dataSize = 0u, bssSize = 0u;
++        };
++
++        StrictImageInfo inspectStrictImage(std::span<const uint8_t> image)
++        {
++            if (image.size() < 52u || image.size() > kMaxStrictImageBytes ||
++                imageWord(image, 0u) != 0x464C457Fu || image[4u] != 1u || image[5u] != 1u ||
++                image[6u] != 1u || imageHalf(image, 18u) != 8u || imageWord(image, 20u) != 1u ||
++                imageHalf(image, 40u) != 52u)
++                throw std::runtime_error("Strict IOP loader: expected a bounded ELF32 little-endian MIPS image");
++            const uint16_t kind = imageHalf(image, 16u);
++            if (kind != 2u && kind != 0xFF80u && kind != 0xFF81u)
++                throw std::runtime_error("Strict IOP loader: unsupported executable ELF type");
++            const uint32_t phoff = imageWord(image, 28u), shoff = imageWord(image, 32u);
++            const uint16_t phnum = imageHalf(image, 44u), shnum = imageHalf(image, 48u);
++            if (phnum == 0u || phnum > 128u || imageHalf(image, 42u) != 32u || phoff < 52u ||
++                !byteRange(image, phoff, size_t(phnum) * 32u) ||
++                (shnum != 0u && (shnum > 4096u || imageHalf(image, 46u) != 40u || shoff < 52u ||
++                                !byteRange(image, shoff, size_t(shnum) * 40u))))
++                throw std::runtime_error("Strict IOP loader: malformed ELF header tables");
++            StrictImageInfo result;
++            result.requiredBytes = phoff + size_t(phnum) * 32u;
++            if (shnum != 0u)
++                result.requiredBytes = std::max(result.requiredBytes, shoff + size_t(shnum) * 40u);
++            struct Segment { uint32_t start, files, memory, flags; };
++            std::vector<Segment> segments;
++            bool hasMetadata = false;
++            uint32_t entry = imageWord(image, 24u);
++            for (size_t i = 0u; i < phnum; ++i)
++            {
++                const size_t ph = phoff + i * 32u;
++                const uint32_t type = imageWord(image, ph), offset = imageWord(image, ph + 4u);
++                const uint32_t files = imageWord(image, ph + 16u), memory = imageWord(image, ph + 20u);
++                if (!byteRange(image, offset, files))
++                    throw std::runtime_error("Strict IOP loader: program bytes extend beyond the image");
++                result.requiredBytes = std::max(result.requiredBytes, size_t(offset) + files);
++                if (type == 1u && memory != 0u)
++                {
++                    const uint32_t start = imageWord(image, ph + 8u), flags = imageWord(image, ph + 24u);
++                    const uint32_t alignment = imageWord(image, ph + 28u);
++                    if (files > memory || memory > IopMemory::RamSize ||
++                        uint64_t(start) + memory > std::numeric_limits<uint32_t>::max() ||
++                        (alignment > 1u && ((alignment & (alignment - 1u)) != 0u ||
++                                           (start % alignment) != (offset % alignment))))
++                        throw std::runtime_error("Strict IOP loader: invalid load-segment range or alignment");
++                    for (const Segment &previous : segments)
++                        if (uint64_t(start) < uint64_t(previous.start) + previous.memory &&
++                            uint64_t(previous.start) < uint64_t(start) + memory)
++                            throw std::runtime_error("Strict IOP loader: overlapping load segments");
++                    segments.push_back({start, files, memory, flags});
++                }
++                if (type == 0x70000080u)
++                {
++                    if (hasMetadata || files < 27u)
++                        throw std::runtime_error("Strict IOP loader: incomplete or duplicate IOPMOD metadata");
++                    hasMetadata = true;
++                    entry = imageWord(image, offset + 4u);
++                    result.textSize = imageWord(image, offset + 12u);
++                    result.dataSize = imageWord(image, offset + 16u);
++                    result.bssSize = imageWord(image, offset + 20u);
++                    result.version = imageHalf(image, offset + 24u);
++                    const auto name = image.subspan(offset + 26u, files - 26u);
++                    const auto end = std::find(name.begin(), name.end(), uint8_t{0u});
++                    if (end == name.begin() || end == name.end() || end - name.begin() > 255)
++                        throw std::runtime_error("Strict IOP loader: invalid IOPMOD name");
++                    result.name.assign(name.begin(), end);
++                }
++            }
++            if (segments.empty() || (entry & 3u) != 0u ||
++                std::none_of(segments.begin(), segments.end(), [&](const Segment &segment)
++                    { return (segment.flags & 1u) != 0u && entry >= segment.start &&
++                             uint64_t(entry) + 4u <= uint64_t(segment.start) + segment.files; }))
++                throw std::runtime_error("Strict IOP loader: entry is not aligned executable file data");
++            const auto [first, last] = std::minmax_element(segments.begin(), segments.end(),
++                [](const Segment &a, const Segment &b) { return a.start < b.start; });
++            const uint64_t imageSpan = uint64_t(last->start) + last->memory - first->start;
++            if (imageSpan > IopMemory::RamSize)
++                throw std::runtime_error("Strict IOP loader: load span exceeds IOP RAM");
++            if (hasMetadata && uint64_t(result.textSize) + result.dataSize + result.bssSize > imageSpan)
++                throw std::runtime_error("Strict IOP loader: IOPMOD sizes exceed the load span");
++            if (!hasMetadata)
++            {
++                for (const Segment &segment : segments)
++                {
++                    ((segment.flags & 1u) != 0u ? result.textSize : result.dataSize) += segment.files;
++                    result.bssSize += segment.memory - segment.files;
++                }
++            }
++            std::vector<uint32_t> pendingHi;
++            for (size_t i = 0u; i < shnum; ++i)
++            {
++                const size_t sh = shoff + i * 40u;
++                const uint32_t type = imageWord(image, sh + 4u), flags = imageWord(image, sh + 8u);
++                const uint32_t address = imageWord(image, sh + 12u), offset = imageWord(image, sh + 16u);
++                const uint32_t size = imageWord(image, sh + 20u), alignment = imageWord(image, sh + 32u);
++                if (type != 8u && !byteRange(image, offset, size))
++                    throw std::runtime_error("Strict IOP loader: section bytes extend beyond the image");
++                if (type != 8u)
++                    result.requiredBytes = std::max(result.requiredBytes, size_t(offset) + size);
++                if (alignment > 1u && (alignment & (alignment - 1u)) != 0u)
++                    throw std::runtime_error("Strict IOP loader: section alignment is not a power of two");
++                if ((flags & 2u) != 0u && size != 0u &&
++                    std::none_of(segments.begin(), segments.end(), [&](const Segment &segment)
++                        { return address >= segment.start && uint64_t(address) + size <= uint64_t(segment.start) + segment.memory; }))
++                    throw std::runtime_error("Strict IOP loader: allocated section is outside load segments");
++                if (type != 4u && type != 9u)
++                    continue;
++                const uint32_t entrySize = type == 4u ? 12u : 8u;
++                const uint32_t declaredSize = imageWord(image, sh + 36u);
++                const uint32_t target = imageWord(image, sh + 28u), symbols = imageWord(image, sh + 24u);
++                if ((declaredSize != 0u && declaredSize != entrySize) || size % entrySize != 0u || target >= shnum ||
++                    (imageWord(image, shoff + size_t(target) * 40u + 8u) & 2u) == 0u || symbols >= shnum)
++                    throw std::runtime_error("Strict IOP loader: malformed relocation section");
++                if (symbols != 0u)
++                {
++                    const size_t symbolHeader = shoff + size_t(symbols) * 40u;
++                    if (imageWord(image, symbolHeader + 4u) != 2u || imageWord(image, symbolHeader + 36u) != 16u ||
++                        imageWord(image, symbolHeader + 20u) % 16u != 0u ||
++                        !byteRange(image, imageWord(image, symbolHeader + 16u), imageWord(image, symbolHeader + 20u)))
++                        throw std::runtime_error("Strict IOP loader: malformed relocation symbol table");
++                }
++                for (size_t at = offset; at < size_t(offset) + size; at += entrySize)
++                {
++                    const uint32_t relocationOffset = imageWord(image, at), info = imageWord(image, at + 4u);
++                    const uint32_t relocationType = info & 0xFFu, symbol = info >> 8u;
++                    if (relocationType > 6u || (symbols == 0u && symbol != 0u) ||
++                        (symbols != 0u && symbol >= imageWord(image, shoff + size_t(symbols) * 40u + 20u) / 16u))
++                        throw std::runtime_error("Strict IOP loader: unsupported or unresolved relocation");
++                    if (symbols != 0u && symbol != 0u)
++                    {
++                        const size_t symbolHeader = shoff + size_t(symbols) * 40u;
++                        const size_t symbolOffset = imageWord(image, symbolHeader + 16u) + size_t(symbol) * 16u;
++                        const uint16_t section = imageHalf(image, symbolOffset + 14u);
++                        if (section == 0u || section >= shnum)
++                            throw std::runtime_error("Strict IOP loader: undefined or special relocation symbol is unsupported");
++                    }
++                    const uint64_t place = kind != 2u ? uint64_t(first->start) + relocationOffset :
++                        uint64_t(imageWord(image, shoff + size_t(target) * 40u + 12u)) + relocationOffset;
++                    if ((place & 3u) != 0u ||
++                        std::none_of(segments.begin(), segments.end(), [&](const Segment &segment)
++                            { return place >= segment.start && place + 4u <= uint64_t(segment.start) + segment.memory; }))
++                        throw std::runtime_error("Strict IOP loader: relocation destination is outside the loaded image");
++                    if (relocationType == 5u)
++                        pendingHi.push_back(symbol);
++                    else if (relocationType == 6u)
++                        std::erase(pendingHi, symbol);
++                }
++            }
++            if (!pendingHi.empty())
++                throw std::runtime_error("Strict IOP loader: unmatched HI16 relocation");
++            return result;
++        }
++
++        std::vector<size_t> argumentOffsets(std::string_view path, const void *arguments, uint32_t argumentSize)
++        {
++            if (path.empty() || path.size() > kMaxModulePathBytes || path.find('\0') != std::string_view::npos ||
++                argumentSize > kMaxModuleArgumentBytes || (argumentSize != 0u && !arguments))
++                throw std::runtime_error("Strict IOP loader: invalid module path or argument buffer");
++            const auto bytes = std::span(static_cast<const uint8_t *>(arguments), argumentSize);
++            std::vector<size_t> offsets;
++            for (size_t offset = 0u; offset < bytes.size();)
++            {
++                offsets.push_back(offset);
++                const auto end = std::find(bytes.begin() + offset, bytes.end(), uint8_t{0u});
++                if (end == bytes.end())
++                    throw std::runtime_error("Strict IOP loader: argument string lacks a bounded NUL terminator");
++                offset = static_cast<size_t>(end - bytes.begin()) + 1u;
++            }
++            return offsets;
++        }
+ 
+         uint32_t physicalAddress(uint32_t address)
+         {
+@@ -78,6 +302,8 @@ namespace ps2x::iop::detail
+             uint32_t entry = 0;
+             uint32_t gp = 0;
+             bool resident = false;
++            bool strict = false;
++            uint32_t metadata = 0u;
+         };
+ 
+         struct GuestCallback
+@@ -118,6 +344,7 @@ namespace ps2x::iop::detail
+             memory.reset();
+             kernel.reset();
+             modules.clear();
++            retiredStrictRanges.clear();
+             imports.reset();
+             rpc.reset();
+             cdvd.reset();
+@@ -136,6 +363,7 @@ namespace ps2x::iop::detail
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+             callDepth = 0u;
++            strictExecution = false;
+             secrMcCommandHandler = {};
+             secrMcDevIdHandler = {};
+             checkKelfPathCallback = {};
+@@ -215,6 +443,46 @@ namespace ps2x::iop::detail
+             host.log(level, text);
+         }
+ 
++        void checkExecutionFailure() const
++        {
++            if (!lastError.empty())
++                throw std::runtime_error(lastError);
++        }
++
++        void rememberExecutionFailure(std::string_view message)
++        {
++            if (lastError.empty())
++                lastError = std::string(message);
++        }
++
++        [[noreturn]] void executionFailure(std::string_view reason, const CpuState &cpu)
++        {
++            std::ostringstream out;
++            out << "Strict IOP execution: " << reason << " pc=0x" << std::hex << cpu.pc
++                << " cause=0x" << cpu.cop0[13] << " epc=0x" << cpu.cop0[14];
++            rememberExecutionFailure(out.str());
++            throw std::runtime_error(lastError);
++        }
++
++        bool strictAddress(uint32_t address) const
++        {
++            if (!iopRamRange(address, 4u))
++                return false;
++            const uint32_t physical = physicalAddress(address);
++            return retiredStrictAddress(address) || std::any_of(modules.begin(), modules.end(), [&](const auto &entry)
++                { const Module &module = entry.second;
++                  return module.strict && physical >= module.base && physical - module.base < module.size; });
++        }
++
++        bool retiredStrictAddress(uint32_t address) const
++        {
++            if (!iopRamRange(address, 4u))
++                return false;
++            const uint32_t physical = physicalAddress(address);
++            return std::any_of(retiredStrictRanges.begin(), retiredStrictRanges.end(), [&](const auto &range)
++                { return physical >= range.first && physical - range.first < range.second; });
++        }
++
+         bool checkInterrupt(CpuState &cpu)
+         {
+             const uint32_t status = cpu.cop0[12];
+@@ -326,7 +594,7 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
+-            if (iequals(call.library, "dmacman"))
++            if (iequals(call.library, "dmacman") && !strictExecution)
+             {
+                 setV0(0);
+                 return ImportDisposition::Handled;
+@@ -367,6 +635,11 @@ namespace ps2x::iop::detail
+                 cpu.stopped = true;
+                 return false;
+             }
++            if (strictExecution && ((cpu.pc & 3u) != 0u || !iopRamRange(cpu.pc, 4u) ||
++                                    !memory.ownsRamRange(cpu.pc, 4u)))
++                executionFailure("unaligned, unmapped or out-of-RAM instruction", cpu);
++            if (retiredStrictAddress(cpu.pc))
++                executionFailure("callback or branch into an unloaded strict module", cpu);
+             if (physicalAddress(cpu.pc) >= kRamSize)
+             {
+                 std::ostringstream out;
+@@ -376,13 +649,24 @@ namespace ps2x::iop::detail
+                 return false;
+             }
+             if (checkInterrupt(cpu))
++            {
++                if (strictExecution)
++                    executionFailure("unhandled CPU interrupt exception", cpu);
+                 return true;
++            }
+ 
+             if (const auto import = imports.decode(cpu.pc))
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                 ++totalInstructions;
+                 ++totalCycles;
++                if (strictExecution && disposition == ImportDisposition::Missing)
++                {
++                    std::ostringstream reason;
++                    reason << "missing import " << import->library << ':' << import->ordinal
++                           << " version=0x" << std::hex << import->version;
++                    executionFailure(reason.str(), cpu);
++                }
+                 if (disposition == ImportDisposition::JumpToGuest)
+                     return true;
+                 cpu.pc = cpu.gpr[31];
+@@ -394,24 +678,39 @@ namespace ps2x::iop::detail
+             schedulePendingDma();
+             ++totalInstructions;
+             ++totalCycles;
++            if (strictExecution && cpu.exception)
++                executionFailure("CPU instruction exception", cpu);
+             return running;
+         }
+ 
+         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
+         {
+-            CpuState *previous = activeCpu;
+-            activeCpu = &cpu;
++            const RestoreValue activeGuard(activeCpu, &cpu);
+             const uint64_t start = totalInstructions;
+-            while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
++            try
+             {
+-                if (!step(cpu))
+-                    break;
+-                if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+-                    servicePendingDmaInterrupts();
+-                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+-                    servicePendingGuestCallbacks();
++                while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
++                {
++                    if (!step(cpu))
++                        break;
++                    if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
++                        servicePendingDmaInterrupts();
++                    if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
++                        servicePendingGuestCallbacks();
++                }
++            }
++            catch (const std::exception &error)
++            {
++                if (strictExecution)
++                    rememberExecutionFailure(std::string("Strict IOP execution: ") + error.what());
++                throw;
++            }
++            catch (...)
++            {
++                if (strictExecution)
++                    rememberExecutionFailure("Strict IOP execution: unknown exception");
++                throw;
+             }
+-            activeCpu = previous;
+             return static_cast<uint32_t>(totalInstructions - start);
+         }
+ 
+@@ -423,6 +722,8 @@ namespace ps2x::iop::detail
+                               uint32_t gp,
+                               uint32_t budget = kMaxCallInstructions)
+         {
++            checkExecutionFailure();
++            const RestoreValue strictGuard(strictExecution, strictExecution || strictAddress(address));
+             struct CallDepthGuard
+             {
+                 uint32_t &depth;
+@@ -438,6 +739,8 @@ namespace ps2x::iop::detail
+             cpu.gpr[6] = a2;
+             cpu.gpr[7] = a3;
+             cpu.gpr[28] = gp;
++            if (strictExecution && depth >= kCallStackCapacity)
++                executionFailure("bounded call stack exhausted", cpu);
+             if (depth < kCallStackCapacity)
+             {
+                 const uint32_t stackTop = kCallStackLimit - depth * kCallStackSize;
+@@ -456,6 +759,10 @@ namespace ps2x::iop::detail
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
++            if (strictExecution && (cpu.pc != kCallReturnSentinel || cpu.branchPending || cpu.yielded))
++                executionFailure(cpu.yielded ? "module call yielded without returning" :
++                                 cpu.stopped ? "module call stopped without returning" :
++                                               "module call exhausted its instruction budget", cpu);
+             return cpu.gpr[2];
+         }
+ 
+@@ -555,6 +862,8 @@ namespace ps2x::iop::detail
+ 
+         void runCycles(uint64_t cycles) noexcept
+         {
++            if (!lastError.empty())
++                return;
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
+@@ -576,15 +885,25 @@ namespace ps2x::iop::detail
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
++                    const RestoreValue strictGuard(strictExecution, strictExecution || strictAddress(next->entry));
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
+                 }
+             }
+-            catch (...)
++            catch (const std::exception &error)
+             {
+                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
++                // runCpu and strict callbacks preserve the first strict error before
++                // their context guards unwind. The next packet/poll gate reports it.
++                if (!lastError.empty())
++                {
++                    try { log(LogLevel::Error, error.what()); } catch (...) {}
++                }
++            }
++            catch (...)
++            {
+             }
+         }
+ 
+@@ -641,6 +960,187 @@ namespace ps2x::iop::detail
+             return result;
+         }
+ 
++        void discardModuleExecution(const Module &module)
++        {
++            kernel.terminateThreadsInRange(module.base, module.size);
++            rpc.removeServersInRange(module.base, module.size);
++            imports.eraseRange(module.base, module.size);
++            kernel.cleanupDeadThreads();
++            if (module.strict)
++            {
++                // IRQ/timer/CDVD models may still hold a callback address. Never
++                // reinterpret a retired strict callback as legacy code or reuse
++                // its bytes for a new module before the subsystem is reset.
++                retiredStrictRanges.emplace_back(module.base, module.size);
++                std::erase_if(pendingGuestCallbacks, [&](const auto &entry)
++                    { const uint32_t pc = physicalAddress(entry.second.function);
++                      return pc >= module.base && pc - module.base < module.size; });
++                for (GuestCallback *callback : {&secrMcCommandHandler, &secrMcDevIdHandler, &checkKelfPathCallback})
++                {
++                    const uint32_t pc = physicalAddress(callback->function);
++                    if (pc >= module.base && pc - module.base < module.size)
++                        *callback = {};
++                }
++            }
++            if (module.metadata != 0u)
++                freeAllocation(module.metadata);
++        }
++
++        ModuleLoadResult loadImageStrict(std::string path, std::span<const uint8_t> image,
++                                         const void *arguments, uint32_t argumentSize)
++        {
++            checkExecutionFailure();
++            const std::vector<size_t> offsets = argumentOffsets(path, arguments, argumentSize);
++            const StrictImageInfo info = inspectStrictImage(image);
++            if (nextModuleId > std::numeric_limits<uint16_t>::max())
++                throw std::runtime_error("Strict IOP loader: ModuleInfo identifier space exhausted");
++
++            // Relocations and allocations are staged so an invalid image never
++            // overwrites a running module or partially mutates its RAM.
++            IopMemory staged = memory;
++            const IopImageLoadResult loaded = IopModuleLoader::load(image, staged, moduleCursor);
++            if (!loaded || !loaded.relocationsComplete)
++                throw std::runtime_error("Strict IOP loader: failed image load or incomplete relocations for " + path);
++            if (loaded.base < kModuleLoadBase || loaded.base >= kKernelHeapBase || loaded.size == 0u ||
++                loaded.size > kKernelHeapBase - loaded.base || (loaded.entry & 3u) != 0u ||
++                loaded.entry < loaded.base || loaded.entry - loaded.base >= loaded.size)
++                throw std::runtime_error("Strict IOP loader: image does not fit the reserved module arena");
++            for (const auto &[id, existing] : modules)
++            {
++                (void)id;
++                if (uint64_t(loaded.base) < uint64_t(existing.base) + existing.size &&
++                    uint64_t(existing.base) < uint64_t(loaded.base) + loaded.size)
++                    throw std::runtime_error("Strict IOP loader: image overlaps an existing module");
++            }
++            for (const auto &[base, size] : retiredStrictRanges)
++                if (uint64_t(loaded.base) < uint64_t(base) + size &&
++                    uint64_t(base) < uint64_t(loaded.base) + loaded.size)
++                    throw std::runtime_error("Strict IOP loader: image overlaps retired callback code; reset is required");
++
++            Module module;
++            module.id = static_cast<int>(nextModuleId);
++            module.path = std::move(path);
++            const size_t slash = module.path.find_last_of("/\\:");
++            module.name = !info.name.empty() ? info.name :
++                slash == std::string::npos ? module.path : module.path.substr(slash + 1u);
++            module.base = loaded.base;
++            module.size = loaded.size;
++            module.entry = loaded.entry;
++            module.gp = loaded.gp;
++            module.strict = true;
++
++            // The public MODLOAD start_module ABI is (argc, argv, 0, ModuleInfo*).
++            // argv[0] is the requested path; args contains bounded NUL-separated
++            // strings, not a byte count passed as argc. ModuleInfo is guest data.
++            // https://ps2dev.github.io/ps2sdk/modload_8c_source.html
++            // https://ps2dev.github.io/ps2sdk/loadcore_8h_source.html
++            const uint32_t argc = static_cast<uint32_t>(offsets.size() + 1u);
++            const uint32_t tableBytes = (argc + 1u) * 4u;
++            const uint32_t pathBytes = static_cast<uint32_t>(module.path.size() + 1u);
++            const uint32_t argumentAllocation = staged.allocate(tableBytes + pathBytes + argumentSize, 16u);
++            module.metadata = staged.allocate(48u + static_cast<uint32_t>(module.name.size()) + 1u, 16u);
++            if (argumentAllocation == 0u || module.metadata == 0u)
++                throw std::runtime_error("Strict IOP loader: insufficient IOP heap for arguments and ModuleInfo");
++
++            const uint32_t pathAddress = argumentAllocation + tableBytes;
++            const uint32_t argsAddress = pathAddress + pathBytes;
++            staged.write32(argumentAllocation, pathAddress);
++            if (!staged.writeRam(pathAddress, module.path.c_str(), pathBytes) ||
++                (argumentSize != 0u && !staged.writeRam(argsAddress, arguments, argumentSize)))
++                throw std::runtime_error("Strict IOP loader: argument copy is outside IOP RAM");
++            for (size_t i = 0u; i < offsets.size(); ++i)
++                staged.write32(argumentAllocation + static_cast<uint32_t>(i + 1u) * 4u,
++                               argsAddress + static_cast<uint32_t>(offsets[i]));
++            staged.write32(argumentAllocation + argc * 4u, 0u);
++            if (!staged.zeroRam(module.metadata, 48u) ||
++                !staged.writeRam(module.metadata + 48u, module.name.c_str(), module.name.size() + 1u))
++                throw std::runtime_error("Strict IOP loader: ModuleInfo copy is outside IOP RAM");
++            staged.write32(module.metadata + 4u, module.metadata + 48u);
++            staged.write16(module.metadata + 8u, info.version);
++            staged.write16(module.metadata + 10u, 2u); // starting
++            staged.write16(module.metadata + 12u, static_cast<uint16_t>(module.id));
++            staged.write32(module.metadata + 16u, module.entry);
++            staged.write32(module.metadata + 20u, module.gp);
++            staged.write32(module.metadata + 24u, module.base);
++            staged.write32(module.metadata + 28u, info.textSize);
++            staged.write32(module.metadata + 32u, info.dataSize);
++            staged.write32(module.metadata + 36u, info.bssSize);
++
++            memory = std::move(staged);
++            moduleCursor = std::max(moduleCursor, loaded.base + loaded.size);
++            const RestoreValue strictGuard(strictExecution, true);
++            uint32_t startResult = 0u;
++            try
++            {
++                startResult = callFunction(module.entry, argc, argumentAllocation, 0u, module.metadata, module.gp);
++            }
++            catch (const std::exception &error)
++            {
++                rememberExecutionFailure("Strict IOP module '" + module.path + "': " + error.what());
++                freeAllocation(argumentAllocation);
++                discardModuleExecution(module);
++                throw;
++            }
++            catch (...)
++            {
++                rememberExecutionFailure("Strict IOP module '" + module.path + "': unknown startup exception");
++                freeAllocation(argumentAllocation);
++                discardModuleExecution(module);
++                throw;
++            }
++            freeAllocation(argumentAllocation);
++            const uint32_t disposition = startResult & 3u;
++            if (static_cast<int32_t>(startResult) < 0 || disposition == 3u)
++            {
++                discardModuleExecution(module);
++                return {true, -1, static_cast<int32_t>(startResult)};
++            }
++            ++nextModuleId;
++            module.resident = disposition == 0u || disposition == 2u;
++            const ModuleLoadResult result{true, module.id, static_cast<int32_t>(startResult)};
++            if (module.resident)
++            {
++                memory.write16(module.metadata + 10u, disposition == 2u ? 0x13u : 3u);
++                modules.emplace(module.id, std::move(module));
++            }
++            else
++                discardModuleExecution(module);
++            std::ostringstream out;
++            out << "[IOP] strict IRX entry returned id=" << result.moduleId
++                << " entry=0x" << std::hex << loaded.entry << " base=0x" << loaded.base
++                << " start=" << std::dec << result.startResult;
++            log(LogLevel::Info, out.str());
++            return result;
++        }
++
++        ModuleLoadResult loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize)
++        {
++            checkExecutionFailure();
++            (void)argumentOffsets(path, arguments, argumentSize);
++            std::vector<uint8_t> image;
++            if (!IopModuleLoader::readWholeHostFile(host, path, image))
++            {
++                log(LogLevel::Warning, std::string("[IOP] failed to open IRX '") + std::string(path) + "'");
++                return {true, -1, -1};
++            }
++            return loadImageStrict(std::string(path), image, arguments, argumentSize);
++        }
++
++        ModuleLoadResult loadModuleIopBuffer(uint32_t address, const void *arguments, uint32_t argumentSize)
++        {
++            checkExecutionFailure();
++            if (!iopRamRange(address, 52u) || !memory.ownsRamRange(address, 52u))
++                throw std::runtime_error("Strict IOP loader: ELF buffer header is outside owned IOP RAM");
++            const auto bytes = memory.ram().subspan(physicalAddress(address));
++            const StrictImageInfo info = inspectStrictImage(bytes);
++            if (!memory.ownsRamRange(address, info.requiredBytes))
++                throw std::runtime_error("Strict IOP loader: complete ELF buffer is not present in IOP RAM");
++            const std::vector<uint8_t> image(bytes.begin(), bytes.begin() + info.requiredBytes);
++            // LOADFILE's buffer-start ABI uses this literal argv[0], because
++            // there is no source filename (PS2SDK loadfile.c: StartModule).
++            return loadImageStrict("LBbyEE", image, arguments, argumentSize);
++        }
++
+         ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+         {
+             std::vector<uint8_t> image;
+@@ -668,11 +1168,8 @@ namespace ps2x::iop::detail
+             if (it == modules.end())
+                 return false;
+             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
+-            kernel.terminateThreadsInRange(it->second.base, it->second.size);
+-            rpc.removeServersInRange(it->second.base, it->second.size);
+-            imports.eraseRange(it->second.base, it->second.size);
++            discardModuleExecution(it->second);
+             modules.erase(it);
+-            kernel.cleanupDeadThreads();
+             if (result)
+                 *result = 0;
+             return true;
+@@ -695,6 +1192,7 @@ namespace ps2x::iop::detail
+         IopImportRegistry imports;
+         IopLoadcore loadcore;
+         std::map<int, Module> modules;
++        std::vector<std::pair<uint32_t, uint32_t>> retiredStrictRanges;
+         std::map<int, uint64_t> pendingDmaInterrupts;
+         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+         uint32_t nextModuleId = 1;
+@@ -707,6 +1205,7 @@ namespace ps2x::iop::detail
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
++        bool strictExecution = false;
+         GuestCallback secrMcCommandHandler;
+         GuestCallback secrMcDevIdHandler;
+         GuestCallback checkKelfPathCallback;
+@@ -734,6 +1233,37 @@ namespace ps2x::iop::detail
+         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
++    ModuleLoadResult IopEmulator::loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize)
++    {
++        return m_impl->loadModuleStrict(path, arguments, argumentSize);
++    }
++
++    ModuleLoadResult IopEmulator::loadModuleImage(std::string_view path, std::span<const uint8_t> image,
++                                                const void *arguments, uint32_t argumentSize)
++    {
++        return m_impl->loadImageStrict(std::string(path), image, arguments, argumentSize);
++    }
++
++    ModuleLoadResult IopEmulator::loadModuleIopBuffer(uint32_t address, const void *arguments, uint32_t argumentSize)
++    {
++        return m_impl->loadModuleIopBuffer(address, arguments, argumentSize);
++    }
++
++    void IopEmulator::checkExecutionFailure() const
++    {
++        m_impl->checkExecutionFailure();
++    }
++
++    uint32_t IopEmulator::callCdvdImport(uint16_t ordinal, uint32_t a0)
++    {
++        checkExecutionFailure();
++        IopCpuState cpu{};
++        cpu.gpr[4] = a0;
++        if (!m_impl->cdvd.dispatchImport(ordinal, cpu))
++            throw std::runtime_error("Unsupported IOP CDVD import " + std::to_string(ordinal));
++        return cpu.gpr[2];
++    }
++
+     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
+     {
+         return m_impl->stopModule(moduleId, result);
+@@ -750,16 +1280,18 @@ namespace ps2x::iop::detail
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+     {
++        checkExecutionFailure();
+         return m_impl->rpc.handleRpc(request, *m_impl);
+     }
+ 
+     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
+     {
+-        return m_impl->rpc.hasServer(sid);
++        return m_impl->lastError.empty() && m_impl->rpc.hasServer(sid);
+     }
+ 
+     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
+     {
++        checkExecutionFailure();
+         m_impl->rpc.onSifTransfer(transfer);
+     }
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df57482646c829ebf19e76e3c351da56105..92f3f0d7d78e6b82cea7fd44d49f6206e3a31b38 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -5,6 +5,7 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -23,6 +24,14 @@ namespace ps2x::iop::detail
+         void reset();
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
++        [[nodiscard]] ModuleLoadResult loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize);
++        [[nodiscard]] ModuleLoadResult loadModuleImage(std::string_view path, std::span<const uint8_t> image,
++                                                     const void *arguments, uint32_t argumentSize);
++        [[nodiscard]] ModuleLoadResult loadModuleIopBuffer(uint32_t iopAddress, const void *arguments, uint32_t argumentSize);
++        // Background execution cannot throw through the EE cycle accounting API.
++        // Strict failures remain sticky until reset and are surfaced at this gate.
++        void checkExecutionFailure() const;
++        [[nodiscard]] uint32_t callCdvdImport(uint16_t ordinal, uint32_t a0);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+diff --git a/ps2xIOP/src/iop_boot_image.cpp b/ps2xIOP/src/iop_boot_image.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6baa81db6f3f3211f3011a9ca874f757f164019
+--- /dev/null
++++ b/ps2xIOP/src/iop_boot_image.cpp
+@@ -0,0 +1,173 @@
++#include "iop_boot_image.h"
++
++#include <algorithm>
++#include <array>
++#include <stdexcept>
++#include <string_view>
++#include <unordered_set>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr size_t kRecordSize = 16u;
++        constexpr size_t kDirectorySearchBytes = 0x8000u;
++
++        [[noreturn]] void invalid(std::string_view reason)
++        {
++            throw std::runtime_error("Invalid IOP boot image: " + std::string(reason));
++        }
++
++        bool contains(std::span<const uint8_t> bytes, size_t offset, size_t size)
++        {
++            return offset <= bytes.size() && size <= bytes.size() - offset;
++        }
++
++        uint16_t read16(std::span<const uint8_t> bytes, size_t offset)
++        {
++            if (!contains(bytes, offset, 2u))
++                invalid("truncated 16-bit field");
++            return static_cast<uint16_t>(uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1u]) << 8u));
++        }
++
++        uint32_t read32(std::span<const uint8_t> bytes, size_t offset)
++        {
++            if (!contains(bytes, offset, 4u))
++                invalid("truncated 32-bit field");
++            return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1u]) << 8u) |
++                   (uint32_t(bytes[offset + 2u]) << 16u) | (uint32_t(bytes[offset + 3u]) << 24u);
++        }
++
++        size_t alignedSize(uint32_t size)
++        {
++            // Compute in a wider type so a forged UINT32_MAX size cannot wrap.
++            return static_cast<size_t>((uint64_t(size) + 15u) & ~uint64_t{15u});
++        }
++
++        std::string nameAt(std::span<const uint8_t> image, size_t offset)
++        {
++            if (!contains(image, offset, 10u))
++                invalid("truncated entry name");
++            const auto field = image.subspan(offset, 10u);
++            const auto terminator = std::find(field.begin(), field.end(), uint8_t{0u});
++            if (terminator == field.begin())
++                invalid("empty entry name");
++            // ROMDRV compares all ten filename bytes. A full-width printable
++            // name is valid without a NUL; shorter names must be zero-padded.
++            if (!std::all_of(terminator, field.end(), [](uint8_t value) { return value == 0u; }))
++                invalid("entry name has nonzero bytes after its terminator");
++            for (auto at = field.begin(); at != terminator; ++at)
++            {
++                if (*at < 0x21u || *at > 0x7Eu || *at == '/' || *at == '\\' || *at == ':')
++                    invalid("entry name is not a plain printable filename");
++            }
++            const std::string name(field.begin(), terminator);
++            if (name == "." || name == "..")
++                invalid("entry name is a relative path component");
++            return name;
++        }
++
++        size_t findDirectory(std::span<const uint8_t> image)
++        {
++            // PS2SDK iop/fs/romdrv: RESET's rounded size locates the directory.
++            // The mount path searches its first 0x8000 bytes on 16-byte bounds.
++            constexpr std::array<uint8_t, 10u> reset{'R', 'E', 'S', 'E', 'T', 0u, 0u, 0u, 0u, 0u};
++            const size_t limit = std::min(image.size(), kDirectorySearchBytes);
++            for (size_t offset = 0u; offset < limit && contains(image, offset, 32u); offset += kRecordSize)
++            {
++                if (std::equal(reset.begin(), reset.end(), image.begin() + offset) &&
++                    alignedSize(read32(image, offset + 12u)) == offset)
++                    return offset;
++            }
++            invalid("no aligned RESET directory within the supported search range");
++        }
++
++        void validateExtInfo(std::span<const uint8_t> bytes)
++        {
++            // Each field is u16 value, u8 appended length, u8 type, then data.
++            // Unknown types remain inventory data; their framing is still checked.
++            for (size_t offset = 0u; offset < bytes.size();)
++            {
++                if (!contains(bytes, offset, 4u))
++                    invalid("truncated EXTINFO field header");
++                const size_t appended = bytes[offset + 2u];
++                if ((appended & 3u) != 0u || !contains(bytes, offset + 4u, appended))
++                    invalid("EXTINFO field length is unaligned or exceeds its entry");
++                offset += 4u + appended;
++            }
++        }
++    }
++
++    BootImage parseBootImage(std::span<const uint8_t> image)
++    {
++        // Public format: https://ps2dev.github.io/ps2sdk/romdrv_8h_source.html
++        // Locations and names are decoded bytewise, independent of host packing.
++        if (image.size() < 4u * kRecordSize || image.size() > kMaxBootImageBytes)
++            invalid("image size is outside the supported 64-byte to 16-MiB range");
++        const size_t directoryOffset = findDirectory(image);
++        if (!contains(image, directoryOffset, 4u * kRecordSize) ||
++            nameAt(image, directoryOffset + 16u) != "ROMDIR" ||
++            nameAt(image, directoryOffset + 32u) != "EXTINFO")
++            invalid("required RESET, ROMDIR, EXTINFO entries are not in order");
++        const uint32_t directorySize = read32(image, directoryOffset + 28u);
++        if ((directorySize & 15u) != 0u || directorySize < 4u * kRecordSize ||
++            directorySize / kRecordSize > kMaxBootImageEntries + 1u ||
++            !contains(image, directoryOffset, directorySize))
++            invalid("ROMDIR length is unaligned, truncated, or exceeds the entry limit");
++
++        BootImage result;
++        result.directoryOffset = directoryOffset;
++        std::unordered_set<std::string> names;
++        const size_t directoryEnd = directoryOffset + directorySize;
++        size_t dataOffset = 0u;
++        size_t extInfoOffset = 0u;
++        bool terminated = false;
++        for (size_t offset = directoryOffset; offset < directoryEnd; offset += kRecordSize)
++        {
++            const auto record = image.subspan(offset, kRecordSize);
++            if (std::all_of(record.begin(), record.end(), [](uint8_t value) { return value == 0u; }))
++            {
++                if (!std::all_of(image.begin() + offset, image.begin() + directoryEnd,
++                                 [](uint8_t value) { return value == 0u; }))
++                    invalid("ROMDIR has nonzero records after its terminator");
++                terminated = true;
++                break;
++            }
++            const std::string name = nameAt(image, offset);
++            const uint16_t extInfoSize = read16(image, offset + 10u);
++            const uint32_t size = read32(image, offset + 12u);
++            if (!names.emplace(name).second)
++                invalid("duplicate ROMDIR filename");
++            if ((extInfoSize & 3u) != 0u)
++                invalid("EXTINFO entry length is not four-byte aligned");
++            if (!contains(image, dataOffset, size))
++                invalid("file extent exceeds the supplied image");
++            result.entries.push_back({name, dataOffset, size, extInfoOffset, extInfoSize});
++            dataOffset += alignedSize(size);
++            extInfoOffset += extInfoSize;
++        }
++        if (!terminated || result.entries.size() < 3u)
++            invalid("ROMDIR lacks its complete zero terminator");
++
++        const BootImageEntry &extInfo = result.entries[2u];
++        if (result.entries[1u].offset != directoryOffset || extInfo.offset != directoryEnd)
++            invalid("directory self-location or EXTINFO location is inconsistent");
++        if (extInfoOffset != extInfo.size)
++            invalid("EXTINFO size does not equal the declared per-file records");
++        for (BootImageEntry &entry : result.entries)
++        {
++            entry.extInfoOffset += extInfo.offset;
++            if (!contains(image, entry.extInfoOffset, entry.extInfoSize))
++                invalid("EXTINFO extent exceeds the supplied image");
++            validateExtInfo(image.subspan(entry.extInfoOffset, entry.extInfoSize));
++        }
++        return result;
++    }
++
++    std::span<const uint8_t> bootImageEntryBytes(std::span<const uint8_t> image, const BootImageEntry &entry)
++    {
++        if (!contains(image, entry.offset, entry.size))
++            invalid("requested entry is outside the supplied image");
++        return image.subspan(entry.offset, entry.size);
++    }
++}
+diff --git a/ps2xIOP/src/iop_boot_image.h b/ps2xIOP/src/iop_boot_image.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc7911db8109610ca56a82680709c16892bc741c
+--- /dev/null
++++ b/ps2xIOP/src/iop_boot_image.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <string>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    struct BootImageEntry
++    {
++        std::string name;
++        size_t offset = 0u;
++        uint32_t size = 0u;
++        size_t extInfoOffset = 0u;
++        uint16_t extInfoSize = 0u;
++    };
++
++    struct BootImage
++    {
++        size_t directoryOffset = 0u;
++        std::vector<BootImageEntry> entries;
++    };
++
++    // This is an inventory parser, not a module loader. Entries refer to the
++    // caller's original bytes by checked offsets; the result owns no raw views.
++    // Limits bound malformed-input work and are well above ordinary IOP images.
++    inline constexpr size_t kMaxBootImageBytes = 16u * 1024u * 1024u;
++    inline constexpr size_t kMaxBootImageEntries = 4096u;
++    [[nodiscard]] BootImage parseBootImage(std::span<const uint8_t> image);
++    [[nodiscard]] std::span<const uint8_t> bootImageEntryBytes(
++        std::span<const uint8_t> image, const BootImageEntry &entry);
++}
+diff --git a/ps2xIOP/src/iop_bootstrap_rpc.cpp b/ps2xIOP/src/iop_bootstrap_rpc.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2e2ffc6b1fe6b0bdb7bc3e9f0f22f96b616578b
+--- /dev/null
++++ b/ps2xIOP/src/iop_bootstrap_rpc.cpp
+@@ -0,0 +1,186 @@
++#include "iop_bootstrap_rpc.h"
++
++#include "ps2x/iop/iop_subsystem.h"
++
++#include <algorithm>
++#include <array>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint32_t kHeap = 0x80000003u;
++        constexpr uint32_t kLoadfile = 0x80000006u;
++        constexpr uint32_t kCdvdInit = 0x80000592u;
++        constexpr uint32_t kCdvdReady = 0x8000059Au;
++
++        uint32_t word(std::span<const uint8_t> bytes, size_t offset)
++        {
++            if (offset > bytes.size() || bytes.size() - offset < 4u)
++                throw std::runtime_error("Truncated IOP bootstrap RPC request");
++            return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1u]) << 8u) |
++                   (uint32_t(bytes[offset + 2u]) << 16u) | (uint32_t(bytes[offset + 3u]) << 24u);
++        }
++
++        void put(std::vector<uint8_t> &bytes, size_t offset, uint32_t value)
++        {
++            for (size_t i = 0u; i < 4u; ++i)
++                bytes.at(offset + i) = static_cast<uint8_t>(value >> (i * 8u));
++        }
++
++        std::vector<uint8_t> result(uint32_t value)
++        {
++            std::vector<uint8_t> bytes(4u);
++            put(bytes, 0u, value);
++            return bytes;
++        }
++
++        std::string path(std::span<const uint8_t> input)
++        {
++            if (input.size() < 260u)
++                throw std::runtime_error("Truncated loadfile path field");
++            const auto bytes = input.subspan(8u, 252u);
++            const auto end = std::find(bytes.begin(), bytes.end(), uint8_t{0u});
++            if (end == bytes.begin() || end == bytes.end())
++                throw std::runtime_error("Loadfile path is empty or not terminated within its 252-byte field");
++            return {bytes.begin(), end};
++        }
++
++        void arguments(std::span<const uint8_t> input, uint32_t length)
++        {
++            if (length > 252u || input.size() < 260u || length > input.size() - 260u)
++                throw std::runtime_error("Loadfile argument bytes exceed the bounded packet field");
++            if (length != 0u && input[260u + length - 1u] != 0u)
++                throw std::runtime_error("Loadfile arguments must be complete NUL-terminated strings");
++        }
++
++        [[noreturn]] void unsupported(uint32_t sid, uint32_t function)
++        {
++            std::ostringstream text;
++            text << "Unsupported IOP bootstrap RPC sid=0x" << std::hex << sid
++                 << " function=0x" << function;
++            throw std::runtime_error(text.str());
++        }
++
++        void requiresReply(uint32_t receiveSize, uint32_t required)
++        {
++            if (receiveSize < required)
++                throw std::runtime_error("IOP bootstrap RPC receive buffer is shorter than the service result");
++        }
++    }
++
++    IopBootstrapRpc::IopBootstrapRpc(IopSubsystem &owner) noexcept : m_owner(&owner) {}
++    void IopBootstrapRpc::rebindOwner(IopSubsystem &owner) noexcept { m_owner = &owner; }
++    void IopBootstrapRpc::reset() noexcept {} // Owned allocator/loader/CDVD state resets in IopSubsystem.
++
++    bool IopBootstrapRpc::supports(uint32_t sid) const noexcept
++    {
++        return sid == kHeap || sid == kLoadfile || sid == kCdvdInit || sid == kCdvdReady;
++    }
++
++    void IopBootstrapRpc::validate(uint32_t sid, uint32_t function,
++                                    std::span<const uint8_t> input, uint32_t receiveSize) const
++    {
++        if (sid == kHeap)
++        {
++            if (function != 1u && function != 2u)
++                unsupported(sid, function);
++            (void)word(input, 0u);
++            requiresReply(receiveSize, 4u);
++            return;
++        }
++        if (sid == kLoadfile)
++        {
++            if (function == 0u || function == 6u)
++            {
++                if (input.size() < 512u)
++                    throw std::runtime_error("Truncated 512-byte loadfile module request");
++                const uint32_t length = word(input, function == 0u ? 0u : 4u);
++                arguments(input, length);
++                if (function == 0u)
++                    (void)path(input);
++                else if (!m_owner->isMemoryRange(word(input, 0u), 52u))
++                    throw std::runtime_error("Loadfile buffer is not a bounded IOP RAM address");
++                requiresReply(receiveSize, 8u);
++                return;
++            }
++            if (function == 2u || function == 3u)
++            {
++                const uint32_t type = word(input, 4u);
++                if (type > 2u || !m_owner->isMemoryRange(word(input, 0u), 1u << type))
++                    throw std::runtime_error("Invalid loadfile memory-value type or IOP range");
++                if (function == 2u)
++                    (void)word(input, 8u);
++                requiresReply(receiveSize, 4u);
++                return;
++            }
++            unsupported(sid, function);
++        }
++        if (sid == kCdvdInit || sid == kCdvdReady)
++        {
++            if (function != 0u)
++                unsupported(sid, function);
++            const uint32_t mode = word(input, 0u);
++            if ((sid == kCdvdInit && mode != 0u && mode != 1u && mode != 5u) ||
++                (sid == kCdvdReady && mode > 1u))
++                throw std::runtime_error("Unsupported CDVD initialization/readiness mode");
++            requiresReply(receiveSize, sid == kCdvdInit ? 16u : 4u);
++            return;
++        }
++        unsupported(sid, function);
++    }
++
++    std::vector<uint8_t> IopBootstrapRpc::call(uint32_t sid, uint32_t function,
++                                               std::span<const uint8_t> input, uint32_t receiveSize)
++    {
++        validate(sid, function, input, receiveSize);
++        if (sid == kHeap)
++        {
++            const uint32_t value = word(input, 0u);
++            if (function == 1u)
++                return result(value <= 0x00200000u ? m_owner->allocateMemory(value, 16u) : 0u);
++            return result(m_owner->freeMemory(value) ? 0u : uint32_t(-1));
++        }
++        if (sid == kLoadfile)
++        {
++            if (function == 0u || function == 6u)
++            {
++                const uint32_t length = word(input, function == 0u ? 0u : 4u);
++                const ModuleLoadResult loaded = function == 0u
++                    ? m_owner->loadModuleStrict(path(input), input.data() + 260u, length)
++                    : m_owner->loadModuleIopBuffer(word(input, 0u), input.data() + 260u, length);
++                std::vector<uint8_t> bytes(8u);
++                put(bytes, 0u, static_cast<uint32_t>(loaded.moduleId));
++                put(bytes, 4u, static_cast<uint32_t>(loaded.startResult));
++                return bytes;
++            }
++            const uint32_t address = word(input, 0u);
++            const uint32_t size = 1u << word(input, 4u);
++            if (function == 2u)
++            {
++                const auto value = result(word(input, 8u));
++                if (!m_owner->writeMemory(address, value.data(), size))
++                    throw std::runtime_error("Cannot write loadfile IOP memory value");
++                return result(0u);
++            }
++            std::array<uint8_t, 4u> value{};
++            if (!m_owner->readMemory(address, value.data(), size))
++                throw std::runtime_error("Cannot read loadfile IOP memory value");
++            return result(word(value, 0u));
++        }
++        if (sid == kCdvdInit)
++        {
++            std::vector<uint8_t> bytes(16u, 0u);
++            put(bytes, 0u, m_owner->callCdvdImport(4u, word(input, 0u)));
++            // This version identifies the modeled service; it does not claim
++            // that a physical CDVDFSV module was loaded or infer its version.
++            put(bytes, 4u, 0x0100u);
++            put(bytes, 8u, m_owner->callCdvdImport(50u, uint32_t(-9)));
++            return bytes;
++        }
++        return result(m_owner->callCdvdImport(13u, word(input, 0u)));
++    }
++}
+diff --git a/ps2xIOP/src/iop_bootstrap_rpc.h b/ps2xIOP/src/iop_bootstrap_rpc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..21b88ba81310dcd6bd927247bbbabcaf8510c579
+--- /dev/null
++++ b/ps2xIOP/src/iop_bootstrap_rpc.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace ps2x::iop
++{
++    class IopSubsystem;
++}
++
++namespace ps2x::iop::detail
++{
++    // Packet services backed by the same runtime allocator, strict IRX loader,
++    // and CDVD device state used by the emulated IOP.
++    class IopBootstrapRpc
++    {
++    public:
++        explicit IopBootstrapRpc(IopSubsystem &owner) noexcept;
++        void rebindOwner(IopSubsystem &owner) noexcept;
++        void reset() noexcept;
++        [[nodiscard]] bool supports(uint32_t sid) const noexcept;
++        void validate(uint32_t sid, uint32_t function, std::span<const uint8_t> input,
++                      uint32_t receiveSize) const;
++        [[nodiscard]] std::vector<uint8_t> call(uint32_t sid, uint32_t function,
++                                               std::span<const uint8_t> input, uint32_t receiveSize);
++
++    private:
++        IopSubsystem *m_owner;
++    };
++}
+diff --git a/ps2xIOP/src/iop_sif_command.cpp b/ps2xIOP/src/iop_sif_command.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cec43a32db745a5a3f6f3f1cec4aae7c17bde694
+--- /dev/null
++++ b/ps2xIOP/src/iop_sif_command.cpp
+@@ -0,0 +1,395 @@
++#include "iop_sif_command.h"
++
++#include <algorithm>
++#include <stdexcept>
++#include <sstream>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint32_t kSetSreg = 0x80000001u;
++        constexpr uint32_t kInit = 0x80000002u;
++        constexpr uint32_t kRpcEnd = 0x80000008u;
++        constexpr uint32_t kRpcBind = 0x80000009u;
++        constexpr uint32_t kRpcCall = 0x8000000Au;
++        constexpr uint32_t kRpcRead = 0x8000000Cu;
++        constexpr uint32_t kServerBufferSize = 4096u;
++        constexpr size_t kMaxReplies = 64u;
++
++        uint32_t word(std::span<const uint8_t> bytes, size_t offset)
++        {
++            if (offset > bytes.size() || bytes.size() - offset < 4u)
++                throw std::runtime_error("Truncated guest SIF packet word");
++            return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1]) << 8u) |
++                   (uint32_t(bytes[offset + 2]) << 16u) | (uint32_t(bytes[offset + 3]) << 24u);
++        }
++
++        void put(std::vector<uint8_t> &bytes, size_t offset, uint32_t value)
++        {
++            for (size_t i = 0; i < 4u; ++i)
++                bytes.at(offset + i) = static_cast<uint8_t>(value >> (8u * i));
++        }
++
++        bool eeRange(uint32_t address, uint32_t size)
++        {
++            constexpr uint32_t ramSize = 0x02000000u;
++            uint32_t physical = address;
++            if ((address >= 0x20000000u && address < 0x40000000u) ||
++                (address >= 0x80000000u && address < 0xC0000000u))
++                physical &= 0x1FFFFFFFu;
++            else if (address >= ramSize)
++                return false;
++            return size <= ramSize && physical <= ramSize - size;
++        }
++
++        [[noreturn]] void unsupported(uint32_t command)
++        {
++            std::ostringstream out;
++            out << "Unsupported IOP SIF command cid=0x" << std::hex << command;
++            throw std::runtime_error(out.str());
++        }
++    }
++
++    IopSifCommand::IopSifCommand(IopSubsystem &owner)
++        : m_owner(&owner), m_bootstrap(owner)
++    {
++    }
++
++    void IopSifCommand::rebindOwner(IopSubsystem &owner) noexcept
++    {
++        m_owner = &owner;
++        m_bootstrap.rebindOwner(owner);
++    }
++
++    void IopSifCommand::reset()
++    {
++        // The owner resets the IOP allocator before this call.
++        m_endpoint = 0u;
++        m_eeReceiveAddress = 0u;
++        m_smFlags = 0u;
++        m_peerRpcInitialized = false;
++        m_registers.clear();
++        m_sregs.fill(0u);
++        m_servers.clear();
++        m_replies.clear();
++        m_bootstrap.reset();
++    }
++
++    void IopSifCommand::initialize()
++    {
++        if (m_endpoint != 0u)
++            return;
++        if (!m_bootstrap.supports(0x80000003u) || !m_bootstrap.supports(0x80000006u))
++            throw std::runtime_error("IOP SIF bootstrap providers are unavailable");
++        const uint32_t endpoint = m_owner->allocateMemory(128u, 64u);
++        if (endpoint == 0u || !m_owner->zeroMemory(endpoint, 128u))
++            throw std::runtime_error("Cannot allocate IOP SIF command endpoint");
++        m_endpoint = endpoint;
++        m_smFlags = 0x00030000u; // SIF and command receiver are now initialized.
++    }
++
++    uint32_t IopSifCommand::getRegister(uint32_t reg)
++    {
++        if (reg == 2u || reg == 4u)
++        {
++            initialize();
++            return reg == 2u ? m_endpoint : m_smFlags;
++        }
++        const auto entry = m_registers.find(reg);
++        return entry == m_registers.end() ? 0u : entry->second;
++    }
++
++    uint32_t IopSifCommand::setRegister(uint32_t reg, uint32_t value)
++    {
++        const uint32_t previous = getRegister(reg);
++        if (reg == 4u)
++            m_smFlags &= ~value; // EE writes acknowledge/clear IOP -> EE flags.
++        else if (reg == 3u)
++            m_registers[reg] = previous | value;
++        else
++            m_registers[reg] = value;
++        return previous;
++    }
++
++    bool IopSifCommand::accepts(uint32_t destination) const noexcept
++    {
++        return m_endpoint != 0u && destination == m_endpoint;
++    }
++
++    const IopSifCommand::Server *IopSifCommand::serverAt(uint32_t address) const
++    {
++        const auto found = std::find_if(m_servers.begin(), m_servers.end(),
++            [address](const Server &server) { return server.address == address; });
++        return found == m_servers.end() ? nullptr : &*found;
++    }
++
++    void IopSifCommand::validate(std::span<const uint8_t> packet) const
++    {
++        validateWithState(packet, m_eeReceiveAddress, m_peerRpcInitialized, m_replies.size());
++    }
++
++    void IopSifCommand::validateBatch(std::span<const SifCommandPacket> packets) const
++    {
++        uint32_t receiveAddress = m_eeReceiveAddress;
++        bool peerInitialized = m_peerRpcInitialized;
++        size_t replies = m_replies.size();
++        size_t rpcRequests = 0u;
++        for (const SifCommandPacket &packet : packets)
++        {
++            try
++            {
++                validateWithState(packet.bytes, receiveAddress, peerInitialized, replies);
++                const uint32_t command = word(packet.bytes, 8u);
++                if ((command == kRpcBind || command == kRpcCall || command == kRpcRead) && ++rpcRequests > 1u)
++                    throw std::runtime_error("Multiple RPC requests in one DMA batch require unsupported transactional service execution");
++                if (command == kRpcCall)
++                {
++                    std::vector<uint8_t> input;
++                    if (packet.hasRpcInput)
++                        input = packet.rpcInput;
++                    else
++                    {
++                        input.resize(word(packet.bytes, 36u));
++                        if (!m_owner->readMemory(serverAt(word(packet.bytes, 52u))->buffer, input.data(), input.size()))
++                            throw std::runtime_error("Cannot preflight SIF RPC request bytes");
++                    }
++                    if (input.size() != word(packet.bytes, 36u))
++                        throw std::runtime_error("SIF RPC input snapshot length disagrees with the CALL packet");
++                    m_bootstrap.validate(serverAt(word(packet.bytes, 52u))->sid, word(packet.bytes, 32u),
++                                         input, word(packet.bytes, 44u));
++                }
++                if (command == kInit)
++                {
++                    if (word(packet.bytes, 12u) == 0u)
++                        receiveAddress = word(packet.bytes, 16u);
++                    else
++                        peerInitialized = true;
++                }
++                if ((command == kInit && word(packet.bytes, 12u) == 0u) ||
++                    command == kRpcBind || command == kRpcCall || command == kRpcRead)
++                    ++replies;
++            }
++            catch (const std::exception &error)
++            {
++                std::ostringstream detail;
++                const uint32_t command = packet.bytes.size() >= 12u ? word(packet.bytes, 8u) : 0u;
++                detail << error.what() << "; cid=0x" << std::hex << command
++                       << " src=0x" << packet.source << " dst=0x" << packet.destination;
++                throw std::runtime_error(detail.str());
++            }
++        }
++    }
++
++    void IopSifCommand::validateWithState(std::span<const uint8_t> packet, uint32_t eeReceiveAddress,
++                                         bool peerRpcInitialized, size_t queuedReplies) const
++    {
++        if (!initialized() || packet.size() < 16u || packet.size() > 112u ||
++            (word(packet, 0u) & 0xFFu) != packet.size())
++            throw std::runtime_error("Malformed or uninitialized IOP SIF command packet");
++        const uint32_t command = word(packet, 8u);
++        const bool needsReply = (command == kInit && word(packet, 12u) == 0u) ||
++                                command == kRpcBind || command == kRpcCall || command == kRpcRead;
++        if (needsReply && queuedReplies >= kMaxReplies)
++            throw std::runtime_error("IOP SIF reply queue is full; EE receiver has not consumed pending packets");
++        if (command == kInit)
++        {
++            const uint32_t option = word(packet, 12u);
++            if (option == 0u)
++            {
++                const uint32_t address = word(packet, 16u);
++                if (address == 0u || (address & 15u) != 0u || !eeRange(address, 128u))
++                    throw std::runtime_error("Invalid EE SIF command receive buffer");
++            }
++            else if (option != 1u || eeReceiveAddress == 0u)
++                throw std::runtime_error("SIF RPC initialization requires prior INIT_CMD option 0");
++            return;
++        }
++        if (command == kSetSreg)
++        {
++            if (word(packet, 16u) >= m_sregs.size())
++                throw std::runtime_error("Invalid IOP SIF software register index");
++            (void)word(packet, 20u);
++            return;
++        }
++        if (command != kRpcBind && command != kRpcCall && command != kRpcRead)
++            unsupported(command);
++        if (!peerRpcInitialized || eeReceiveAddress == 0u)
++            throw std::runtime_error("SIF RPC request precedes the negotiated RPC initialization");
++        if (packet.size() < 64u)
++            throw std::runtime_error("Truncated 64-byte SIF RPC packet");
++        const uint32_t client = word(packet, 28u);
++        const uint32_t requestAddress = word(packet, 20u);
++        const uint32_t clientSize = command == kRpcRead ? 28u : 40u;
++        if (client == 0u || !eeRange(client, clientSize) || requestAddress == 0u || !eeRange(requestAddress, 64u))
++            throw std::runtime_error("SIF RPC packet contains an invalid EE client or request address");
++        if (command == kRpcCall)
++        {
++            const Server *server = serverAt(word(packet, 52u));
++            if (!server)
++                throw std::runtime_error("SIF RPC CALL references an unbound IOP server");
++            const uint32_t sendSize = word(packet, 36u);
++            const uint32_t receiveSize = word(packet, 44u);
++            const uint32_t receiveAddress = word(packet, 40u);
++            if (sendSize > kServerBufferSize || receiveSize > kServerBufferSize ||
++                (receiveSize != 0u && (receiveAddress == 0u || !eeRange(receiveAddress, receiveSize))) ||
++                word(packet, 48u) > 1u)
++                throw std::runtime_error("SIF RPC CALL buffer or completion mode is outside supported bounds");
++        }
++        else if (command == kRpcRead)
++        {
++            const uint32_t size = word(packet, 40u);
++            if (size > 0x00200000u || !m_owner->isMemoryRange(word(packet, 32u), size) ||
++                !eeRange(word(packet, 36u), size))
++                throw std::runtime_error("SIF RPC RDATA contains an invalid IOP/EE memory range");
++        }
++    }
++
++    void IopSifCommand::queueReady()
++    {
++        SifEeReply reply;
++        reply.packet.resize(24u, 0u);
++        put(reply.packet, 0u, 24u);
++        put(reply.packet, 8u, kSetSreg);
++        put(reply.packet, 16u, 0u);
++        put(reply.packet, 20u, 1u);
++        m_replies.push_back(std::move(reply));
++    }
++
++    SifEeReply IopSifCommand::makeEnd(std::span<const uint8_t> request) const
++    {
++        SifEeReply reply;
++        reply.packet.resize(64u, 0u);
++        put(reply.packet, 0u, 64u);
++        put(reply.packet, 8u, kRpcEnd);
++        put(reply.packet, 16u, word(request, 16u));
++        put(reply.packet, 20u, word(request, 20u));
++        put(reply.packet, 24u, word(request, 24u));
++        put(reply.packet, 28u, word(request, 28u));
++        put(reply.packet, 32u, word(request, 8u));
++        return reply;
++    }
++
++    IopSifCommand::Server *IopSifCommand::findServer(uint32_t sid)
++    {
++        for (Server &server : m_servers)
++            if (server.sid == sid)
++                return &server;
++        if (!m_bootstrap.supports(sid))
++            return nullptr;
++        const uint32_t allocation = m_owner->allocateMemory(64u + kServerBufferSize, 64u);
++        if (allocation == 0u || !m_owner->zeroMemory(allocation, 64u + kServerBufferSize))
++            throw std::runtime_error("Cannot allocate a SIF RPC server and request buffer");
++        m_servers.push_back({sid, allocation, allocation + 64u});
++        return &m_servers.back();
++    }
++
++    uint32_t IopSifCommand::rpcBuffer(uint32_t server) const noexcept
++    {
++        const Server *entry = serverAt(server);
++        return entry ? entry->buffer : 0u;
++    }
++
++    void IopSifCommand::receive(std::span<const uint8_t> packet)
++    {
++        execute(packet, nullptr);
++    }
++
++    void IopSifCommand::receive(const SifCommandPacket &packet)
++    {
++        execute(packet.bytes, packet.hasRpcInput ? &packet.rpcInput : nullptr);
++    }
++
++    void IopSifCommand::execute(std::span<const uint8_t> packet, const std::vector<uint8_t> *rpcInput)
++    {
++        validate(packet);
++        const uint32_t command = word(packet, 8u);
++        if (command == kInit)
++        {
++            if (word(packet, 12u) == 0u)
++            {
++                m_eeReceiveAddress = word(packet, 16u);
++                queueReady(); // Original EE SET_SREG handler performs the store.
++            }
++            else
++                m_peerRpcInitialized = true;
++            return;
++        }
++        if (command == kSetSreg)
++        {
++            m_sregs[word(packet, 16u)] = word(packet, 20u);
++            return;
++        }
++        SifEeReply reply = makeEnd(packet);
++        if (command == kRpcBind)
++        {
++            if (Server *server = findServer(word(packet, 32u)))
++            {
++                put(reply.packet, 36u, server->address);
++                put(reply.packet, 40u, server->buffer);
++            }
++        }
++        else if (command == kRpcCall)
++        {
++            const Server &server = *serverAt(word(packet, 52u));
++            std::vector<uint8_t> input(word(packet, 36u));
++            if (rpcInput)
++            {
++                if (rpcInput->size() != input.size())
++                    throw std::runtime_error("SIF RPC input snapshot length disagrees with the CALL packet");
++                input = *rpcInput;
++            }
++            else if (!m_owner->readMemory(server.buffer, input.data(), input.size()))
++                throw std::runtime_error("Cannot read SIF RPC request bytes from IOP RAM");
++            reply.dataAddress = word(packet, 40u);
++            reply.data = m_bootstrap.call(server.sid, word(packet, 32u), input, word(packet, 44u));
++            if (reply.data.size() > word(packet, 44u))
++                throw std::runtime_error("IOP SIF RPC service exceeded the requested reply size");
++            if (word(packet, 48u) == 0u)
++            {
++                reply.command = false;
++                reply.packetAddress = word(packet, 20u);
++                put(reply.packet, 16u, 0u);
++                put(reply.packet, 24u, 0u);
++            }
++        }
++        else if (command == kRpcRead)
++        {
++            reply.dataAddress = word(packet, 36u);
++            reply.data.resize(word(packet, 40u));
++            if (!m_owner->readMemory(word(packet, 32u), reply.data.data(), reply.data.size()))
++                throw std::runtime_error("Cannot read SIF RPC RDATA source from IOP RAM");
++        }
++        put(reply.packet, 0u, 64u | (static_cast<uint32_t>(reply.data.size()) << 8u));
++        put(reply.packet, 4u, reply.dataAddress);
++        m_replies.push_back(std::move(reply));
++    }
++
++    bool IopSifCommand::peekReply(SifEeReply &reply) const
++    {
++        if (m_replies.empty())
++            return false;
++        reply = m_replies.front();
++        return true;
++    }
++
++    void IopSifCommand::consumeReply()
++    {
++        if (m_replies.empty())
++            throw std::logic_error("Cannot consume an empty SIF reply queue");
++        m_replies.pop_front();
++    }
++
++    bool IopSifCommand::queueCommand(uint32_t command, std::span<const uint8_t> packet)
++    {
++        if (!initialized() || m_eeReceiveAddress == 0u || packet.size() < 16u ||
++            packet.size() > 112u || m_replies.size() >= kMaxReplies)
++            return false;
++        SifEeReply reply;
++        reply.packet.assign(packet.begin(), packet.end());
++        put(reply.packet, 0u, (word(packet, 0u) & 0xFFFFFF00u) | static_cast<uint32_t>(packet.size()));
++        put(reply.packet, 8u, command);
++        m_replies.push_back(std::move(reply));
++        return true;
++    }
++}
+diff --git a/ps2xIOP/src/iop_sif_command.h b/ps2xIOP/src/iop_sif_command.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..707a7da20234b5f70d87d014f2ef03cb99352b05
+--- /dev/null
++++ b/ps2xIOP/src/iop_sif_command.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++#include "ps2x/iop/iop_subsystem.h"
++#include "iop_bootstrap_rpc.h"
++
++#include <array>
++#include <deque>
++#include <span>
++#include <unordered_map>
++
++namespace ps2x::iop::detail
++{
++    class IopSifCommand
++    {
++    public:
++        explicit IopSifCommand(IopSubsystem &owner);
++        void reset();
++        void rebindOwner(IopSubsystem &owner) noexcept;
++        uint32_t getRegister(uint32_t reg);
++        uint32_t setRegister(uint32_t reg, uint32_t value);
++        bool accepts(uint32_t destination) const noexcept;
++        bool initialized() const noexcept { return m_endpoint != 0u; }
++        void validate(std::span<const uint8_t> packet) const;
++        void validateBatch(std::span<const SifCommandPacket> packets) const;
++        void receive(std::span<const uint8_t> packet);
++        void receive(const SifCommandPacket &packet);
++        uint32_t rpcBuffer(uint32_t server) const noexcept;
++        uint32_t eeReceiveAddress() const noexcept { return m_eeReceiveAddress; }
++        bool peekReply(SifEeReply &reply) const;
++        void consumeReply();
++        bool queueCommand(uint32_t command, std::span<const uint8_t> packet);
++
++    private:
++        struct Server
++        {
++            uint32_t sid = 0u;
++            uint32_t address = 0u;
++            uint32_t buffer = 0u;
++        };
++        void initialize();
++        void validateWithState(std::span<const uint8_t> packet, uint32_t eeReceiveAddress,
++                               bool peerRpcInitialized, size_t queuedReplies) const;
++        void queueReady();
++        void execute(std::span<const uint8_t> packet, const std::vector<uint8_t> *rpcInput);
++        SifEeReply makeEnd(std::span<const uint8_t> request) const;
++        Server *findServer(uint32_t sid);
++        const Server *serverAt(uint32_t address) const;
++
++        IopSubsystem *m_owner;
++        IopBootstrapRpc m_bootstrap;
++        uint32_t m_endpoint = 0u;
++        uint32_t m_eeReceiveAddress = 0u;
++        uint32_t m_smFlags = 0u;
++        bool m_peerRpcInitialized = false;
++        std::unordered_map<uint32_t, uint32_t> m_registers;
++        std::array<uint32_t, 32> m_sregs{};
++        std::vector<Server> m_servers;
++        std::deque<SifEeReply> m_replies;
++    };
++}
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b49815540952427b724770b5a9555994b5de99d7..b3f58371fce870ead3b23858aef2939444d8a4a6 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -2,11 +2,13 @@
+ 
+ #include "iop_service.h"
+ #include "iop_module_manager.h"
++#include "iop_sif_command.h"
+ #include "emulator/iop_emulator.h"
+ #include "module_factories.h"
+ #include "ps2x/iop/ps2_path.h"
+ 
+ #include <sstream>
++#include <stdexcept>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -16,9 +18,10 @@ namespace ps2x::iop
+     class IopSubsystem::Impl
+     {
+     public:
+-        explicit Impl(IopHost &hostRef)
++        explicit Impl(IopHost &hostRef, IopSubsystem &owner)
+             : host(hostRef),
+-              emulator(hostRef)
++              emulator(hostRef),
++              sifCommand(owner)
+         {
+             coreServices.emplace_back(detail::createMcservService(host));
+             coreServices.emplace_back(detail::createDbcmanService(host));
+@@ -86,16 +89,32 @@ namespace ps2x::iop
+         std::string lastError;
+         detail::IopModuleManager moduleManager;
+         detail::IopEmulator emulator;
++        detail::IopSifCommand sifCommand;
+     };
+ 
+     IopSubsystem::IopSubsystem(IopHost &host)
+-        : m_impl(std::make_unique<Impl>(host))
++        : m_impl(std::make_unique<Impl>(host, *this))
+     {
+     }
+ 
+     IopSubsystem::~IopSubsystem() = default;
+-    IopSubsystem::IopSubsystem(IopSubsystem &&) noexcept = default;
+-    IopSubsystem &IopSubsystem::operator=(IopSubsystem &&) noexcept = default;
++    IopSubsystem::IopSubsystem(IopSubsystem &&other) noexcept
++        : m_impl(std::move(other.m_impl))
++    {
++        if (m_impl)
++            m_impl->sifCommand.rebindOwner(*this);
++    }
++
++    IopSubsystem &IopSubsystem::operator=(IopSubsystem &&other) noexcept
++    {
++        if (this != &other)
++        {
++            m_impl = std::move(other.m_impl);
++            if (m_impl)
++                m_impl->sifCommand.rebindOwner(*this);
++        }
++        return *this;
++    }
+ 
+     void IopSubsystem::reset()
+     {
+@@ -110,6 +129,7 @@ namespace ps2x::iop
+             }
+         }
+         m_impl->emulator.reset();
++        m_impl->sifCommand.reset();
+         m_impl->refreshServiceModuleKeys();
+         m_impl->rebuildRoutes();
+     }
+@@ -150,6 +170,34 @@ namespace ps2x::iop
+         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
+     }
+ 
++    ModuleLoadResult IopSubsystem::loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize)
++    {
++        ModuleLoadResult result = m_impl->emulator.loadModuleStrict(path, arguments, argumentSize);
++        if (result.moduleId > 0 && (static_cast<uint32_t>(result.startResult) & 3u) != 1u)
++        {
++            m_impl->moduleManager.observePhysicalLoad(result.moduleId, path);
++            m_impl->rebuildRoutes();
++        }
++        return result;
++    }
++
++    ModuleLoadResult IopSubsystem::loadModuleImage(std::string_view path, std::span<const uint8_t> image,
++                                                 const void *arguments, uint32_t argumentSize)
++    {
++        ModuleLoadResult result = m_impl->emulator.loadModuleImage(path, image, arguments, argumentSize);
++        if (result.moduleId > 0 && (static_cast<uint32_t>(result.startResult) & 3u) != 1u)
++        {
++            m_impl->moduleManager.observePhysicalLoad(result.moduleId, path);
++            m_impl->rebuildRoutes();
++        }
++        return result;
++    }
++
++    ModuleLoadResult IopSubsystem::loadModuleIopBuffer(uint32_t iopAddress, const void *arguments, uint32_t argumentSize)
++    {
++        return m_impl->emulator.loadModuleIopBuffer(iopAddress, arguments, argumentSize);
++    }
++
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+     {
+         if (m_impl->moduleManager.stopHle(moduleId, result))
+@@ -169,6 +217,11 @@ namespace ps2x::iop
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
++    uint32_t IopSubsystem::callCdvdImport(uint16_t ordinal, uint32_t a0)
++    {
++        return m_impl->emulator.callCdvdImport(ordinal, a0);
++    }
++
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
+         for (const auto &service : m_impl->coreServices)
+@@ -219,6 +272,41 @@ namespace ps2x::iop
+         m_impl->emulator.onSifTransfer(transfer);
+     }
+ 
++    uint32_t IopSubsystem::getSifRegister(uint32_t reg) { return m_impl->sifCommand.getRegister(reg); }
++    uint32_t IopSubsystem::setSifRegister(uint32_t reg, uint32_t value) { return m_impl->sifCommand.setRegister(reg, value); }
++    bool IopSubsystem::acceptsSifCommand(uint32_t destination) const noexcept { return m_impl->sifCommand.accepts(destination); }
++    bool IopSubsystem::sifCommandsInitialized() const noexcept { return m_impl->sifCommand.initialized(); }
++    void IopSubsystem::validateSifCommand(const void *packet, size_t size) const
++    {
++        if (!packet && size != 0u)
++            throw std::invalid_argument("Null SIF command packet");
++        m_impl->sifCommand.validate({static_cast<const uint8_t *>(packet), size});
++    }
++    void IopSubsystem::receiveSifCommand(const void *packet, size_t size)
++    {
++        if (!packet && size != 0u)
++            throw std::invalid_argument("Null SIF command packet");
++        m_impl->sifCommand.receive({static_cast<const uint8_t *>(packet), size});
++    }
++    void IopSubsystem::receiveSifCommandPacket(const SifCommandPacket &packet)
++    {
++        m_impl->sifCommand.receive(packet);
++    }
++    uint32_t IopSubsystem::sifRpcBuffer(uint32_t server) const noexcept { return m_impl->sifCommand.rpcBuffer(server); }
++    void IopSubsystem::checkExecutionFailure() const { m_impl->emulator.checkExecutionFailure(); }
++
++    void IopSubsystem::validateSifCommandBatch(std::span<const SifCommandPacket> packets) const
++    {
++        m_impl->sifCommand.validateBatch(packets);
++    }
++    uint32_t IopSubsystem::sifEeReceiveAddress() const noexcept { return m_impl->sifCommand.eeReceiveAddress(); }
++    bool IopSubsystem::peekSifReply(SifEeReply &reply) const { return m_impl->sifCommand.peekReply(reply); }
++    void IopSubsystem::consumeSifReply() { m_impl->sifCommand.consumeReply(); }
++    bool IopSubsystem::queueSifCommand(uint32_t command, const void *packet, size_t size)
++    {
++        return packet && m_impl->sifCommand.queueCommand(command, {static_cast<const uint8_t *>(packet), size});
++    }
++
+     uint32_t IopSubsystem::allocateMemory(uint32_t size, uint32_t alignment)
+     {
+         return m_impl->emulator.allocateMemory(size, alignment);
+diff --git a/ps2xIOP/tests/iop_boot_image_tests.cpp b/ps2xIOP/tests/iop_boot_image_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8c04a429d329dcf413329fbd170031d6d2f30fc
+--- /dev/null
++++ b/ps2xIOP/tests/iop_boot_image_tests.cpp
+@@ -0,0 +1,274 @@
++#include "iop_boot_image.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++
++    void require(bool condition, const char *message)
++    {
++        if (!condition)
++            throw std::runtime_error(message);
++    }
++
++    void put16(std::vector<uint8_t> &bytes, size_t offset, uint16_t value)
++    {
++        bytes.at(offset) = static_cast<uint8_t>(value);
++        bytes.at(offset + 1u) = static_cast<uint8_t>(value >> 8u);
++    }
++
++    void put32(std::vector<uint8_t> &bytes, size_t offset, uint32_t value)
++    {
++        for (size_t i = 0u; i < 4u; ++i)
++            bytes.at(offset + i) = static_cast<uint8_t>(value >> (i * 8u));
++    }
++
++    void record(std::vector<uint8_t> &bytes, size_t offset, const char *name,
++                uint16_t extSize, uint32_t fileSize)
++    {
++        std::fill_n(bytes.begin() + offset, 16u, uint8_t{0u});
++        std::copy_n(name, std::strlen(name), bytes.begin() + offset);
++        put16(bytes, offset + 10u, extSize);
++        put32(bytes, offset + 12u, fileSize);
++    }
++
++    // Author-generated public fixture: no proprietary module or ROM bytes.
++    // Six directory slots, 12 EXTINFO bytes, then independently known payloads.
++    std::vector<uint8_t> fixture(uint32_t bootstrapSize = 0u)
++    {
++        const size_t directory = bootstrapSize == 0u ? 0u : 32u;
++        std::vector<uint8_t> bytes(directory + 147u, 0u);
++        if (bootstrapSize != 0u)
++            std::fill_n(bytes.begin(), bootstrapSize, uint8_t{0xA5u});
++        record(bytes, directory, "RESET", 4u, bootstrapSize);
++        record(bytes, directory + 16u, "ROMDIR", 0u, 96u);
++        record(bytes, directory + 32u, "EXTINFO", 0u, 12u);
++        record(bytes, directory + 48u, "ALPHA", 8u, 17u);
++        record(bytes, directory + 64u, "BETA", 0u, 3u);
++        const std::array<uint8_t, 12u> info{0x02u, 0x01u, 0u, 2u,
++                                          0u, 0u, 4u, 3u, 'a', 'b', 'c', 0u};
++        std::copy(info.begin(), info.end(), bytes.begin() + directory + 96u);
++        for (uint8_t i = 0u; i < 17u; ++i)
++            bytes[directory + 112u + i] = static_cast<uint8_t>(0x40u + i);
++        bytes[directory + 144u] = 0x11u;
++        bytes[directory + 145u] = 0x22u;
++        bytes[directory + 146u] = 0x33u;
++        return bytes;
++    }
++
++    template <typename Action>
++    void rejects(Action action, const char *message)
++    {
++        try
++        {
++            action();
++        }
++        catch (const std::runtime_error &error)
++        {
++            require(std::string(error.what()).find("Invalid IOP boot image:") == 0u,
++                    "failure lost its boot-image diagnostic");
++            return;
++        }
++        throw std::runtime_error(message);
++    }
++
++    void inventoryAndPayloads()
++    {
++        const auto bytes = fixture();
++        const auto before = bytes;
++        const auto parsed = parseBootImage(bytes);
++        require(bytes == before, "inventory mutated the original image");
++        require(parsed.directoryOffset == 0u && parsed.entries.size() == 5u,
++                "wrong image inventory");
++        const std::array<std::string, 5u> expected{"RESET", "ROMDIR", "EXTINFO", "ALPHA", "BETA"};
++        for (size_t i = 0u; i < expected.size(); ++i)
++            require(parsed.entries[i].name == expected[i], "entry order/name changed");
++        const auto &alpha = parsed.entries[3u];
++        require(alpha.offset == 112u && alpha.size == 17u &&
++                    alpha.extInfoOffset == 100u && alpha.extInfoSize == 8u,
++                "file and EXTINFO offsets are not independent");
++        const auto alphaBytes = bootImageEntryBytes(bytes, alpha);
++        require(alphaBytes.size() == 17u && alphaBytes.front() == 0x40u && alphaBytes.back() == 0x50u,
++                "entry view includes padding or wrong data");
++        const auto beta = bootImageEntryBytes(bytes, parsed.entries[4u]);
++        require(beta.size() == 3u && beta[0u] == 0x11u && beta[1u] == 0x22u && beta[2u] == 0x33u,
++                "unaligned final EOF was rejected or changed");
++        require(bootImageEntryBytes(bytes, parsed.entries[0u]).empty(), "zero-byte RESET gained payload");
++    }
++
++    void resetBootstrapPrefix()
++    {
++        const auto bytes = fixture(17u);
++        const auto parsed = parseBootImage(bytes);
++        require(parsed.directoryOffset == 32u && parsed.entries[1u].offset == 32u &&
++                    parsed.entries[3u].offset == 144u && parsed.entries[4u].offset == 176u,
++                "nonempty RESET bootstrap shifted extents incorrectly");
++        const auto reset = bootImageEntryBytes(bytes, parsed.entries[0u]);
++        require(reset.size() == 17u && std::all_of(reset.begin(), reset.end(), [](uint8_t b) { return b == 0xA5u; }),
++                "RESET payload must refer to the image prefix");
++    }
++
++    void truncatedImages()
++    {
++        const auto bytes = fixture();
++        for (size_t size : {size_t{0u}, size_t{15u}, size_t{63u}, size_t{95u}, size_t{146u}})
++            rejects([&] { (void)parseBootImage(std::span(bytes).first(size)); }, "truncated input was accepted");
++    }
++
++    void requiredEntriesAndSelfLocation()
++    {
++        auto bytes = fixture();
++        bytes[16u] = 'X';
++        rejects([&] { (void)parseBootImage(bytes); }, "missing ROMDIR was accepted");
++        bytes = fixture();
++        bytes[32u] = 'X';
++        rejects([&] { (void)parseBootImage(bytes); }, "missing EXTINFO was accepted");
++        bytes = fixture(17u);
++        put32(bytes, 44u, 33u);
++        rejects([&] { (void)parseBootImage(bytes); }, "RESET self-location mismatch was accepted");
++    }
++
++    void directoryBoundsAndTermination()
++    {
++        for (uint32_t size : {0u, 48u, 65u, 80u, 160u, 0xFFFFFFF0u})
++        {
++            auto bytes = fixture();
++            put32(bytes, 28u, size);
++            rejects([&] { (void)parseBootImage(bytes); }, "malformed ROMDIR length was accepted");
++        }
++        auto bytes = fixture();
++        bytes[95u] = 1u;
++        rejects([&] { (void)parseBootImage(bytes); }, "partial zero terminator was accepted");
++        bytes = fixture();
++        std::fill_n(bytes.begin() + 48u, 16u, uint8_t{0u});
++        rejects([&] { (void)parseBootImage(bytes); }, "records after terminator were accepted");
++    }
++
++    void fileBoundsAndIntegerOverflow()
++    {
++        for (uint32_t size : {4u, 0x7FFFFFFFu, 0xFFFFFFF1u, 0xFFFFFFFFu})
++        {
++            auto bytes = fixture();
++            put32(bytes, 76u, size);
++            rejects([&] { (void)parseBootImage(bytes); }, "out-of-image file size was accepted");
++        }
++        auto bytes = fixture();
++        put32(bytes, 60u, 0xFFFFFFFFu);
++        rejects([&] { (void)parseBootImage(bytes); }, "rounded file size overflow was accepted");
++    }
++
++    void strictNamesAndDuplicates()
++    {
++        auto bytes = fixture();
++        record(bytes, 64u, "ALPHA", 0u, 3u);
++        rejects([&] { (void)parseBootImage(bytes); }, "duplicate filename was accepted");
++        for (const char *name : {"..", "A/B", "A\\B", "A:B", "A B"})
++        {
++            bytes = fixture();
++            record(bytes, 64u, name, 0u, 3u);
++            rejects([&] { (void)parseBootImage(bytes); }, "invalid filename was accepted");
++        }
++        bytes = fixture();
++        bytes[70u] = 'X';
++        rejects([&] { (void)parseBootImage(bytes); }, "hidden bytes after filename terminator were accepted");
++        bytes = fixture();
++        record(bytes, 64u, "ABCDEFGHIJ", 0u, 3u);
++        const auto parsed = parseBootImage(bytes);
++        require(parsed.entries[4u].name == "ABCDEFGHIJ" &&
++                    bootImageEntryBytes(bytes, parsed.entries[4u]).size() == 3u,
++                "a bounded ten-byte filename needs no terminator beyond its field");
++    }
++
++    void extInfoBoundsAndFraming()
++    {
++        for (uint16_t size : {uint16_t{1u}, uint16_t{7u}, uint16_t{12u}, uint16_t{0xFFFCu}})
++        {
++            auto bytes = fixture();
++            put16(bytes, 58u, size);
++            rejects([&] { (void)parseBootImage(bytes); }, "incorrect per-file EXTINFO size was accepted");
++        }
++        for (uint8_t length : {uint8_t{1u}, uint8_t{8u}, uint8_t{252u}})
++        {
++            auto bytes = fixture();
++            bytes[102u] = length;
++            rejects([&] { (void)parseBootImage(bytes); }, "invalid EXTINFO field framing was accepted");
++        }
++        auto bytes = fixture();
++        bytes[103u] = 0xE1u;
++        require(parseBootImage(bytes).entries.size() == 5u, "unknown but framed EXTINFO type was rejected");
++    }
++
++    void unalignedDirectoryAndSearchLimit()
++    {
++        auto bytes = fixture();
++        bytes.insert(bytes.begin(), 1u, uint8_t{0xA5u});
++        rejects([&] { (void)parseBootImage(bytes); }, "unaligned directory was accepted");
++        bytes = fixture();
++        bytes.insert(bytes.begin(), 0x8000u, uint8_t{0xA5u});
++        put32(bytes, 0x800Cu, 0x8000u);
++        rejects([&] { (void)parseBootImage(bytes); }, "directory search escaped its bounded window");
++    }
++
++    void entryViewBounds()
++    {
++        const auto bytes = fixture();
++        const auto parsed = parseBootImage(bytes);
++        rejects([&] { (void)bootImageEntryBytes(std::span(bytes).first(146u), parsed.entries[4u]); },
++                "entry view accepted a shorter caller buffer");
++        auto invalidEntry = parsed.entries[4u];
++        invalidEntry.offset = static_cast<size_t>(-1);
++        rejects([&] { (void)bootImageEntryBytes(bytes, invalidEntry); }, "entry view offset overflow was accepted");
++    }
++
++    void resourceLimits()
++    {
++        auto bytes = fixture();
++        bytes.resize(kMaxBootImageBytes + 1u, 0u);
++        rejects([&] { (void)parseBootImage(bytes); }, "unbounded image size was accepted");
++        bytes = fixture();
++        bytes.resize((kMaxBootImageEntries + 2u) * 16u, 0u);
++        put32(bytes, 28u, static_cast<uint32_t>(bytes.size()));
++        rejects([&] { (void)parseBootImage(bytes); }, "unbounded directory count was accepted");
++    }
++}
++
++int main()
++{
++    const std::pair<const char *, void (*)()> tests[] = {
++        {"Inventory preserves original bytes and exact unpadded payloads", inventoryAndPayloads},
++        {"Nonempty RESET locates the aligned directory", resetBootstrapPrefix},
++        {"Truncated files and directory bytes are rejected", truncatedImages},
++        {"Required entries and self-location are checked", requiredEntriesAndSelfLocation},
++        {"Directory length and full zero terminator are checked", directoryBoundsAndTermination},
++        {"File extents cannot overflow or leave the image", fileBoundsAndIntegerOverflow},
++        {"Names are bounded, unambiguous and unique", strictNamesAndDuplicates},
++        {"EXTINFO spans and field framing are checked", extInfoBoundsAndFraming},
++        {"Directory alignment and search bounds are enforced", unalignedDirectoryAndSearchLimit},
++        {"Entry views reject a changed or shorter backing buffer", entryViewBounds},
++        {"Input work and inventory allocation are bounded", resourceLimits},
++    };
++    size_t passed = 0u;
++    for (const auto &[name, test] : tests)
++    {
++        try
++        {
++            test();
++            ++passed;
++            std::cout << "[PASS] " << name << '\n';
++        }
++        catch (const std::exception &error)
++        {
++            std::cerr << "[FAIL] " << name << ": " << error.what() << '\n';
++        }
++    }
++    std::cout << passed << '/' << std::size(tests) << " boot-image tests passed\n";
++    return passed == std::size(tests) ? 0 : 1;
++}
+diff --git a/ps2xIOP/tests/iop_strict_fixtures.h b/ps2xIOP/tests/iop_strict_fixtures.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..693b33dac7d332f339f5202c8c4416f4333413c6
+--- /dev/null
++++ b/ps2xIOP/tests/iop_strict_fixtures.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include "iop_compat_test_support.h"
++
++namespace iop_test
++{
++    // Author-generated MIPS code: startup creates/starts one thread and returns
++    // resident. Only the later thread calls the unresolved absent:42 import.
++    inline Irx backgroundMissingImport()
++    {
++        Irx image;
++        image.words(0u, {0x27BDFFE0u, 0xAFBF001Cu,
++            0x3C040001u, 0x34840180u, 0x0C004045u, 0u,
++            0x00402021u, 0x00002821u, 0x0C004047u, 0u,
++            0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x00001021u});
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x61626874u, 0x00006573u,
++            0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++        image.words(0x180u, {0u, 0u, 0x10200u, 0x1000u, 20u});
++        image.words(0x200u, {0x0C0040A5u, 0u});
++        image.words(0x280u, {0x41E00000u, 0u, 0x0101u, 0x65736261u, 0x0000746Eu,
++            0x03E00008u, 0x2400002Au, 0u, 0u});
++        return image;
++    }
++}
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e782bea46e16d33a047f12b31d27cd10adbe3708
+--- /dev/null
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -0,0 +1,465 @@
++#include "iop_strict_fixtures.h"
++#include "emulator/iop_emulator.h"
++
++#include <functional>
++
++namespace
++{
++    using namespace iop_test;
++    using ps2x::iop::detail::IopEmulator;
++
++    void put16(std::vector<uint8_t> &bytes, size_t at, uint16_t value)
++    {
++        require(at <= bytes.size() && 2u <= bytes.size() - at, "fixture write out of bounds");
++        bytes[at] = static_cast<uint8_t>(value);
++        bytes[at + 1u] = static_cast<uint8_t>(value >> 8u);
++    }
++
++    void put32(std::vector<uint8_t> &bytes, size_t at, uint32_t value)
++    {
++        put16(bytes, at, static_cast<uint16_t>(value));
++        put16(bytes, at + 2u, static_cast<uint16_t>(value >> 16u));
++    }
++
++    uint32_t word(IopEmulator &iop, uint32_t address)
++    {
++        std::array<uint8_t, 4> bytes{};
++        require(iop.readMemory(address, bytes.data(), bytes.size()), "IOP snapshot read failed");
++        return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8u) |
++               (uint32_t(bytes[2]) << 16u) | (uint32_t(bytes[3]) << 24u);
++    }
++
++    std::string rejects(const std::function<void()> &operation, std::string_view text)
++    {
++        try { operation(); }
++        catch (const std::runtime_error &error)
++        {
++            require(std::string_view(error.what()).find(text) != std::string_view::npos,
++                    "failure did not identify the concrete cause");
++            return error.what();
++        }
++        throw std::runtime_error("operation unexpectedly succeeded");
++    }
++
++    Irx returns(uint16_t result = 0u)
++    {
++        Irx image;
++        image.words(0u, {0x03E00008u, 0x24020000u | result});
++        return image;
++    }
++
++    constexpr uint32_t jal(uint32_t target) { return 0x0C000000u | (target >> 2u); }
++
++    void emit(Irx &image, uint32_t &offset, uint32_t instruction)
++    {
++        image.words(offset, {instruction});
++        offset += 4u;
++    }
++
++    Irx snapshotArguments(std::span<const std::string> expected)
++    {
++        Irx image(0u, 0x1000u);
++        put16(image.bytes, 16u, 0xFF80u);
++        put32(image.bytes, 68u, 0xD00u);
++        put16(image.bytes, 44u, 2u);
++        put32(image.bytes, 84u, 0x70000080u);
++        put32(image.bytes, 88u, 0x80u);
++        put32(image.bytes, 100u, 34u);
++        put32(image.bytes, 0x84u, 0u); // entry relative to loaded image
++        put32(image.bytes, 0x88u, 0x2000u); // GP need not point inside text
++        put32(image.bytes, 0x8Cu, 0x500u);
++        put32(image.bytes, 0x90u, 0x800u);
++        put32(image.bytes, 0x94u, 0x300u);
++        put16(image.bytes, 0x98u, 0x0207u);
++        constexpr char name[] = "fixture";
++        std::copy(std::begin(name), std::end(name), image.bytes.begin() + 0x9Au);
++
++        // Capture arguments and descriptor while they are valid, using only
++        // ordinary guest loads/stores. No host-side parser synthesizes results.
++        uint32_t pc = 0u;
++        emit(image, pc, 0x3C080001u); // t0 = durable snapshot 0x10C00
++        emit(image, pc, 0x35080C00u);
++        for (uint32_t reg = 4u; reg <= 7u; ++reg)
++            emit(image, pc, 0xAD000000u | (reg << 16u) | ((reg - 4u) * 4u));
++        emit(image, pc, 0xAD1C0010u); // gp
++        for (uint32_t index = 0u; index <= expected.size(); ++index)
++        {
++            emit(image, pc, 0x8CA90000u | (index * 4u)); // t1 = argv[index]
++            emit(image, pc, 0u); // R3000A load delay
++            emit(image, pc, 0xAD090020u | (index * 4u));
++            if (index == expected.size())
++                continue;
++            for (uint32_t byte = 0u; byte <= expected[index].size(); ++byte)
++            {
++                emit(image, pc, 0x912A0000u | byte); // lbu t2, byte(t1)
++                emit(image, pc, 0u);
++                emit(image, pc, 0xA10A0000u | (0x40u + index * 0x40u + byte));
++            }
++        }
++        for (uint32_t offset = 0u; offset < 48u; offset += 4u)
++        {
++            emit(image, pc, 0x8CE90000u | offset);
++            emit(image, pc, 0u);
++            emit(image, pc, 0xAD090200u | offset);
++        }
++        emit(image, pc, 0x03E00008u);
++        emit(image, pc, 0x24020000u);
++        require(pc < 0xC00u, "snapshot code overwrote its results");
++        return image;
++    }
++
++    void realArgumentAbi()
++    {
++        Host host;
++        IopEmulator iop(host);
++        const std::array<std::string, 4> expected{"cdrom0:\\TEST.IRX;1", "alpha beta", "", "z"};
++        const std::array<char, 14> packed{'a','l','p','h','a',' ','b','e','t','a','\0','\0','z','\0'};
++        const Irx image = snapshotArguments(expected);
++        const auto result = iop.loadModuleImage(expected[0], image.bytes, packed.data(), packed.size());
++        require(result.moduleId > 0 && result.startResult == 0 && iop.loadedModuleCount() == 1u,
++                "valid original entry was not accepted");
++        constexpr uint32_t snapshot = 0x10C00u;
++        require(word(iop, snapshot) == expected.size(), "argc is not the number of strings plus argv[0]");
++        require(word(iop, snapshot + 8u) == 0u && word(iop, snapshot + 12u) != 0u,
++                "normal IRX a2/a3 ABI is wrong");
++        require(word(iop, snapshot + 16u) == 0x12000u, "actual relocated GP was not passed");
++        require(word(iop, snapshot + 0x20u + 4u * expected.size()) == 0u, "argv lacks its null pointer");
++        for (size_t index = 0u; index < expected.size(); ++index)
++        {
++            std::vector<char> captured(expected[index].size() + 1u);
++            require(iop.readMemory(snapshot + 0x40u + static_cast<uint32_t>(index) * 0x40u,
++                                   captured.data(), captured.size()), "argument snapshot read failed");
++            require(std::string(captured.data()) == expected[index] && captured.back() == '\0',
++                    "argv changed spaces, empty strings, path syntax or terminators");
++        }
++        require(word(iop, snapshot + 0x208u) == 0x00020207u, "ModuleInfo version/start flags are wrong");
++        require((word(iop, snapshot + 0x20Cu) & 0xFFFFu) == static_cast<uint32_t>(result.moduleId),
++                "ModuleInfo does not identify the real module");
++        require(word(iop, snapshot + 0x210u) == 0x10000u && word(iop, snapshot + 0x214u) == 0x12000u &&
++                word(iop, snapshot + 0x218u) == 0x10000u && word(iop, snapshot + 0x21Cu) == 0x500u &&
++                word(iop, snapshot + 0x220u) == 0x800u && word(iop, snapshot + 0x224u) == 0x300u,
++                "ModuleInfo text/data/bss/entry/GP do not come from the actual image");
++        iop.checkExecutionFailure();
++    }
++
++    void argumentPreflight()
++    {
++        Host host;
++        IopEmulator iop(host);
++        const Irx image = returns();
++        constexpr std::array<char, 2> unterminated{'a','b'};
++        rejects([&] { (void)iop.loadModuleImage("test", image.bytes, unterminated.data(), 2u); }, "NUL");
++        rejects([&] { (void)iop.loadModuleImage("test", image.bytes, nullptr, 1u); }, "argument buffer");
++        rejects([&] { (void)iop.loadModuleImage("", image.bytes, nullptr, 0u); }, "path");
++        rejects([&] { (void)iop.loadModuleImage(std::string(1025u, 'x'), image.bytes, nullptr, 0u); }, "path");
++        require(word(iop, 0x10000u) == 0u && iop.loadedModuleCount() == 0u,
++                "invalid argument preflight mutated module RAM");
++        require(iop.loadModuleImage("test", image.bytes, nullptr, 0u).moduleId > 0,
++                "preflight failure poisoned an unmodified runtime");
++    }
++
++    void nonReturningEntry()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Irx image;
++        image.words(0u, {0x08004000u, 0u}); // j 0x10000 forever
++        const std::string cause = rejects([&] { (void)iop.loadModuleImage("loop", image.bytes, nullptr, 0u); }, "budget");
++        require(iop.instructions() >= 2'000'000u && iop.loadedModuleCount() == 0u,
++                "endless entry was falsely accepted");
++        require(rejects([&] { iop.checkExecutionFailure(); }, "budget") == cause,
++                "first execution failure was not preserved");
++        iop.runEeCycles(800u);
++        require(iop.loadedModuleCount() == 0u, "cycle scheduling cleared failed startup");
++        iop.reset();
++        image = returns();
++        require(iop.loadModuleImage("after-reset", image.bytes, nullptr, 0u).moduleId > 0,
++                "reset did not restore execution after a failed call");
++    }
++
++    Irx callsImport(std::string_view name, uint16_t ordinal)
++    {
++        require(name.size() <= 8u, "fixture import name too long");
++        Irx image;
++        image.words(0u, {0x27BDFFF0u, 0xAFBF000Cu, jal(0x10094u), 0u,
++                         0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x24020000u});
++        image.words(0x80u, {0x41E00000u, 0u, 0x0101u, 0u, 0u,
++                            0x03E00008u, 0x24000000u | ordinal, 0u, 0u});
++        std::copy(name.begin(), name.end(), image.bytes.begin() + 0x18Cu);
++        return image;
++    }
++
++    void missingImport()
++    {
++        for (std::string_view name : {"absent", "dmacman"})
++        {
++            Host host;
++            IopEmulator iop(host);
++            const Irx image = callsImport(name, 0x123u);
++            rejects([&] { (void)iop.loadModuleImage("missing", image.bytes, nullptr, 0u); },
++                    std::string("missing import ") + std::string(name) + ":291");
++            require(iop.loadedModuleCount() == 0u && iop.rpcServerCount() == 0u,
++                    "unimplemented import created a successful physical module");
++        }
++    }
++
++    void exceptionAndBadPc()
++    {
++        for (unsigned variant = 0u; variant < 3u; ++variant)
++        {
++            Host host;
++            IopEmulator iop(host);
++            Irx image;
++            if (variant == 0u)
++                image.words(0u, {0x0000000Cu}); // SYSCALL raises a real CPU exception
++            else
++                image.words(0u, {0x3C080000u | (variant == 1u ? 0x2000u : 0u),
++                                 0x35080001u, 0x01000008u, 0u});
++            rejects([&] { (void)iop.loadModuleImage("invalid-exec", image.bytes, nullptr, 0u); },
++                    variant == 0u ? "exception" : "instruction");
++            require(iop.loadedModuleCount() == 0u, "invalid original execution was reported as loaded");
++        }
++        Host host;
++        IopEmulator iop(host);
++        const Irx image = callsImport("thbase", 16u); // yield is not a startup return
++        rejects([&] { (void)iop.loadModuleImage("yield", image.bytes, nullptr, 0u); }, "yielded");
++    }
++
++    Irx relocationImage(uint32_t type)
++    {
++        Irx image;
++        image.words(0u, {0x03E00008u, 0x24020000u});
++        image.bytes.resize(0x680u, 0u);
++        put32(image.bytes, 32u, 0x600u);
++        put16(image.bytes, 46u, 40u);
++        put16(image.bytes, 48u, 3u);
++        put32(image.bytes, 0x62Cu, 1u); // section1 PROGBITS
++        put32(image.bytes, 0x630u, 6u);
++        put32(image.bytes, 0x634u, 0x10000u);
++        put32(image.bytes, 0x638u, 0x100u);
++        put32(image.bytes, 0x63Cu, 0x500u);
++        put32(image.bytes, 0x648u, 4u);
++        put32(image.bytes, 0x654u, 9u); // section2 REL
++        put32(image.bytes, 0x660u, 0x678u);
++        put32(image.bytes, 0x664u, 8u);
++        put32(image.bytes, 0x66Cu, 1u);
++        put32(image.bytes, 0x670u, 4u);
++        put32(image.bytes, 0x674u, 8u);
++        put32(image.bytes, 0x678u, 0x40u);
++        put32(image.bytes, 0x67Cu, type);
++        return image;
++    }
++
++    void relocationAndImagePreflight()
++    {
++        for (uint32_t type : {7u, 5u, 0x102u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            const Irx image = relocationImage(type);
++            rejects([&] { (void)iop.loadModuleImage("bad-reloc", image.bytes, nullptr, 0u); }, "relocation");
++            require(word(iop, 0x10000u) == 0u && iop.loadedModuleCount() == 0u,
++                    "rejected relocation changed real RAM");
++        }
++        for (unsigned variant = 0u; variant < 5u; ++variant)
++        {
++            Host host;
++            IopEmulator iop(host);
++            Irx image = returns();
++            if (variant == 0u) put32(image.bytes, 68u, 0xFFFFFFF0u);
++            if (variant == 1u) put32(image.bytes, 60u, 0xFFFFFC00u);
++            if (variant == 2u) put32(image.bytes, 24u, 0x10500u);
++            if (variant == 3u) put32(image.bytes, 80u, 3u);
++            if (variant == 4u) put16(image.bytes, 42u, 31u);
++            rejects([&] { (void)iop.loadModuleImage("bad-elf", image.bytes, nullptr, 0u); }, "Strict IOP loader");
++            require(word(iop, 0x10000u) == 0u, "malformed ELF partially loaded");
++        }
++        Host host;
++        IopEmulator iop(host);
++        Irx good = relocationImage(2u);
++        put16(good.bytes, 16u, 0xFF80u);
++        put32(good.bytes, 24u, 0u);
++        put32(good.bytes, 60u, 0u);
++        put32(good.bytes, 0x634u, 0u);
++        put32(good.bytes, 0x140u, 0x80u);
++        require(iop.loadModuleImage("reloc", good.bytes, nullptr, 0u).moduleId > 0 &&
++                word(iop, 0x10040u) == 0x10080u, "supported relocation was not actually applied");
++    }
++
++    void fileAndIopSources()
++    {
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            const std::array<std::string, 1> expected{"LBbyEE"};
++            const Irx image = snapshotArguments(expected);
++            const uint32_t address = iop.allocateMemory(static_cast<uint32_t>(image.bytes.size()));
++            require(address != 0u && iop.writeMemory(address, image.bytes.data(), image.bytes.size()),
++                    "IOP fixture placement failed");
++            require(iop.loadModuleIopBuffer(address | alias, nullptr, 0u).moduleId > 0,
++                    "valid IOP RAM alias failed to load");
++            require(host.guestReads == 0u && host.guestWrites == 0u,
++                    "IOP-buffer load incorrectly used EE guest memory");
++            std::array<char, 7> captured{};
++            require(word(iop, 0x10C00u) == 1u &&
++                    iop.readMemory(0x10C40u, captured.data(), captured.size()) &&
++                    std::string(captured.data()) == "LBbyEE",
++                    "IOP-buffer argv[0] does not match LOADFILE's normal start ABI");
++        }
++        Host host;
++        IopEmulator iop(host);
++        const Irx image = returns();
++        rejects([&] { (void)iop.loadModuleIopBuffer(0x40001000u, nullptr, 0u); }, "IOP RAM");
++        require(iop.writeMemory(0x1FFFC0u, image.bytes.data(), 52u), "bounded ELF header placement failed");
++        rejects([&] { (void)iop.loadModuleIopBuffer(0xA01FFFC0u, nullptr, 0u); }, "header tables");
++        require(iop.loadModuleStrict("missing", nullptr, 0u).moduleId < 0,
++                "missing host file was successful");
++        host.file = image.bytes;
++        require(iop.loadModuleStrict("host:test", nullptr, 0u).moduleId > 0,
++                "strict host file path did not run original entry");
++    }
++
++    void overlapAndLegacyCompatibility()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Irx image = returns();
++        require(iop.loadModuleImage("one", image.bytes, nullptr, 0u).moduleId > 0, "first image failed");
++        const uint32_t original = word(iop, 0x10000u);
++        image.words(0u, {0xFFFFFFFFu});
++        rejects([&] { (void)iop.loadModuleImage("two", image.bytes, nullptr, 0u); }, "overlaps");
++        require(word(iop, 0x10000u) == original && iop.loadedModuleCount() == 1u,
++                "overlap rejection overwrote the running module");
++        iop.checkExecutionFailure();
++
++        iop.reset();
++        image.words(0u, {0x03E00008u, 0x00801021u}); // returns a0
++        image.install(host);
++        constexpr std::array<char, 3> args{'x','y','\0'};
++        require(iop.loadModuleBuffer(0x1000u, args.data(), args.size()).startResult == 3,
++                "legacy direct EE-buffer argument API changed");
++        iop.reset();
++        require(iop.loadModuleImage("strict", image.bytes, args.data(), args.size()).startResult == 2,
++                "strict API still passed byte count as argc");
++    }
++
++    void callbackCompletion()
++    {
++        Host host;
++        IopEmulator iop(host);
++        constexpr uint32_t sid = 0x12345678u;
++        Irx image = rpcServer(sid, 0x76543210u);
++        image.words(0x300u, {0x0000000Cu}); // real callback fails only when invoked
++        require(iop.loadModuleImage("rpc", image.bytes, nullptr, 0u).moduleId > 0 && iop.hasRpcServer(sid),
++                "physical callback registration did not succeed");
++        const RpcRequest call = request(sid, 0u);
++        rejects([&] { (void)iop.handleRpc(call); }, "exception");
++        require(!iop.hasRpcServer(sid), "failed strict callback remained advertised");
++        rejects([&] { (void)iop.handleRpc(call); }, "exception");
++    }
++
++    void backgroundFailure()
++    {
++        Host host;
++        IopEmulator iop(host);
++        const Irx image = backgroundMissingImport();
++        require(iop.loadModuleImage("thread", image.bytes, nullptr, 0u).moduleId > 0 && iop.threadCount() == 1u,
++                "strict module did not start its actual guest thread");
++        iop.checkExecutionFailure();
++        iop.runEeCycles(4096u); // noexcept boundary must preserve the detailed error
++        rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:42");
++        const uint64_t instructions = iop.instructions();
++        iop.runEeCycles(4096u);
++        require(iop.instructions() == instructions, "failed background execution kept running");
++        iop.reset();
++        iop.checkExecutionFailure();
++        require(iop.loadModuleImage("after-reset", returns().bytes, nullptr, 0u).moduleId > 0,
++                "background error survived reset or left invalid active CPU state");
++    }
++
++    void retiredCallbacks()
++    {
++        for (uint16_t disposition : std::array<uint16_t, 2>{0u, 1u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            Irx image;
++            image.words(0u, {0x27BDFFE0u, 0xAFBF001Cu,
++                0x24040024u, 0x00002821u, 0x3C060001u, 0x34C60200u, 0x00003821u,
++                jal(0x10114u), 0u, 0x24040024u, jal(0x1011Cu), 0u,
++                0x3C081F80u, 0x350810C8u, 0x3C090100u, 0xAD090000u,
++                0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0x24020000u | disposition});
++            image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x72746E69u, 0x006E616Du,
++                0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++            image.words(0x200u, {0x3C080001u, 0x24090BADu, 0xAD090400u, 0x03E00008u, 0u});
++            const auto result = iop.loadModuleImage("irq-owner", image.bytes, nullptr, 0u);
++            require(result.moduleId > 0, "callback owner did not start");
++            if (disposition == 0u)
++                require(iop.stopModule(result.moduleId, nullptr), "resident owner did not unload");
++            require(iop.loadedModuleCount() == 0u, "retired owner is still loaded");
++            const Irx replacement = returns();
++            rejects([&] { (void)iop.loadModuleImage("replacement", replacement.bytes, nullptr, 0u); }, "retired");
++            iop.runEeCycles(2048u);
++            rejects([&] { iop.checkExecutionFailure(); }, "unloaded strict module");
++            require(word(iop, 0x10400u) == 0u,
++                    "a stale callback executed after its strict module was retired");
++        }
++        Host host;
++        IopEmulator iop(host);
++        Irx owner;
++        owner.words(0u, {0x3C080001u, 0x24090BADu, 0xAD090400u, 0x03E00008u, 0x00001021u});
++        const auto loaded = iop.loadModuleImage("owner", owner.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0 && iop.stopModule(loaded.moduleId, nullptr), "strict owner did not retire");
++        require(iop.zeroMemory(0x10400u, 4u), "retired code canary reset failed");
++        Irx trampoline(0x11000u);
++        trampoline.words(0u, {0x08004000u, 0u}); // legacy code branches to the retired entry
++        host.file = trampoline.bytes;
++        rejects([&] { (void)iop.loadModule("legacy-trampoline", nullptr, 0u); }, "unloaded strict module");
++        require(word(iop, 0x10400u) == 0u,
++                "legacy trampoline bypassed retired strict range protection");
++    }
++
++    void returnDispositionAndCdvd()
++    {
++        for (uint16_t value : std::array<uint16_t, 5>{0u, 1u, 2u, 4u, 0xFFFFu})
++        {
++            Host host;
++            IopEmulator iop(host);
++            const Irx image = returns(value);
++            const auto result = iop.loadModuleImage("result", image.bytes, nullptr, 0u);
++            if (value == 0xFFFFu)
++                require(result.moduleId < 0 && result.startResult == -1 && iop.loadedModuleCount() == 0u,
++                        "negative original startup result was reported as a loaded module");
++            else
++                require(result.moduleId > 0 && result.startResult == value &&
++                        iop.loadedModuleCount() == (value == 1u ? 0u : 1u),
++                        "module residency did not use the original return disposition");
++        }
++        Host host;
++        IopEmulator iop(host);
++        require(iop.callCdvdImport(4u, 0u) == 1u && iop.callCdvdImport(13u, 0u) != 0u &&
++                iop.callCdvdImport(50u, static_cast<uint32_t>(-9)) != 0u,
++                "CDVD wrapper did not invoke the existing model");
++        rejects([&] { (void)iop.callCdvdImport(0xFFFFu, 0u); }, "Unsupported IOP CDVD import");
++    }
++}
++
++int main()
++{
++    const Test tests[] = {
++        {"Original entry observes normal IRX argv and actual ModuleInfo", realArgumentAbi},
++        {"Arguments fail before RAM mutation", argumentPreflight},
++        {"Endless startup cannot become module success", nonReturningEntry},
++        {"Missing imports cannot become module success", missingImport},
++        {"Exceptions, bad PCs and yielding are not startup returns", exceptionAndBadPc},
++        {"Malformed ELF/relocations fail before commit; valid relocation executes", relocationAndImagePreflight},
++        {"Strict files and real IOP buffers use their correct memory spaces", fileAndIopSources},
++        {"Overlap is atomic and legacy EE API remains compatible", overlapAndLegacyCompatibility},
++        {"Later physical RPC callback failures remain strict", callbackCompletion},
++        {"Background strict execution failure survives noexcept scheduling", backgroundFailure},
++        {"Unloaded and nonresident strict callback code cannot execute or be reused", retiredCallbacks},
++        {"Original start result controls residency and CDVD uses existing model", returnDispositionAndCdvd},
++    };
++    return run(tests);
++}
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff998daaa9fec3c1569cafa75a09619e17cc..b960a96f2e50b3c7a86ddd6402ca355069fbee1f 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -332,6 +332,7 @@ public:
+     int setIrqHandlerEnabled(bool dmac, int id, bool enabled);
+     int setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled);
+     void dispatchIrq(bool dmac, uint32_t cause);
++    [[nodiscard]] bool hasEnabledIrqHandler(bool dmac, uint32_t cause) const;
+     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
+     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index aae3eb71ad1267ebfa992ca8d57e3dc6cb4a5c3f..5c8a6b16b43b0c3904366f0b100b104c491d9891 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1264,6 +1264,21 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+     return KE_OK;
+ }
+ 
++bool EeScheduler::hasEnabledIrqHandler(bool dmac, uint32_t cause) const
++{
++    assertExecutor();
++    const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
++    if (cause < 32u && (mask & (1u << cause)) == 0u)
++        return false;
++    const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
++    return std::any_of(handlers.begin(), handlers.end(), [&](const auto &entry)
++        {
++            const EeIrqHandler &handler = entry.second;
++            return handler.enabled && handler.cause == cause && handler.handler != 0u &&
++                   m_runtime.hasFunction(handler.handler);
++        });
++}
++
+ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+ {
+     assertExecutor();
+@@ -1755,6 +1770,7 @@ void EeScheduler::applyPendingPreemption()
+ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
++    m_runtime.drainCompletedDmacHandlers(m_rdram);
+     processDueDeadlines();
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index fc19ba73d7d0d8504f595f288654db984c5932c8..cce50934e48c9d0dae8694a52ccccd92a4a1e7d6 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -190,7 +190,11 @@ namespace ps2_stubs
+         void rejectUnsupportedGuestCommandDma(const uint8_t *rdram, PS2Runtime *runtime,
+                                                const Ps2SifDmaTransfer &transfer)
+         {
+-            if (!runtime || runtime->missingFunctionPolicy() != PS2Runtime::MissingFunctionPolicy::Stop)
++            if (!runtime)
++                return;
++            auto *const iop = PS2IopTransport::subsystem(runtime);
++            const bool modeledEndpoint = iop && iop->acceptsSifCommand(transfer.dest);
++            if (!modeledEndpoint && runtime->missingFunctionPolicy() != PS2Runtime::MissingFunctionPolicy::Stop)
+                 return;
+ 
+             // PS2SDK ee/kernel/include/sifdma.h and ee/kernel/src/sifcmd.c:
+@@ -199,12 +203,10 @@ namespace ps2_stubs
+             constexpr uint32_t kCommandAttributes = 0x44u;
+             if ((static_cast<uint32_t>(transfer.attr) & kCommandAttributes) != kCommandAttributes)
+                 return;
++            if (!modeledEndpoint)
+             {
+-                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+-                const auto destination = g_sifRegs.find(kSifSysregSubAddr);
+-                const auto commandData = g_sifRegs.find(kSifSysregMainAddr);
+-                if (destination == g_sifRegs.end() || transfer.dest != destination->second ||
+-                    commandData == g_sifRegs.end() || commandData->second == 0u)
++                if (!iop || transfer.dest != iop->getSifRegister(kSifSysregSubAddr) ||
++                    iop->getSifRegister(kSifSysregMainAddr) == 0u)
+                     return;
+             }
+ 
+@@ -235,6 +237,13 @@ namespace ps2_stubs
+             else if (commandId == 0x80000001u && packetSize < 24u)
+                 malformed = "SET_SREG lacks its register index/value";
+ 
++            if (!malformed && modeledEndpoint)
++            {
++                // State/order and aggregate reply capacity are validated for
++                // the complete batch before any descriptor commits below.
++                return;
++            }
++
+             std::ostringstream message;
+             message << (malformed ? "Malformed" : "Unsupported") << " guest SIF command DMA: cid=";
+             if (readableHeader)
+@@ -273,6 +282,59 @@ namespace ps2_stubs
+         seedDefaultSifRegsLocked();
+     }
+ 
++    void pumpSifCommands(uint8_t *rdram, PS2Runtime *runtime)
++    {
++        auto *const iop = PS2IopTransport::subsystem(runtime);
++        if (!iop)
++            return;
++        iop->checkExecutionFailure();
++        if (!iop->sifCommandsInitialized())
++            return;
++        auto &memory = runtime->memory();
++        constexpr uint32_t sif0 = 0x1000C000u;
++        constexpr uint32_t dstatAddress = 0x1000E010u;
++        for (size_t completed = 0u; completed < 64u; ++completed)
++        {
++            ps2x::iop::SifEeReply reply;
++            if ((memory.readIORegister(sif0) & 0x100u) == 0u || !iop->peekSifReply(reply))
++                return;
++            const auto control = memory.m_ioRegisters.find(0x1000E000u);
++            if (control != memory.m_ioRegisters.end() && (control->second & 1u) == 0u)
++                return;
++            if (reply.command && !runtime->eeScheduler().hasEnabledIrqHandler(true, 5u))
++                return;
++            const uint32_t destination = reply.command ? iop->sifEeReceiveAddress() : reply.packetAddress;
++            const uint32_t packetBytes = static_cast<uint32_t>((reply.packet.size() + 15u) & ~size_t(15u));
++            if (destination == 0u || !canAccessEeRange(rdram, destination, packetBytes) ||
++                (!reply.data.empty() && !canAccessEeRange(rdram, reply.dataAddress, static_cast<uint32_t>(reply.data.size()))))
++                throw std::runtime_error("IOP SIF reply contains an inaccessible EE destination");
++            if (reply.command && *getConstMemPtr(rdram, destination) != 0u)
++                return; // The original interrupt handler has not consumed this buffer.
++            if (!reply.data.empty() && !writeEeRange(rdram, reply.dataAddress, reply.data.data(), static_cast<uint32_t>(reply.data.size())))
++                throw std::runtime_error("Cannot transfer IOP SIF reply data to EE memory");
++            reply.packet.resize(packetBytes, 0u);
++            if (!writeEeRange(rdram, destination, reply.packet.data(), packetBytes))
++                throw std::runtime_error("Cannot transfer IOP SIF reply packet to EE memory");
++            memory.m_ioRegisters[sif0 + 0x10u] = destination + packetBytes;
++            memory.m_ioRegisters[sif0 + 0x20u] = 0u;
++            iop->consumeSifReply();
++            if (reply.command)
++            {
++                // Complete the armed destination chain, then let the registered
++                // guest DMAC5 handler copy, rearm and dispatch this exact packet.
++                memory.m_ioRegisters[sif0] &= ~0x100u;
++                uint32_t &status = memory.m_ioRegisters[dstatAddress];
++                status |= 1u << 5u;
++                if ((status & (status >> 16u) & 0x3FFu) != 0u)
++                    status |= 1u << 31u;
++                else
++                    status &= ~(1u << 31u);
++                ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
++                return;
++            }
++        }
++    }
++
+     bool dispatchSifCommand(uint8_t *rdram,
+                             PS2Runtime *runtime,
+                             uint32_t commandId,
+@@ -511,6 +573,11 @@ namespace ps2_stubs
+     void sceSifGetReg(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         const uint32_t reg = getRegU32(ctx, 4);
++        if (runtime && runtime->missingFunctionPolicy() == PS2Runtime::MissingFunctionPolicy::Stop)
++        {
++            setReturnU32(ctx, PS2IopTransport::subsystem(runtime)->getSifRegister(reg));
++            return;
++        }
+         uint32_t value = 0u;
+         bool shouldLog = false;
+         {
+@@ -668,8 +735,12 @@ namespace ps2_stubs
+ 
+     void sceSifSetDChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        (void)rdram;
+-        (void)runtime;
++        if (runtime && runtime->missingFunctionPolicy() == PS2Runtime::MissingFunctionPolicy::Stop)
++        {
++            // PS2SDK kernel.h documents CHAIN | TIE | STR for this syscall.
++            runtime->memory().writeIORegister(0x1000C000u, 0x184u);
++            pumpSifCommands(rdram, runtime);
++        }
+         setReturnS32(ctx, 0);
+     }
+ 
+@@ -712,6 +783,8 @@ namespace ps2_stubs
+         });
+ 
+         std::array<Ps2SifDmaTransfer, 32u> pending{};
++        std::array<std::vector<uint8_t>, 32u> payloads;
++        std::vector<ps2x::iop::SifCommandPacket> commands;
+         uint32_t pendingCount = 0u;
+         bool ok = true;
+         for (uint32_t i = 0; i < count; ++i)
+@@ -745,14 +818,68 @@ namespace ps2_stubs
+                 break;
+             }
+ 
+-            pending[pendingCount++] = xfer;
++            pending[pendingCount] = xfer;
++            auto &payload = payloads[pendingCount];
++            payload.resize(sizeBytes);
++            if (!readEeRange(rdram, xfer.src, payload.data(), sizeBytes))
++            {
++                ok = false;
++                break;
++            }
++            ++pendingCount;
++            auto *const iop = PS2IopTransport::subsystem(runtime);
++            if (iop && iop->acceptsSifCommand(xfer.dest) && (static_cast<uint32_t>(xfer.attr) & 0x44u) == 0x44u)
++            {
++                ps2x::iop::SifCommandPacket packet;
++                packet.source = xfer.src;
++                packet.destination = xfer.dest;
++                packet.bytes.assign(payload.begin(), payload.begin() + payload[0u]);
++                const auto word = [&](size_t offset)
++                {
++                    return uint32_t(packet.bytes.at(offset)) | (uint32_t(packet.bytes.at(offset + 1u)) << 8u) |
++                           (uint32_t(packet.bytes.at(offset + 2u)) << 16u) | (uint32_t(packet.bytes.at(offset + 3u)) << 24u);
++                };
++                if (packet.bytes.size() >= 64u && word(8u) == 0x8000000Au && word(36u) <= 4096u)
++                {
++                    const uint32_t buffer = iop->sifRpcBuffer(word(52u));
++                    if (buffer != 0u)
++                    {
++                        packet.rpcInput.resize(word(36u));
++                        if (!iop->readMemory(buffer, packet.rpcInput.data(), packet.rpcInput.size()))
++                            throw std::runtime_error("Cannot snapshot IOP RPC request buffer");
++                        // Overlay earlier DMA writes into a temporary service
++                        // input, without committing any descriptor. This makes
++                        // path/argument/reply validation happen before effects.
++                        for (uint32_t previous = 0u; previous + 1u < pendingCount; ++previous)
++                        {
++                            const uint32_t destination = pending[previous].dest & 0x1FFFFFFFu;
++                            const uint32_t start = std::max(destination, buffer);
++                            const uint32_t end = std::min(destination + static_cast<uint32_t>(payloads[previous].size()),
++                                                          buffer + static_cast<uint32_t>(packet.rpcInput.size()));
++                            if (start < end)
++                                std::copy_n(payloads[previous].begin() + (start - destination), end - start,
++                                            packet.rpcInput.begin() + (start - buffer));
++                        }
++                        packet.hasRpcInput = true;
++                    }
++                }
++                commands.push_back(std::move(packet));
++            }
+         }
+ 
+         if (ok)
+         {
++            if (!commands.empty())
++                PS2IopTransport::subsystem(runtime)->validateSifCommandBatch(commands);
++            size_t commandIndex = 0u;
+             for (uint32_t i = 0; i < pendingCount; ++i)
+             {
+                 const Ps2SifDmaTransfer &xfer = pending[i];
++                auto *const iop = PS2IopTransport::subsystem(runtime);
++                const bool commandTransfer = iop && iop->acceptsSifCommand(xfer.dest) &&
++                                             (static_cast<uint32_t>(xfer.attr) & 0x44u) == 0x44u;
++                const ps2x::iop::SifCommandPacket *const command =
++                    commandTransfer ? &commands.at(commandIndex++) : nullptr;
+                 if (runtime)
+                 {
+                     PS2IopTransport::notifyTransfer(runtime, rdram, {
+@@ -763,9 +890,10 @@ namespace ps2_stubs
+                                                                         static_cast<uint32_t>(xfer.size),
+                                                                     });
+                 }
+-                const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
+-                std::vector<uint8_t> payload(sizeBytes);
+-                if (!readEeRange(rdram, xfer.src, payload.data(), sizeBytes) || !runtime->writeIopMemory(xfer.dest, payload.data(), payload.size()))
++                const std::vector<uint8_t> &payload = payloads[i];
++                // Copy the exact bytes validated before any descriptor or
++                // transfer observer could alter guest memory.
++                if (!runtime->writeIopMemory(xfer.dest, payload.data(), payload.size()))
+                 {
+                     ok = false;
+                     break;
+@@ -780,6 +908,8 @@ namespace ps2_stubs
+                                                                         static_cast<uint32_t>(xfer.size),
+                                                                     });
+                 }
++                if (command)
++                    iop->receiveSifCommandPacket(*command);
+             }
+         }
+ 
+@@ -799,7 +929,14 @@ namespace ps2_stubs
+             return;
+         }
+ 
+-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
++        auto *const iop = PS2IopTransport::subsystem(runtime);
++        if (iop && iop->sifCommandsInitialized())
++        {
++            runtime->memory().m_dmaStartCount.fetch_add(1u, std::memory_order_relaxed);
++            pumpSifCommands(rdram, runtime);
++        }
++        else
++            ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);
+ 
+         setReturnS32(ctx, static_cast<int32_t>(allocateSifDmaTransferId()));
+     }
+@@ -813,6 +950,11 @@ namespace ps2_stubs
+     {
+         const uint32_t reg = getRegU32(ctx, 4);
+         const uint32_t value = getRegU32(ctx, 5);
++        if (runtime && runtime->missingFunctionPolicy() == PS2Runtime::MissingFunctionPolicy::Stop)
++        {
++            setReturnU32(ctx, PS2IopTransport::subsystem(runtime)->setSifRegister(reg, value));
++            return;
++        }
+         uint32_t prev = 0u;
+         bool shouldLog = false;
+         {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+index 8673e80dd3619d6aa9beae193613b6c853cb782f..07bd2944e8a666b6197523567e41ced99433601f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.h
+@@ -9,6 +9,7 @@ namespace ps2_stubs
+     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void resetSifState();
++    void pumpSifCommands(uint8_t *rdram, PS2Runtime *runtime);
+     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifAllocIopHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03292de9c846294a620ef793451cb8010a3..9eb7b8458bfc3e59bed95fc3306656ceec8c48f2 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2_runtime.h"
+ #include "ps2_stubs.h"
++#include "ps2_iop_transport.h"
+ #include "Kernel/Stubs/SIF.h"
+ #include "runtime/ps2_memory.h"
+ #include "Kernel/Stubs/MemoryCard.h"
+@@ -510,6 +511,9 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+     uint8_t *const rdram = m_activeRdram
+                                ? m_activeRdram
+                                : m_runtime.memory().getRDRAM();
++    auto *const iop = PS2IopTransport::subsystem(&m_runtime);
++    if (iop && iop->sifCommandsInitialized())
++        return iop->queueSifCommand(commandId, packet, packetSize);
+     return ps2_stubs::dispatchSifCommand(rdram,
+                                          &m_runtime,
+                                          commandId,
+diff --git a/ps2xRuntime/src/lib/ps2_iop_transport.h b/ps2xRuntime/src/lib/ps2_iop_transport.h
+index 6bd1835ce5786784904ebf6ef49bfa8bb4dfbb73..e9b399daf1c84a4541cee696a0abe00ef17388c6 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_transport.h
++++ b/ps2xRuntime/src/lib/ps2_iop_transport.h
+@@ -8,6 +8,13 @@
+ class PS2IopTransport
+ {
+ public:
++    // Executor-thread access to the per-runtime packet endpoint. Keeping this
++    // bridge in the runtime implementation avoids changing generated-code ABI.
++    [[nodiscard]] static ps2x::iop::IopSubsystem *subsystem(PS2Runtime *runtime)
++    {
++        return runtime ? runtime->m_iopSubsystem.get() : nullptr;
++    }
++
+     [[nodiscard]] static ps2x::iop::RpcAbi selectRpcAbi(
+         const PS2Runtime *runtime,
+         const ps2x::iop::RpcAbiRequest &request)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4decc5865c7e51fbe9209ce46eafa6ccb27..7c22c201d9fe42d8f95fe78084b272465e9a6f49 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2361,6 +2361,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         {
+             if ((address & 0xFF) == 0x00)
+             {
++                // SIF0 is a receive chain: polling CHCR cannot complete it.
++                // The negotiated IOP transport clears STR only after delivering
++                // a packet, or the guest can cancel it with an explicit write.
++                if (address == 0x1000C000u)
++                    return m_ioRegisters[address];
+                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
+                 m_ioRegisters[address] = channelStatus;
+                 return channelStatus;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 18682467eeb586804570fe0b8be72f2374aa59a0..55f667a6b866758158e1e2bf315bdf2471f717f3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "Kernel/Stubs/SIF.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -1496,6 +1497,7 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
+ 
+ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
++    ps2_stubs::pumpSifCommands(rdram, this);
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
+         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 0f83c03bef7e7adf9aa41ef26e88bc1e95b7cf9b..5fc24792fa1a09738a27e3e6a71be0c217269e2e 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -36,6 +36,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
++    src/ps2_sif_packet_tests.cpp
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+     src/ps2_float_semantics_tests.cpp
+@@ -47,6 +48,7 @@ target_include_directories(ps2_test_lib PRIVATE
+     ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
+     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+     ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
++    ${CMAKE_SOURCE_DIR}/ps2xIOP/tests
+ )
+ 
+ target_link_libraries(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 9351210ba06b1111189d3dc43df03ad4a9c7078a..a5f9a4b58af476701b28873a881142bf678094ee 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -17,6 +17,7 @@ void register_ps2_gs_tests();
+ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
++void register_ps2_sif_packet_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void register_ps2_float_semantics_tests();
+@@ -41,6 +42,7 @@ int main()
+     register_ps2_iop_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
++    register_ps2_sif_packet_tests();
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
+     register_ps2_float_semantics_tests();
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6b5c86a79c84eaefbb60ed4156a61b9cf00d2a7
+--- /dev/null
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -0,0 +1,606 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_iop_transport.h"
++#include "ps2_runtime_macros.h"
++#include "Kernel/Stubs/SIF.h"
++#include "runtime/ee_scheduler.h"
++#include "iop_strict_fixtures.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kMain = 0x00110000u, kHandler = 0x00110010u;
++    constexpr uint32_t kDescriptors = 0x00020000u, kSource = 0x00020100u;
++    constexpr uint32_t kReceive = 0x00022000u, kSregs = 0x00023000u;
++    constexpr uint32_t kClient = 0x00024000u, kRequest = 0x00025000u, kResult = 0x00026000u;
++    std::vector<uint32_t> receivedValues;
++    std::vector<uint32_t> receivedRpcResults;
++
++    void put(std::vector<uint8_t> &bytes, size_t offset, uint32_t value)
++    {
++        for (size_t i = 0; i < 4u; ++i)
++            bytes.at(offset + i) = static_cast<uint8_t>(value >> (8u * i));
++    }
++
++    uint32_t word(const uint8_t *bytes, size_t offset)
++    {
++        return uint32_t(bytes[offset]) | (uint32_t(bytes[offset + 1]) << 8u) |
++               (uint32_t(bytes[offset + 2]) << 16u) | (uint32_t(bytes[offset + 3]) << 24u);
++    }
++
++    uint32_t word(const std::vector<uint8_t> &bytes, size_t offset)
++    {
++        if (offset > bytes.size() || bytes.size() - offset < 4u)
++            throw std::runtime_error("synthetic test received a truncated reply word");
++        return word(bytes.data(), offset);
++    }
++
++    std::vector<uint8_t> packet(uint32_t command, uint32_t size = 64u, uint32_t option = 0u)
++    {
++        std::vector<uint8_t> bytes(size, 0u);
++        put(bytes, 0u, size);
++        put(bytes, 8u, command);
++        put(bytes, 12u, option);
++        if (size >= 64u)
++        {
++            put(bytes, 16u, 0x00010005u);
++            put(bytes, 20u, kRequest);
++            put(bytes, 24u, 0x1234u);
++            put(bytes, 28u, kClient);
++        }
++        return bytes;
++    }
++
++    void mainStop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void guestCommandHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        // Model the original guest handler's observable ordering: copy packet,
++        // clear receive slot, rearm SIF0, then dispatch SET_SREG in guest code.
++        std::array<uint8_t, 112> local{};
++        const uint32_t size = rdram[kReceive];
++        if (size < 16u || size > local.size())
++            throw std::runtime_error("synthetic guest handler received malformed packet");
++        std::memcpy(local.data(), rdram + kReceive, size);
++        rdram[kReceive] = 0u;
++        ps2_stubs::sceSifSetDChain(rdram, ctx, runtime);
++        if (word(local.data(), 8u) == 0x80000001u)
++        {
++            const uint32_t index = word(local.data(), 16u);
++            const uint32_t value = word(local.data(), 20u);
++            std::memcpy(rdram + kSregs + index * 4u, &value, sizeof(value));
++            receivedValues.push_back(value);
++        }
++        else if (word(local.data(), 8u) == 0x80000008u)
++        {
++            const uint32_t client = word(local.data(), 28u);
++            if (word(local.data(), 32u) == 0x8000000Au)
++            {
++                // A guest END callback observes DMA result bytes before its
++                // completion semaphore is signaled, as in the original SDK.
++                receivedRpcResults.push_back(word(rdram, word(local.data(), 4u)));
++                const int32_t semaphore = static_cast<int32_t>(word(rdram, client + 8u));
++                if (semaphore >= 0)
++                    (void)runtime->eeScheduler().signalSemaphore(semaphore, true);
++                const uint32_t zero = 0u;
++                std::memcpy(rdram + client, &zero, sizeof(zero));
++            }
++        }
++        ctx->pc = 0u;
++    }
++
++    struct PacketEnv
++    {
++        PS2Runtime runtime;
++        std::vector<uint8_t> rdram = std::vector<uint8_t>(PS2_RAM_SIZE, 0u);
++        R5900Context context{};
++        uint32_t endpoint = 0u;
++
++        PacketEnv()
++        {
++            ps2_stubs::resetSifState();
++            receivedValues.clear();
++            receivedRpcResults.clear();
++            runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            runtime.registerFunction(kMain, mainStop);
++            runtime.registerFunction(kHandler, guestCommandHandler);
++            context.pc = kMain;
++            runtime.eeScheduler().bindMainContextForSyscall(context, rdram.data());
++            endpoint = iop().getSifRegister(2u);
++            (void)iop().setSifRegister(0x80000000u, endpoint);
++            (void)iop().setSifRegister(0x80000001u, 0x00021000u);
++        }
++
++        ps2x::iop::IopSubsystem &iop() { return *PS2IopTransport::subsystem(&runtime); }
++
++        void installHandler(bool enabled = true)
++        {
++            runtime.eeScheduler().addIrqHandler(true, 5u, kHandler, true, 0u, 0u, 0u);
++            runtime.eeScheduler().setIrqCauseEnabled(true, 5u, enabled);
++        }
++
++        void arm() { ps2_stubs::sceSifSetDChain(rdram.data(), &context, &runtime); }
++
++        void submit(const std::vector<uint8_t> &bytes)
++        {
++            std::memcpy(rdram.data() + kSource, bytes.data(), bytes.size());
++            const std::array<uint32_t, 4> descriptor{kSource, endpoint, static_cast<uint32_t>(bytes.size()), 0x44u};
++            std::memcpy(rdram.data() + kDescriptors, descriptor.data(), sizeof(descriptor));
++            SET_GPR_U32(&context, 4, kDescriptors);
++            SET_GPR_U32(&context, 5, 1u);
++            ps2_stubs::sceSifSetDma(rdram.data(), &context, &runtime);
++        }
++
++        void init()
++        {
++            auto init = packet(0x80000002u, 20u);
++            put(init, 16u, kReceive);
++            submit(init);
++        }
++
++        uint32_t bindService(uint32_t sid)
++        {
++            init();
++            iop().consumeSifReply(); // This unit inspects framing independently of the IRQ integration test.
++            submit(packet(0x80000002u, 16u, 1u));
++            auto bind = packet(0x80000009u);
++            put(bind, 32u, sid);
++            submit(bind);
++            ps2x::iop::SifEeReply reply;
++            if (!iop().peekSifReply(reply))
++                throw std::runtime_error("synthetic BIND produced no reply");
++            const uint32_t server = word(reply.packet, 36u);
++            const uint32_t buffer = word(reply.packet, 40u);
++            std::memcpy(rdram.data() + kClient + 20u, &buffer, sizeof(buffer));
++            iop().consumeSifReply();
++            return server;
++        }
++
++        uint32_t bindHeap() { return bindService(0x80000003u); }
++
++        void submitRpc(uint32_t server, uint32_t function, const std::vector<uint8_t> &input,
++                       uint32_t receiveSize, uint32_t replyMode = 1u)
++        {
++            const uint32_t buffer = word(rdram.data(), kClient + 20u);
++            auto call = packet(0x8000000Au);
++            put(call, 0u, 64u | (static_cast<uint32_t>(input.size()) << 8u));
++            put(call, 4u, buffer);
++            put(call, 32u, function);
++            put(call, 36u, static_cast<uint32_t>(input.size()));
++            put(call, 40u, kResult);
++            put(call, 44u, receiveSize);
++            put(call, 48u, replyMode);
++            put(call, 52u, server);
++            std::memcpy(rdram.data() + kSource, call.data(), call.size());
++            std::copy(input.begin(), input.end(), rdram.begin() + kSource + 128u);
++            const std::array<uint32_t, 8> descriptors{
++                kSource + 128u, buffer, static_cast<uint32_t>(input.size()), 0u,
++                kSource, endpoint, 64u, 0x44u};
++            std::memcpy(rdram.data() + kDescriptors, descriptors.data(), sizeof(descriptors));
++            SET_GPR_U32(&context, 4, kDescriptors);
++            SET_GPR_U32(&context, 5, 2u);
++            ps2_stubs::sceSifSetDma(rdram.data(), &context, &runtime);
++        }
++
++        bool fails(const std::vector<uint8_t> &bytes)
++        {
++            try { submit(bytes); }
++            catch (const std::runtime_error &) { return true; }
++            return false;
++        }
++    };
++}
++
++void register_ps2_sif_packet_tests()
++{
++    MiniTest::Case("PS2SifPackets", [](TestCase &tc)
++    {
++        tc.Run("negotiated INIT readiness reaches EE only through its guest DMAC handler", [](TestCase &t)
++        {
++            PacketEnv env;
++            t.IsTrue(env.endpoint != 0u && env.runtime.isIopMemoryRange(env.endpoint, 128u),
++                     "advertised IOP endpoint must be a real allocated memory range");
++            env.init();
++            t.Equals(word(env.rdram.data(), kSregs), 0u, "INIT must not patch guest SREG memory");
++            env.installHandler(false);
++            env.arm();
++            t.IsTrue((env.runtime.memory().readIORegister(0x1000C000u) & 0x100u) != 0u,
++                     "guest CHCR poll must preserve the armed SIF0 receive chain");
++            t.Equals(env.rdram[kReceive], uint8_t{0}, "disabled DMAC handler retains queued reply");
++            env.runtime.eeScheduler().setIrqCauseEnabled(true, 5u, true);
++            ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime);
++            t.Equals(env.rdram[kReceive], uint8_t{24}, "armed SIF0 must receive a real SET_SREG packet");
++            t.Equals(word(env.rdram.data(), kSregs), 0u, "DMA completion alone must not mutate guest SREG");
++            env.runtime.eeScheduler().run();
++            t.Equals(word(env.rdram.data(), kSregs), 1u, "guest handler must interpret SET_SREG and write readiness");
++            t.Equals(receivedValues.size(), size_t{1}, "exactly one guest interrupt delivery");
++        });
++
++        tc.Run("queued command replies respect guest buffer ownership and receive-chain rearming", [](TestCase &t)
++        {
++            PacketEnv env;
++            env.init();
++            auto next = packet(0x80000001u, 24u);
++            put(next, 16u, 1u);
++            put(next, 20u, 77u);
++            t.IsTrue(env.iop().queueSifCommand(0x80000001u, next.data(), next.size()), "queue second real reply");
++            env.arm();
++            t.Equals(env.rdram[kReceive], uint8_t{0}, "unregistered DMAC handler retains both packets");
++            env.installHandler();
++            ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime);
++            t.Equals(word(env.rdram.data(), kReceive + 20u), 1u, "first packet occupies receive buffer");
++            ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime);
++            t.Equals(word(env.rdram.data(), kReceive + 20u), 1u, "second reply cannot overwrite an unconsumed packet");
++            env.runtime.eeScheduler().run();
++            t.IsTrue(receivedValues == std::vector<uint32_t>({1u, 77u}), "original handler ordering must be retained");
++            t.Equals(word(env.rdram.data(), kSregs + 4u), 77u, "second guest dispatch consumes the second packet");
++        });
++
++        tc.Run("RPC BIND echoes identities and exposes an allocated bootstrap buffer", [](TestCase &t)
++        {
++            PacketEnv env;
++            env.init();
++            env.iop().consumeSifReply();
++            env.submit(packet(0x80000002u, 16u, 1u));
++            auto bind = packet(0x80000009u);
++            put(bind, 32u, 0x80000003u);
++            env.submit(bind);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply), "BIND must produce RPC_END");
++            t.Equals(word(reply.packet, 8u), 0x80000008u, "reply command is RPC_END");
++            for (size_t offset : {16u, 20u, 24u, 28u})
++                t.Equals(word(reply.packet, offset), word(bind.data(), offset), "request identity is echoed exactly");
++            t.Equals(word(reply.packet, 32u), 0x80000009u, "END identifies original BIND command");
++            t.IsTrue(word(reply.packet, 36u) != 0u && word(reply.packet, 40u) != 0u &&
++                         word(reply.packet, 36u) != word(reply.packet, 40u) &&
++                         env.runtime.isIopMemoryRange(word(reply.packet, 36u), 64u) &&
++                         env.runtime.isIopMemoryRange(word(reply.packet, 40u), 4096u),
++                     "server descriptor and input buffer refer to real distinct IOP allocations");
++        });
++
++        tc.Run("rmode zero copies the real heap result then completes the original request without END", [](TestCase &t)
++        {
++            PacketEnv env;
++            const uint32_t server = env.bindHeap();
++            const uint32_t buffer = word(env.rdram.data(), kClient + 20u);
++            const uint32_t requestedSize = 128u;
++            t.IsTrue(env.runtime.writeIopMemory(buffer, &requestedSize, sizeof(requestedSize)), "prepare real heap request");
++            auto call = packet(0x8000000Au);
++            put(call, 32u, 1u);
++            put(call, 36u, 4u);
++            put(call, 40u, kResult);
++            put(call, 44u, 4u);
++            put(call, 48u, 0u);
++            put(call, 52u, server);
++            std::memset(env.rdram.data() + kRequest, 0xA5, 64u);
++            env.submit(call);
++            t.Equals(word(env.rdram.data(), kRequest + 24u), 0xA5A5A5A5u, "unarmed receive DMA retains completion");
++            env.arm();
++            const uint32_t allocation = word(env.rdram.data(), kResult);
++            t.IsTrue(allocation != 0u && env.runtime.isIopMemoryRange(allocation, requestedSize), "heap reply is an actual allocated IOP range");
++            t.Equals(word(env.rdram.data(), kRequest + 16u), 0u, "direct completion clears rec_id");
++            t.Equals(word(env.rdram.data(), kRequest + 24u), 0u, "direct completion clears rpc_id");
++            t.IsTrue(receivedValues.empty() && env.rdram[kReceive] == 0u, "rmode zero must not synthesize an END interrupt");
++            t.IsTrue(env.runtime.freeIopMemory(allocation), "reported allocation must be owned by real IOP allocator");
++        });
++
++        tc.Run("RPC result DMA precedes the guest END callback and semaphore completion", [](TestCase &t)
++        {
++            PacketEnv env;
++            const uint32_t server = env.bindHeap();
++            const uint32_t buffer = word(env.rdram.data(), kClient + 20u);
++            const uint32_t requestedSize = 128u;
++            t.IsTrue(env.runtime.writeIopMemory(buffer, &requestedSize, sizeof(requestedSize)), "prepare heap CALL");
++            const int semaphore = env.runtime.eeScheduler().createSemaphore(0, 1, 0u, 0u);
++            std::memcpy(env.rdram.data() + kClient + 8u, &semaphore, sizeof(semaphore));
++            auto call = packet(0x8000000Au);
++            put(call, 32u, 1u);
++            put(call, 36u, 4u);
++            put(call, 40u, kResult);
++            put(call, 44u, 4u);
++            put(call, 48u, 1u);
++            put(call, 52u, server);
++            env.submit(call);
++            env.installHandler();
++            env.arm();
++            const uint32_t allocation = word(env.rdram.data(), kResult);
++            t.IsTrue(allocation != 0u && receivedRpcResults.empty(), "result bytes arrive before guest interrupt execution");
++            t.IsTrue(env.runtime.eeScheduler().pollSemaphore(semaphore) < 0, "DMA alone cannot complete the guest semaphore");
++            env.runtime.eeScheduler().run();
++            t.IsTrue(receivedRpcResults == std::vector<uint32_t>{allocation}, "guest END callback sees exact service output");
++            t.Equals(env.runtime.eeScheduler().pollSemaphore(semaphore), semaphore, "guest END handler signals completion");
++            t.IsTrue(env.runtime.freeIopMemory(allocation), "completed result remains a real allocator-owned block");
++        });
++
++        tc.Run("malformed INIT and RPC ranges fail before readiness or allocator mutation", [](TestCase &t)
++        {
++            PacketEnv env;
++            t.IsTrue(env.fails(packet(0x80000002u, 16u, 1u)), "option 1 before option 0 is invalid");
++            auto init = packet(0x80000002u, 20u);
++            put(init, 16u, 0x21FFFFC0u);
++            t.IsTrue(env.fails(init), "uncached receive range cannot wrap beyond physical RAM");
++            const uint32_t server = env.bindHeap();
++            const uint32_t buffer = word(env.rdram.data(), kClient + 20u);
++            const uint32_t allocation = env.runtime.allocateIopMemory(128u, 16u);
++            t.IsTrue(env.runtime.writeIopMemory(buffer, &allocation, sizeof(allocation)), "prepare real free request");
++            auto call = packet(0x8000000Au);
++            put(call, 32u, 2u);
++            put(call, 36u, 4u);
++            put(call, 40u, 0x81FFFFFEu);
++            put(call, 44u, 4u);
++            put(call, 48u, 1u);
++            put(call, 52u, server);
++            t.IsTrue(env.fails(call), "cross-boundary result storage must fail during packet preflight");
++            t.IsTrue(env.runtime.freeIopMemory(allocation), "rejected CALL must not execute the free service");
++            t.Equals(word(env.rdram.data(), kSregs), 0u, "invalid messages cannot create readiness");
++        });
++
++        tc.Run("RDATA validates its exact receive descriptor and copies real IOP bytes", [](TestCase &t)
++        {
++            PacketEnv env;
++            (void)env.bindHeap();
++            const uint32_t source = env.runtime.allocateIopMemory(4u, 16u);
++            const uint32_t value = 0xDEADBEEFu;
++            t.IsTrue(env.runtime.writeIopMemory(source, &value, sizeof(value)), "prepare RDATA source");
++            auto request = packet(0x8000000Cu);
++            put(request, 28u, PS2_RAM_SIZE - 28u);
++            put(request, 32u, source);
++            put(request, 36u, kResult);
++            put(request, 40u, 4u);
++            env.submit(request);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply) && reply.data.size() == 4u &&
++                         word(reply.data, 0u) == value,
++                     "28-byte RDATA descriptor ending at RAM boundary is valid");
++            env.iop().consumeSifReply();
++            put(request, 28u, PS2_RAM_SIZE - 27u);
++            t.IsTrue(env.fails(request), "RDATA descriptor must not cross the physical RAM boundary");
++        });
++
++        tc.Run("modeled endpoint framing is validated even under compatibility policy", [](TestCase &t)
++        {
++            PacketEnv env;
++            env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::ContinueToTarget);
++            auto malformed = packet(0x80000002u, 16u);
++            put(malformed, 0u, 64u);
++            t.IsTrue(env.fails(malformed), "advertised packet size cannot exceed copied bytes in any policy");
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(!env.iop().peekSifReply(reply), "malformed compatibility packet creates no reply");
++        });
++
++        tc.Run("provider payload preflight rejects malformed requests before the preceding DMA commits", [](TestCase &t)
++        {
++            PacketEnv env;
++            const uint32_t server = env.bindService(0x80000006u);
++            const uint32_t buffer = word(env.rdram.data(), kClient + 20u);
++            std::array<uint8_t, 512u> sentinel{};
++            sentinel.fill(0xA5u);
++            t.IsTrue(env.runtime.writeIopMemory(buffer, sentinel.data(), sentinel.size()), "prepare provider input sentinel");
++            std::vector<uint8_t> malformed(512u, 0u);
++            std::fill(malformed.begin() + 8u, malformed.begin() + 260u, uint8_t{'x'});
++            bool failed = false;
++            try { env.submitRpc(server, 0u, malformed, 8u); }
++            catch (const std::runtime_error &) { failed = true; }
++            t.IsTrue(failed, "unterminated loadfile path must fail preflight");
++            std::array<uint8_t, 512u> readback{};
++            t.IsTrue(env.runtime.readIopMemory(buffer, readback.data(), readback.size()) && readback == sentinel,
++                     "invalid provider payload cannot partially copy into its server buffer");
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(!env.iop().peekSifReply(reply), "invalid provider request must create no completion");
++        });
++
++        tc.Run("staged RPC input executes real heap allocation and rejects undersized output before mutation", [](TestCase &t)
++        {
++            PacketEnv env;
++            const uint32_t server = env.bindHeap();
++            const uint32_t buffer = word(env.rdram.data(), kClient + 20u);
++            const uint32_t sentinel = 0xAABBCCDDu;
++            t.IsTrue(env.runtime.writeIopMemory(buffer, &sentinel, sizeof(sentinel)), "prepare input sentinel");
++            std::vector<uint8_t> input(4u);
++            put(input, 0u, 128u);
++            bool failed = false;
++            try { env.submitRpc(server, 1u, input, 0u); }
++            catch (const std::runtime_error &) { failed = true; }
++            t.IsTrue(failed, "short result range must fail before a heap request executes");
++            uint32_t readback = 0u;
++            t.IsTrue(env.runtime.readIopMemory(buffer, &readback, sizeof(readback)) && readback == sentinel,
++                     "undersized output must not commit preceding input DMA");
++            env.submitRpc(server, 1u, input, 4u);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply) && reply.data.size() == 4u &&
++                         env.runtime.freeIopMemory(word(reply.data, 0u)),
++                     "validated staged payload produces an actual allocator-owned block");
++            env.iop().consumeSifReply();
++            put(input, 0u, 0xFFFFFFFFu);
++            env.submitRpc(server, 1u, input, 4u);
++            t.IsTrue(env.iop().peekSifReply(reply) && word(reply.data, 0u) == 0u,
++                     "oversized signed heap request cannot wrap into a successful zero-sized allocation");
++        });
++
++        tc.Run("CDVD readiness depends on initialization and real mounted media", [](TestCase &t)
++        {
++            struct PathsGuard
++            {
++                PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
++                std::filesystem::path directory;
++                ~PathsGuard()
++                {
++                    PS2Runtime::setIoPaths(saved);
++                    std::error_code error;
++                    if (!directory.empty()) std::filesystem::remove_all(directory, error);
++                }
++            } guard;
++            PS2Runtime::setIoPaths({});
++            {
++                PacketEnv env;
++                t.Equals(env.iop().callCdvdImport(13u, 0u), 6u, "uninitialized drive is not ready");
++                const uint32_t server = env.bindService(0x80000592u);
++                std::vector<uint8_t> mode(4u, 0u);
++                env.submitRpc(server, 0u, mode, 16u);
++                ps2x::iop::SifEeReply reply;
++                t.IsTrue(env.iop().peekSifReply(reply) && word(reply.data, 0u) == 1u,
++                         "init RPC initializes the same owned CDVD model");
++                t.Equals(env.iop().callCdvdImport(13u, 0u), 6u, "initialization cannot fabricate mounted media");
++            }
++            const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
++            guard.directory = std::filesystem::temp_directory_path() / ("ps2-sif-media-" + std::to_string(suffix));
++            if (!std::filesystem::create_directory(guard.directory))
++                throw std::runtime_error("cannot create unique synthetic media fixture");
++            std::ofstream(guard.directory / "TEST.BIN", std::ios::binary).write("fixture", 7);
++            PS2Runtime::IoPaths paths{};
++            paths.cdRoot = guard.directory.string();
++            PS2Runtime::setIoPaths(paths);
++            PacketEnv env;
++            (void)env.iop().callCdvdImport(4u, 0u);
++            t.Equals(env.iop().callCdvdImport(13u, 0u), 2u, "a readable mounted volume can become ready");
++            (void)env.iop().callCdvdImport(4u, 5u);
++            t.Equals(env.iop().callCdvdImport(13u, 0u), 6u, "deinitialization clears drive readiness");
++        });
++
++        tc.Run("nonresident strict modules do not activate an alias-backed service", [](TestCase &t)
++        {
++            for (const uint32_t disposition : {0u, 1u, 2u, 3u})
++            {
++                PacketEnv env;
++                iop_test::Irx image;
++                image.words(0u, {0x03E00008u, 0x24020000u | disposition});
++                const auto loaded = env.iop().loadModuleImage("mcserv.irx", image.bytes, nullptr, 0u);
++                const bool resident = disposition == 0u || disposition == 2u;
++                t.Equals(env.iop().canBindRpc(0x80000400u), resident,
++                         "service routing must follow the original entry's resident disposition");
++                t.Equals(env.iop().debugSnapshot().emulatorLoadedModules, resident ? size_t{1u} : size_t{0u},
++                         "service routing and actual loaded-module state must agree");
++                if (resident)
++                    t.IsTrue(env.iop().stopModule(loaded.moduleId) && !env.iop().canBindRpc(0x80000400u),
++                             "stopping the resident module removes its alias route");
++            }
++        });
++
++        tc.Run("idle SIF polling propagates a strict IOP background-thread failure", [](TestCase &t)
++        {
++            PacketEnv env;
++            const auto image = iop_test::backgroundMissingImport();
++            const auto loaded = env.iop().loadModuleImage("thread", image.bytes, nullptr, 0u);
++            t.IsTrue(loaded.moduleId > 0, "actual synthetic entry must create its guest thread and return");
++            env.iop().runEeCycles(4096u);
++            std::string error;
++            try { ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime); }
++            catch (const std::runtime_error &failure) { error = failure.what(); }
++            t.IsTrue(error.find("missing import absent:42") != std::string::npos,
++                     "pending IOP error must escape polling even with no queued reply or armed channel");
++        });
++
++        tc.Run("IOP reset discards packet replies and bindings before a new handshake", [](TestCase &t)
++        {
++            PacketEnv env;
++            const uint32_t oldServer = env.bindHeap();
++            env.init();
++            PS2IopTransport::reset(&env.runtime);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(!env.iop().peekSifReply(reply) && !env.iop().sifCommandsInitialized(), "reset discards old endpoint and queued packets");
++            env.endpoint = env.iop().getSifRegister(2u);
++            auto call = packet(0x8000000Au);
++            put(call, 52u, oldServer);
++            t.IsTrue(env.fails(call), "stale RPC binding cannot survive a new IOP boot");
++        });
++
++        tc.Run("moving an IOP subsystem rebinds endpoint and provider ownership", [](TestCase &t)
++        {
++            PacketEnv env;
++            auto &original = env.iop();
++            ps2x::iop::IopSubsystem moved(std::move(original));
++            struct RestoreOwner
++            {
++                ps2x::iop::IopSubsystem &destination, &source;
++                ~RestoreOwner() { destination = std::move(source); }
++            } restore{original, moved};
++            t.Equals(moved.getSifRegister(2u), env.endpoint, "move constructor preserves the live endpoint");
++            moved.reset();
++            t.IsTrue(moved.getSifRegister(2u) != 0u, "moved endpoint must allocate through its rebound owner");
++            auto init = packet(0x80000002u, 20u);
++            put(init, 16u, kReceive);
++            moved.receiveSifCommand(init.data(), init.size());
++            moved.consumeSifReply();
++            const auto rpcInit = packet(0x80000002u, 16u, 1u);
++            moved.receiveSifCommand(rpcInit.data(), rpcInit.size());
++            auto bind = packet(0x80000009u);
++            put(bind, 32u, 0x80000003u);
++            moved.receiveSifCommand(bind.data(), bind.size());
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(moved.peekSifReply(reply) && word(reply.packet, 36u) != 0u,
++                     "moved provider must allocate a real bound server using the new owner");
++            const uint32_t server = word(reply.packet, 36u);
++            const uint32_t buffer = word(reply.packet, 40u);
++            moved.consumeSifReply();
++            const uint32_t size = 128u;
++            t.IsTrue(moved.writeMemory(buffer, &size, sizeof(size)), "write moved provider input");
++            auto call = packet(0x8000000Au);
++            put(call, 32u, 1u);
++            put(call, 36u, 4u);
++            put(call, 40u, kResult);
++            put(call, 44u, 4u);
++            put(call, 52u, server);
++            moved.receiveSifCommand(call.data(), call.size());
++            t.IsTrue(moved.peekSifReply(reply) && reply.data.size() == 4u &&
++                         moved.freeMemory(word(reply.data, 0u)),
++                     "moved bootstrap provider must execute against its rebound owner");
++        });
++
++        tc.Run("packet batch preflight stages initialization order and reserves all reply slots", [](TestCase &t)
++        {
++            PacketEnv env;
++            auto init = packet(0x80000002u, 20u);
++            put(init, 16u, kReceive);
++            const auto rpcInit = packet(0x80000002u, 16u, 1u);
++            std::memcpy(env.rdram.data() + kSource, init.data(), init.size());
++            std::memcpy(env.rdram.data() + kSource + 128u, rpcInit.data(), rpcInit.size());
++            const std::array<uint32_t, 8> initDescriptors{
++                kSource, env.endpoint, 20u, 0x44u, kSource + 128u, env.endpoint, 16u, 0x44u};
++            std::memcpy(env.rdram.data() + kDescriptors, initDescriptors.data(), sizeof(initDescriptors));
++            SET_GPR_U32(&env.context, 4, kDescriptors);
++            SET_GPR_U32(&env.context, 5, 2u);
++            ps2_stubs::sceSifSetDma(env.rdram.data(), &env.context, &env.runtime);
++            t.IsTrue(getRegU32(&env.context, 2) != 0u, "valid ordered INIT messages in one batch must succeed");
++
++            auto reply = packet(0x80000001u, 24u);
++            for (size_t i = 0u; i < 62u; ++i)
++                t.IsTrue(env.iop().queueSifCommand(0x80000001u, reply.data(), reply.size()), "prepare 63 pending replies");
++            auto bind = packet(0x80000009u);
++            put(bind, 32u, 0x80000003u);
++            std::memcpy(env.rdram.data() + kSource, bind.data(), bind.size());
++            constexpr uint32_t ordinaryDestination = 0x00030000u;
++            const uint32_t sentinel = 0xAABBCCDDu;
++            t.IsTrue(env.runtime.writeIopMemory(ordinaryDestination, &sentinel, sizeof(sentinel)), "prepare ordinary transfer sentinel");
++            const std::array<uint32_t, 12> descriptors{
++                kSource, ordinaryDestination, 4u, 0u,
++                kSource, env.endpoint, 64u, 0x44u,
++                kSource, env.endpoint, 64u, 0x44u};
++            std::memcpy(env.rdram.data() + kDescriptors, descriptors.data(), sizeof(descriptors));
++            SET_GPR_U32(&env.context, 4, kDescriptors);
++            SET_GPR_U32(&env.context, 5, 3u);
++            bool failed = false;
++            try { ps2_stubs::sceSifSetDma(env.rdram.data(), &env.context, &env.runtime); }
++            catch (const std::runtime_error &) { failed = true; }
++            t.IsTrue(failed, "two reply-producing commands cannot fit in one remaining queue slot");
++            uint32_t readback = 0u;
++            t.IsTrue(env.runtime.readIopMemory(ordinaryDestination, &readback, sizeof(readback)) && readback == sentinel,
++                     "queue exhaustion must fail before an earlier descriptor commits");
++            size_t count = 0u;
++            ps2x::iop::SifEeReply pending;
++            while (env.iop().peekSifReply(pending)) { env.iop().consumeSifReply(); ++count; }
++            t.Equals(count, size_t{63}, "failed batch cannot append a partial BIND completion");
++        });
++    });
++}
