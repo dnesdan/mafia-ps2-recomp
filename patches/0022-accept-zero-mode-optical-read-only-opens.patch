@@ -1,0 +1,198 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+index 7fe0bd56bf6c84fc2e4acc02118a7269385d07dc..ec97c5df5bfce3e38dd9d6feaed431f8cd223d4f 100644
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -213,14 +213,14 @@ namespace ps2x::iop::detail
+             // https://ps2dev.github.io/ps2sdk/ioman_8h_source.html
+             // https://ps2dev.github.io/ps2sdk/io__common_8h_source.html
+             const uint32_t flags = cpu.gpr[5];
+-            if (flags != 1u && flags != 3u) // FIO_O_RDONLY / optical FIO_O_RDWR.
++            if (flags != 0u && flags != 1u && flags != 3u) // FIO_O_RDONLY / optical modes 0 and FIO_O_RDWR.
+                 return false;
+             const std::string path = filePath(m_memory, a0);
+-            // CDVDMAN accepts O_RDWR but converts the opened file to O_RDONLY.
++            // CDVDMAN accepts modes 0 and O_RDWR but sets the file to O_RDONLY.
+             // Preserve that optical-driver behavior without granting host or
+             // memory-card write access, or accepting unmodeled mode bits.
+             // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html (cdrom_open)
+-            if (flags == 3u && (path.find(':') == std::string::npos ||
++            if (flags != 1u && (path.find(':') == std::string::npos ||
+                                parsePs2Path(path).device != Ps2PathDevice::Cdrom))
+                 return false;
+             const std::string device = deviceName(path);
+diff --git a/ps2xIOP/tests/iop_ioman_file_tests.cpp b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+index d8286685ed821870ca937a77f181c02b8865b5fb..c00f640e68b39dd4800a9aa16bcd699d3f3bd82b 100644
+--- a/ps2xIOP/tests/iop_ioman_file_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_file_tests.cpp
+@@ -354,60 +354,75 @@ namespace
+                 "unmounted CD device fell back to a native host path");
+     }
+ 
+-    void opticalReadWriteModeRetainsReadOnlyBacking()
++    void opticalModesRetainReadOnlyBacking()
+     {
+-        Fixture f;
+-        for (const std::string path : {"cdrom0:\\DATA\\TEST.BIN;1", "cdrom:DATA/TEST.BIN",
+-                                      "CDROM0:DATA/TEST.BIN", "CdRoM:DATA/TEST.BIN"})
++        for (const uint32_t flags : {0u, 1u, 3u})
+         {
+-            // The optional creation mode is irrelevant without O_CREAT, as in
+-            // the original caller that opens an existing optical icon with 3.
+-            const auto fd = static_cast<uint32_t>(f.open(path, 3u, 0x50E670u));
+-            f.fill(0x11000u, 32u);
+-            require(fd < 16u && f.call(8u, fd, 0u, 2u) == content.size() &&
+-                        f.call(8u, fd, 0u, 0u) == 0u &&
+-                        f.call(6u, fd, 0x11001u, 20u) == content.size() &&
+-                        f.bytes(0x11001u, content.size()) == content &&
+-                        f.memory.read8(0x11000u) == 0xCAu &&
+-                        f.memory.read8(0x11001u + content.size()) == 0xCAu &&
+-                        f.call(6u, fd, 0x11001u, 1u) == 0u,
+-                    "optical mode 3 did not read the actual existing bytes with EOF and seek semantics");
+-            IopCpuState write{};
+-            write.gpr[2] = marker;
+-            write.gpr[4] = fd;
+-            write.gpr[5] = 0x11001u;
+-            write.gpr[6] = 1u;
+-            require(!f.ioman->dispatchImport(7u, write, f.executor) && write.gpr[2] == marker &&
+-                        f.position(fd) == content.size() && f.host.handles.size() == 1u &&
+-                        f.host.handles.begin()->second == content && f.call(5u, fd) == 0u,
+-                    "optical mode 3 granted write behavior or changed the read-only file");
+-        }
+-        const size_t opens = f.host.opens;
+-        for (const std::string path : {"host:TEST.BIN", "HOST0:TEST.BIN", "mc0:TEST.BIN",
+-                                      "rom0:ROMVER", "cdrom1:DATA/TEST.BIN", "cdrom00:DATA/TEST.BIN",
+-                                      "DATA/TEST.BIN", "/tmp/TEST.BIN"})
+-        {
+-            require(f.memory.writeRam(0x10000u, path.c_str(), path.size() + 1u), "could not install strict route");
+-            IopCpuState cpu{};
+-            cpu.gpr[2] = marker;
+-            cpu.gpr[4] = 0x10000u;
+-            cpu.gpr[5] = 3u;
+-            const size_t translations = f.host.translations;
+-            require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
+-                        f.host.opens == opens && f.host.translations == translations,
+-                    "optical mode exception broadened another device or an implicit path");
++            Fixture f;
++            for (const std::string path : {"cdrom0:\\DATA\\TEST.BIN;1", "cdrom:DATA/TEST.BIN",
++                                          "CDROM0:DATA/TEST.BIN", "CdRoM:DATA/TEST.BIN"})
++            {
++                // Optical modes 0, O_RDONLY and O_RDWR all keep the actual file
++                // read-only. Without O_CREAT the optional creation mode is unused.
++                const auto fd = static_cast<uint32_t>(f.open(path, flags, 0x50E670u));
++                f.fill(0x11000u, 32u);
++                require(fd < 16u && f.call(8u, fd, 0u, 2u) == content.size() &&
++                            f.call(8u, fd, 0u, 0u) == 0u &&
++                            f.call(6u, fd, 0x11001u, 20u) == content.size() &&
++                            f.bytes(0x11001u, content.size()) == content &&
++                            f.memory.read8(0x11000u) == 0xCAu &&
++                            f.memory.read8(0x11001u + content.size()) == 0xCAu &&
++                            f.call(6u, fd, 0x11001u, 1u) == 0u,
++                        "optical mode did not read the actual existing bytes with EOF and seek semantics");
++                IopCpuState write{};
++                write.gpr[2] = marker;
++                write.gpr[4] = fd;
++                write.gpr[5] = 0x11001u;
++                write.gpr[6] = 1u;
++                require(!f.ioman->dispatchImport(7u, write, f.executor) && write.gpr[2] == marker &&
++                            f.position(fd) == content.size() && f.host.handles.size() == 1u &&
++                            f.host.handles.begin()->second == content && f.call(5u, fd) == 0u,
++                        "optical mode granted write behavior or changed the read-only file");
++            }
++            const size_t opens = f.host.opens;
++            if (flags != 1u)
++            {
++                for (const std::string path : {"host:TEST.BIN", "HOST0:TEST.BIN", "mc0:TEST.BIN",
++                                              "rom0:ROMVER", "cdrom1:DATA/TEST.BIN", "cdrom00:DATA/TEST.BIN",
++                                              "DATA/TEST.BIN", "/tmp/TEST.BIN"})
++                {
++                    require(f.memory.writeRam(0x10000u, path.c_str(), path.size() + 1u), "could not install strict route");
++                    IopCpuState cpu{};
++                    cpu.gpr[2] = marker;
++                    cpu.gpr[4] = 0x10000u;
++                    cpu.gpr[5] = flags;
++                    const size_t translations = f.host.translations;
++                    require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
++                                f.host.opens == opens && f.host.translations == translations,
++                            "optical mode exception broadened another device or an implicit path");
++                }
++            }
++            for (const std::string path : {"cdrom0:", "cdrom0:../outside/SECRET.BIN",
++                                          "cdrom0:DATA/../../outside/SECRET.BIN", "cdrom0:DATA/TEST.BIN;BAD",
++                                          "cdrom0:DATA/C:TEST.BIN", "cdrom0:BAD\nNAME"})
++            {
++                const size_t translations = f.host.translations;
++                require(f.open(path, flags) == -19 && f.host.opens == opens &&
++                            f.host.translations == translations,
++                        "optical mode bypassed route validation before host translation");
++            }
++            require(f.open("cdrom0:MISSING.BIN", flags) == -2 && f.host.opens == opens + 1u,
++                    "missing optical file did not return its actual ENOENT");
++            f.host.roots[0].clear();
++            require(f.open("cdrom0:DATA/TEST.BIN", flags) == -19 && f.host.opens == opens + 1u &&
++                        f.host.handles.empty() && f.host.guestWrites == 0u && f.host.guestReads == 0u,
++                    "unmounted optical mode escaped the mount or retained a handle");
+         }
+-        require(f.open("cdrom0:MISSING.BIN", 3u) == -2 && f.host.opens == opens + 1u,
+-                "missing optical file with mode 3 did not return its actual ENOENT");
+-        f.host.roots[0].clear();
+-        require(f.open("cdrom0:DATA/TEST.BIN", 3u) == -19 && f.host.opens == opens + 1u &&
+-                    f.host.handles.empty() && f.host.guestWrites == 0u && f.host.guestReads == 0u,
+-                "unmounted optical mode 3 escaped the mount or retained a handle");
+     }
+ 
+     void canonicalContainmentAndDriverPrecedence()
+     {
+-        for (const uint32_t flags : {1u, 3u})
++        for (const uint32_t flags : {0u, 1u, 3u})
+         {
+             Fixture f;
+             for (const fs::path &target : {f.tree.root / "outside" / "SECRET.BIN", f.tree.root / "cd",
+@@ -440,8 +455,9 @@ namespace
+                 cpu.gpr[2] = marker;
+                 cpu.gpr[4] = 0x10000u;
+                 cpu.gpr[5] = flags;
++                const size_t translations = f.host.translations;
+                 require(!f.ioman->dispatchImport(4u, cpu, f.executor) && cpu.gpr[2] == marker &&
+-                            f.host.opens == opens,
++                            f.host.opens == opens && f.host.translations == translations,
+                         "modeled mounted open shadowed a registered original driver");
+             }
+         }
+@@ -452,7 +468,9 @@ namespace
+         Fixture f;
+         (void)f.open();
+         const size_t opens = f.host.opens;
+-        for (const uint32_t flags : {0u, 2u, 0x11u, 0x101u, 0x201u, 0x401u, 0x8001u,
++        for (const uint32_t flags : {2u, 0x10u, 0x100u, 0x200u, 0x400u, 0x800u, 0x8000u,
++                                     0x10000000u, 0x40000000u,
++                                     0x11u, 0x101u, 0x201u, 0x401u, 0x8001u,
+                                      0x13u, 0x103u, 0x203u, 0x403u, 0x803u, 0x8003u,
+                                      0x10000003u, 0x40000003u})
+         {
+@@ -498,7 +516,7 @@ namespace
+                 return address;
+             },
+         };
+-        for (const uint32_t flags : {1u, 3u})
++        for (const uint32_t flags : {0u, 1u, 3u})
+         for (const auto &alter : examples)
+         {
+             Fixture f;
+@@ -787,7 +805,7 @@ namespace
+     void authoredMipsImportsConsumeActualIopBytes()
+     {
+         TemporaryTree tree;
+-        for (const uint32_t flags : {1u, 3u})
++        for (const uint32_t flags : {0u, 1u, 3u})
+         {
+             FileHost host(tree);
+             IopEmulator iop(host);
+@@ -828,7 +846,7 @@ int main()
+         {"Read accepts complete RAM aliases and live allocation interiors", aliasesAndLiveHeapBuffers},
+         {"Bad descriptors and signed seek errors preserve file position", descriptorAndSeekErrorsPreservePosition},
+         {"Explicit mounts distinguish absent devices from absent files", supportedMountsAndAbsentRoutes},
+-        {"Optical mode 3 opens existing files with read-only backing", opticalReadWriteModeRetainsReadOnlyBacking},
++        {"Optical modes 0, 1 and 3 open existing files with read-only backing", opticalModesRetainReadOnlyBacking},
+         {"Canonical paths remain contained and original drivers take precedence", canonicalContainmentAndDriverPrecedence},
+         {"Unsupported file modes and operations remain strict", unsupportedOperationsStayStrict},
+         {"Malformed paths fail before host or guest side effects", malformedPathsFailBeforeHostActivity},
