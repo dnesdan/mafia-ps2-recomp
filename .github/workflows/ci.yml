@@ -54,6 +54,32 @@ jobs:
           cmake -S . -B build/runtime -C .deps/fetchcontent.cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DMAFIA_BUILD_RUNTIME=ON -DMAFIA_ENABLE_FFMPEG=ON -DMAFIA_PS2RECOMP_SOURCE_DIR="$PWD/.deps/PS2Recomp" "${task_flags[@]}"
           cmake --build build/runtime --target mafia_runtime_contract_tests mafia_host_tests MafiaHostContract --parallel 2
           ctest --test-dir build/runtime --output-on-failure
+      - name: Build and run upstream runtime and IOP regressions
+        shell: bash
+        run: |
+          task_flags=()
+          task_cxx_flags="-fno-fast-math -ffp-contract=off"
+          if [[ "$(uname -s)" == Darwin ]]; then
+            task_flags+=(-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
+          else
+            task_cxx_flags+=" -msse4.1"
+          fi
+          cmake -S .deps/PS2Recomp -B build/upstream-tests -C .deps/fetchcontent.cmake \
+            -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_CXX_FLAGS=$task_cxx_flags" \
+            -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
+            -DBUILD_TESTING=ON -DPS2X_BUILD_TEST=ON -DPS2X_IOP_BUILD_TESTS=ON \
+            -DPS2X_BUILD_RUNTIME=ON -DPS2X_BUILD_RECOMP=ON -DPS2X_BUILD_ANALYZER=ON \
+            -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_DEBUG_UI=OFF -DPS2X_ENABLE_SCCACHE=OFF \
+            -DPS2X_ENABLE_FFMPEG=ON -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF "${task_flags[@]}"
+          cmake --build build/upstream-tests --parallel 2 --target ps2x_tests \
+            ps2_iop_ioman_file_tests ps2_iop_mailbox_tests ps2_iop_ioman_devctl_tests \
+            ps2_iop_cdvd_clock_tests ps2_iop_dmacman_tests ps2_iop_modload_policy_tests \
+            ps2_iop_cdvd_memory_tests ps2_iop_boot_image_tests ps2_iop_strict_loader_tests \
+            ps2_iop_emulator_tests ps2_iop_import_tests ps2_iop_compatibility_tests \
+            ps2_iop_import_version_tests
+          # Upstream does not register ps2x_tests with CTest.
+          build/upstream-tests/ps2xTest/ps2x_tests
+          ctest --test-dir build/upstream-tests/ps2xIOP --output-on-failure --no-tests=error --parallel 2
       - name: Generated integer operations under UBSan
         shell: bash
         run: |
