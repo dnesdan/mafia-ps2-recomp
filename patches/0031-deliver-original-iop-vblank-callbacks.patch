@@ -1,0 +1,721 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -100,6 +100,11 @@
+         const auto enabled = m_enabled.find(irq);
+         if (enabled == m_enabled.end() || !enabled->second)
+             return false;
++        return dispatchRegisteredInterrupt(irq, executor);
++    }
++
++    bool IopIntrman::dispatchRegisteredInterrupt(int irq, IopGuestExecutor &executor) const
++    {
+         const auto handler = m_handlers.find(irq);
+         if (handler == m_handlers.end() || handler->second.function == 0u)
+             return false;
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.h b/ps2xIOP/src/emulator/imports/iop_intrman.h
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.h
+@@ -17,6 +17,9 @@
+         void reset();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+         [[nodiscard]] bool dispatchInterrupt(int irq, IopGuestExecutor &executor) const;
++        // For modeled devices which already checked the live I_CTRL/I_MASK.
++        // Direct guest mask writes must not be shadowed by EnableIntr bookkeeping.
++        [[nodiscard]] bool dispatchRegisteredInterrupt(int irq, IopGuestExecutor &executor) const;
+         [[nodiscard]] bool inInterruptContext() const noexcept { return m_interruptDepth != 0u; }
+         // Hard-timer callbacks execute through the same interrupt context as
+         // registered hardware IRQ handlers.
+diff --git a/ps2xIOP/src/emulator/imports/iop_vblank.cpp b/ps2xIOP/src/emulator/imports/iop_vblank.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_vblank.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_vblank.cpp
+@@ -1,17 +1,46 @@
+ #include "iop_vblank.h"
++#include "iop_intrman.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../iop_emulator_const.h"
+ #include "../core/iop_kernel.h"
++#include "../core/iop_memory.h"
++#include "../services/iop_rpc.h"
++
++#include <algorithm>
++#include <limits>
+ 
+ namespace ps2x::iop::detail
+ {
+-    IopVblank::IopVblank(IopKernel &kernel) noexcept
+-        : m_kernel(kernel)
++    namespace
++    {
++        constexpr uint32_t kPhaseIrqBits[] = {1u, 1u << 11u};
++        // The SDK's sixteen entries include its two built-in wait handlers.
++        constexpr size_t kClientHandlerCapacity = 14u;
++        constexpr int32_t kIllegalContext = -100;
++        constexpr int32_t kFoundHandler = -104;
++        constexpr int32_t kNotFoundHandler = -105;
++        constexpr int32_t kNoMemory = -400;
++    }
++
++    IopVblank::IopVblank(IopKernel &kernel, IopMemory &memory) noexcept
++        : m_kernel(kernel), m_memory(memory)
+     {
+     }
+ 
+-    bool IopVblank::dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
++    void IopVblank::reset() noexcept
++    {
++        m_handlers.clear();
++        m_nextPhase = {kVblankPeriodCycles, kVblankEndPhaseCycles};
++        m_pending = {};
++        m_servicing = false;
++        // Modeled VBLANK startup installs/enables both phase dispatchers once.
++        // Later guest DisableIntr and direct I_MASK changes remain authoritative.
++        m_memory.setInterruptMask(m_memory.interruptMask() | kPhaseIrqBits[0] | kPhaseIrqBits[1]);
++    }
++
++    bool IopVblank::dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle,
++                                   const IopIntrman &intrman)
+     {
+         switch (ordinal)
+         {
+@@ -32,11 +61,108 @@
+         }
+         case 8: // RegisterVblankHandler
+         case 9: // ReleaseVblankHandler
+-            // Callback delivery is not required by the scheduler wait ABI yet.
+-            cpu.gpr[2] = 0u;
++        {
++            // ABI and removal semantics: ps2sdk iop/system/vblank/src/vblank.c.
++            // Any nonzero startend selector names the end-phase list.
++            if (intrman.inInterruptContext())
++            {
++                cpu.gpr[2] = static_cast<uint32_t>(kIllegalContext);
++                return true;
++            }
++            const bool end = cpu.gpr[4] != 0u;
++            const uint32_t function = cpu.gpr[ordinal == 8u ? 6u : 5u];
++            const auto same = [&](const Handler &handler)
++            { return handler.end == end && handler.function == function; };
++            if (ordinal == 9u)
++            {
++                const auto found = std::find_if(m_handlers.begin(), m_handlers.end(), same);
++                if (found == m_handlers.end())
++                    cpu.gpr[2] = static_cast<uint32_t>(kNotFoundHandler);
++                else
++                {
++                    m_handlers.erase(found);
++                    cpu.gpr[2] = 0u;
++                }
++                return true;
++            }
++            // Preserve the SDK's capacity-before-duplicate error ordering.
++            if (m_handlers.size() == kClientHandlerCapacity)
++                cpu.gpr[2] = static_cast<uint32_t>(kNoMemory);
++            else if (std::any_of(m_handlers.begin(), m_handlers.end(), same))
++                cpu.gpr[2] = static_cast<uint32_t>(kFoundHandler);
++            else
++            {
++                const int32_t priority = static_cast<int32_t>(cpu.gpr[5]);
++                const auto position = std::find_if(m_handlers.begin(), m_handlers.end(),
++                    [&](const Handler &handler) { return handler.end == end && handler.priority > priority; });
++                m_handlers.insert(position, Handler{end, priority, function, cpu.gpr[7], cpu.gpr[28]});
++                cpu.gpr[2] = 0u;
++            }
+             return true;
++        }
+         default:
+             return false;
+         }
+     }
++
++    void IopVblank::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
++    {
++        for (size_t phase = 0u; phase < m_nextPhase.size(); ++phase)
++        {
++            if (m_nextPhase[phase] > currentCycle)
++                continue;
++            m_pending[phase] = true;
++            const uint64_t periods = (currentCycle - m_nextPhase[phase]) / kVblankPeriodCycles + 1u;
++            const uint64_t available = (std::numeric_limits<uint64_t>::max() - m_nextPhase[phase]) /
++                                       kVblankPeriodCycles;
++            m_nextPhase[phase] = periods > available ? std::numeric_limits<uint64_t>::max()
++                                                   : m_nextPhase[phase] + periods * kVblankPeriodCycles;
++        }
++        if (m_servicing || intrman.inInterruptContext())
++            return;
++        m_servicing = true;
++        struct ServiceGuard
++        {
++            bool &active;
++            ~ServiceGuard() { active = false; }
++        } guard{m_servicing};
++
++        // Private latches model the built-in kernel dispatcher boundary. Do
++        // not also assert I_STAT and enter an unprovided raw firmware vector.
++        // Masked edges coalesce, remain pending, and are delivered on resume.
++        for (size_t phase = 0u; phase < m_pending.size(); ++phase)
++        {
++            if (!m_pending[phase] || m_memory.interruptControl() == 0u ||
++                (m_memory.interruptMask() & kPhaseIrqBits[phase]) == 0u)
++                continue;
++            m_pending[phase] = false;
++            // A supplied kernel/provider can replace the phase IRQ itself.
++            // In that case its original dispatcher owns the callback chain.
++            if (intrman.dispatchRegisteredInterrupt(phase == 0u ? 0 : 11, executor))
++                continue;
++            for (auto handler = m_handlers.begin(); handler != m_handlers.end();)
++            {
++                if (handler->end != (phase != 0u))
++                {
++                    ++handler;
++                    continue;
++                }
++                const uint32_t result = intrman.executeInterruptCallback(handler->function, handler->argument,
++                                                                         handler->gp, executor);
++                // Registration/release are illegal within these callbacks, so
++                // only this dispatcher can remove the active iterator.
++                if (result == 0u)
++                    handler = m_handlers.erase(handler);
++                else
++                    ++handler;
++            }
++        }
++    }
++
++    uint64_t IopVblank::nextEventCycle(uint64_t fallback) const noexcept
++    {
++        // Phase edges also drive a supplied IRQ dispatcher whose callbacks are
++        // held entirely in guest memory, outside the modeled registration list.
++        return std::min({fallback, m_nextPhase[0u], m_nextPhase[1u]});
++    }
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_vblank.h b/ps2xIOP/src/emulator/imports/iop_vblank.h
+--- a/ps2xIOP/src/emulator/imports/iop_vblank.h
++++ b/ps2xIOP/src/emulator/imports/iop_vblank.h
+@@ -1,20 +1,43 @@
+ #pragma once
+ 
++#include <array>
+ #include <cstdint>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+     struct IopCpuState;
+     class IopKernel;
++    class IopMemory;
++    class IopIntrman;
++    class IopGuestExecutor;
+ 
+     class IopVblank
+     {
+     public:
+-        explicit IopVblank(IopKernel &kernel) noexcept;
++        IopVblank(IopKernel &kernel, IopMemory &memory) noexcept;
+ 
+-        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
++        void reset() noexcept;
++        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle,
++                                          const IopIntrman &intrman);
++        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman);
++        [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+ 
+     private:
++        struct Handler
++        {
++            bool end = false;
++            int32_t priority = 0;
++            uint32_t function = 0u;
++            uint32_t argument = 0u;
++            uint32_t gp = 0u;
++        };
++
+         IopKernel &m_kernel;
++        IopMemory &m_memory;
++        std::vector<Handler> m_handlers;
++        std::array<uint64_t, 2> m_nextPhase{};
++        std::array<bool, 2> m_pending{};
++        bool m_servicing = false;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -346,7 +346,7 @@
+               sysmem(host, memory),
+               kernel(memory),
+               cdvd(host, memory, kernel),
+-              vblank(kernel),
++              vblank(kernel, memory),
+               rpc(host, memory, kernel),
+               sysclib(memory),
+               stdio(host, memory),
+@@ -377,6 +377,7 @@
+             rpc.reset();
+             cdvd.reset();
+             intrman.reset();
++            vblank.reset();
+             timrman.reset();
+             ioman.reset();
+             pendingDmaInterrupts.clear();
+@@ -749,7 +750,9 @@
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "sifman") && rpc.dispatchSifManImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+-            if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
++            if (iequals(call.library, "vblank") &&
++                imports.resolve(call.library, call.ordinal, call.version) == 0u &&
++                vblank.dispatchImport(call.ordinal, cpu, totalCycles, intrman))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
+@@ -865,6 +868,7 @@
+                 {
+                     if (!step(cpu))
+                         break;
++                    serviceVblankCallbacks();
+                     if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                         servicePendingDmaInterrupts();
+                     if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+@@ -959,6 +963,14 @@
+             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
+         }
+ 
++        void serviceVblankCallbacks()
++        {
++            // A modeled kernel interrupt must complete as real guest code.
++            // Preserve faults even when the interrupted CPU is idle or legacy.
++            const RestoreValue strictGuard(strictExecution, true);
++            vblank.serviceDue(totalCycles, *this, intrman);
++        }
++
+         // Not that good to use exception handling for control flow but will do for now
+         void servicePendingDmaInterrupts()
+         {
+@@ -1041,6 +1053,7 @@
+                 const uint64_t target = totalCycles + cycles;
+                 while (totalCycles < target)
+                 {
++                    serviceVblankCallbacks();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this, intrman);
+@@ -1053,6 +1066,7 @@
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        nextWake = vblank.nextEventCycle(nextWake);
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_strict_fixtures.h"
++#include "iop_vblank_fixtures.h"
+ #include "emulator/iop_emulator.h"
+ 
+ #include <functional>
+@@ -1394,6 +1395,15 @@
+ int main()
+ {
+     const Test tests[] = {
++        {"VBlank phases preserve priority, arguments, GP and interrupt context", iop_vblank_test::phasePriorityArgumentsAndContext},
++        {"VBlank registration, release and bounded capacity follow the kernel ABI", iop_vblank_test::registrationReleaseAndCapacity},
++        {"VBlank return-zero removal forbids mutation from interrupt context", iop_vblank_test::returnZeroAndIllegalCallbackMutation},
++        {"Masked VBlank edges coalesce and resume without a raw-vector duplicate", iop_vblank_test::maskedEdgesCoalesceUntilResume},
++        {"IOP reset discards VBlank registrations and pending edges", iop_vblank_test::resetDropsRegistrationsAndPendingEdges},
++        {"VBlank callbacks preserve strict missing-import and retired-code faults", iop_vblank_test::strictCallbacksAndRetirement},
++        {"Compatible supplied VBlank exports retain execution precedence", iop_vblank_test::suppliedExportKeepsPrecedence},
++        {"A supplied phase IRQ handler owns delivery until explicitly released", iop_vblank_test::suppliedPhaseInterruptOwnsDelivery},
++        {"A real VBlank callback wakes an event-waiting guest worker", iop_vblank_test::callbackWakesAnOriginalStyleWorker},
+         {"Original entry observes normal IRX argv and actual ModuleInfo", realArgumentAbi},
+         {"Arguments fail before RAM mutation", argumentPreflight},
+         {"Endless startup cannot become module success", nonReturningEntry},
+diff --git a/ps2xIOP/tests/iop_vblank_fixtures.h b/ps2xIOP/tests/iop_vblank_fixtures.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_vblank_fixtures.h
+@@ -0,0 +1,380 @@
++#pragma once
++
++#include "iop_compat_test_support.h"
++#include "emulator/iop_emulator.h"
++#include "emulator/iop_emulator_const.h"
++
++#include <functional>
++
++namespace iop_vblank_test
++{
++    using iop_test::Host;
++    using iop_test::Irx;
++    using iop_test::require;
++    using ps2x::iop::detail::IopEmulator;
++
++    // Entirely authored MIPS fixtures. No driver or game bytes are included.
++    struct Program
++    {
++        uint32_t base;
++        uint32_t cursor = 0u;
++        Irx image;
++
++        explicit Program(uint32_t address = 0x10000u) : base(address), image(address, 0x2800u)
++        {
++            imports(0x1000u, "vblank", {8u, 9u});
++            imports(0x1100u, "intrman", {17u, 18u, 23u, 6u, 7u, 4u, 5u});
++            imports(0x1200u, "thbase", {4u, 6u});
++            imports(0x1300u, "thevent", {4u, 7u, 10u});
++            imports(0x1400u, "absent", {42u});
++            imports(0x1500u, "loadcore", {6u});
++        }
++
++        uint32_t data(uint32_t offset = 0u) const { return base + 0x2000u + offset; }
++        uint32_t stub(uint32_t table, uint32_t index = 0u) const { return base + table + 20u + index * 8u; }
++        void emit(uint32_t value) { image.words(cursor, {value}); cursor += 4u; }
++        void constant(uint32_t reg, uint32_t value)
++        {
++            emit(0x3C000000u | (reg << 16u) | (value >> 16u));
++            emit(0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu));
++        }
++        void move(uint32_t target, uint32_t source) { emit((source << 21u) | (target << 11u) | 0x21u); }
++        void call(uint32_t address) { emit(0x0C000000u | (address >> 2u)); emit(0u); }
++        void store(uint32_t reg, uint32_t address)
++        {
++            constant(10u, address);
++            emit(0xAD400000u | (reg << 16u));
++        }
++        void load(uint32_t reg, uint32_t address)
++        {
++            constant(10u, address);
++            emit(0x8D400000u | (reg << 16u));
++            emit(0u); // Explicit load-delay instruction.
++        }
++        void begin(uint32_t offset = 0u)
++        {
++            cursor = offset;
++            emit(0x27BDFFE0u); emit(0xAFBF001Cu);
++        }
++        void finish(uint32_t result = 0u)
++        {
++            constant(2u, result);
++            emit(0x8FBF001Cu); emit(0x27BD0020u);
++            emit(0x03E00008u); emit(0u);
++        }
++        void registerHandler(uint32_t phase, uint32_t priority, uint32_t offset,
++                             uint32_t argument, uint32_t gp = 0u)
++        {
++            constant(4u, phase); constant(5u, priority);
++            constant(6u, base + offset); constant(7u, argument); constant(28u, gp);
++            call(stub(0x1000u));
++        }
++        void release(uint32_t phase, uint32_t offset)
++        {
++            constant(4u, phase); constant(5u, base + offset); call(stub(0x1000u, 1u));
++        }
++        void recordingHandler(uint32_t offset, uint32_t result = 1u)
++        {
++            begin(offset);
++            emit(0xAFB00018u); move(16u, 4u);
++            call(stub(0x1100u, 2u)); // QueryIntrContext.
++            load(8u, data());
++            emit((8u << 16u) | (9u << 11u) | (4u << 6u)); // sll t1,t0,4
++            constant(10u, data(0x100u));
++            emit((9u << 21u) | (10u << 16u) | (9u << 11u) | 0x21u);
++            emit(0xAD300000u); emit(0xAD3C0004u); emit(0xAD220008u);
++            emit(0x25080001u); store(8u, data());
++            emit(0x8FB00018u);
++            finish(result);
++        }
++        void imports(uint32_t offset, const char *name, std::initializer_list<uint32_t> ordinals)
++        {
++            std::array<uint32_t, 2u> words{};
++            std::memcpy(words.data(), name, std::min<size_t>(std::strlen(name), 8u));
++            image.words(offset, {0x41E00000u, 0u, 0x0101u, words[0], words[1]});
++            offset += 20u;
++            for (const uint32_t ordinal : ordinals)
++            {
++                image.words(offset, {0x03E00008u, 0x24000000u | ordinal});
++                offset += 8u;
++            }
++            image.words(offset, {0u, 0u});
++        }
++    };
++
++    inline uint32_t word(IopEmulator &iop, uint32_t address)
++    {
++        uint32_t value = 0u;
++        require(iop.readMemory(address, &value, sizeof(value)), "cannot read authored VBlank marker");
++        return value;
++    }
++
++    inline int start(IopEmulator &iop, const Program &program)
++    {
++        const auto result = iop.loadModuleImage("authored-vblank", program.image.bytes, nullptr, 0u);
++        require(result.moduleId > 0 && result.startResult == 0, "authored VBlank fixture failed to start");
++        return result.moduleId;
++    }
++
++    inline void advance(IopEmulator &iop, uint64_t iopCycles)
++    {
++        iop.runEeCycles(iopCycles * 8u);
++        iop.checkExecutionFailure();
++    }
++
++    inline void rejects(const std::function<void()> &operation, std::string_view message)
++    {
++        try { operation(); }
++        catch (const std::runtime_error &error)
++        {
++            require(std::string_view(error.what()).find(message) != std::string_view::npos,
++                    "VBlank fault lost its concrete strict execution cause");
++            return;
++        }
++        throw std::runtime_error("VBlank fault was silently accepted");
++    }
++
++    inline void phasePriorityArgumentsAndContext()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Program p;
++        p.begin();
++        p.registerHandler(0u, 30u, 0x600u, 30u, 0xA030u);
++        p.registerHandler(0u, 10u, 0x680u, 10u, 0xA010u);
++        p.registerHandler(0u, 10u, 0x700u, 11u, 0xA011u);
++        p.registerHandler(1u, 16u, 0x780u, 20u, 0xA020u);
++        p.finish();
++        for (const uint32_t offset : {0x600u, 0x680u, 0x700u, 0x780u})
++            p.recordingHandler(offset);
++        start(iop, p);
++        advance(iop, 2u * kVblankPeriodCycles + kVblankEndPhaseCycles);
++        const uint32_t expected[] = {20u, 10u, 11u, 30u, 20u, 10u, 11u, 30u, 20u};
++        require(word(iop, p.data()) == std::size(expected), "VBlank start/end handlers were not delivered each field");
++        for (size_t i = 0u; i < std::size(expected); ++i)
++        {
++            const uint32_t row = p.data(0x100u + static_cast<uint32_t>(i) * 16u);
++            const uint32_t gp = expected[i] == 30u ? 0xA030u : expected[i] == 20u ? 0xA020u :
++                                expected[i] == 11u ? 0xA011u : 0xA010u;
++            require(word(iop, row) == expected[i] && word(iop, row + 4u) == gp && word(iop, row + 8u) == 1u,
++                    "VBlank priority/equal-priority order, argument, GP or interrupt context changed");
++        }
++    }
++
++    inline void registrationReleaseAndCapacity()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Program p;
++        p.begin();
++        p.registerHandler(0u, 16u, 0x600u, 0u); p.store(2u, p.data(0x40u));
++        p.registerHandler(0u, 1u, 0x600u, 0u); p.store(2u, p.data(0x44u));
++        p.registerHandler(3u, 1u, 0x600u, 0u); p.store(2u, p.data(0x48u));
++        p.release(0u, 0x600u); p.store(2u, p.data(0x4Cu));
++        p.release(0u, 0x600u); p.store(2u, p.data(0x50u));
++        for (uint32_t i = 0u; i < 13u; ++i)
++            p.registerHandler(0u, i, 0x680u + i * 8u, 0u);
++        p.registerHandler(0u, 99u, 0x800u, 0u); p.store(2u, p.data(0x54u));
++        p.finish();
++        start(iop, p);
++        require(word(iop, p.data(0x40u)) == 0u && word(iop, p.data(0x44u)) == uint32_t(-104) &&
++                    word(iop, p.data(0x48u)) == 0u && word(iop, p.data(0x4Cu)) == 0u &&
++                    word(iop, p.data(0x50u)) == uint32_t(-105) && word(iop, p.data(0x54u)) == uint32_t(-400),
++                "VBlank duplicate/release/capacity results did not follow the kernel ABI");
++    }
++
++    inline void returnZeroAndIllegalCallbackMutation()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Program p;
++        p.begin(); p.registerHandler(0u, 16u, 0x600u, 0u); p.finish();
++        p.begin(0x600u);
++        p.release(0u, 0x600u); p.store(2u, p.data(0x40u));
++        p.registerHandler(0u, 16u, 0x800u, 0u); p.store(2u, p.data(0x44u));
++        p.load(8u, p.data()); p.emit(0x25080001u); p.store(8u, p.data());
++        p.finish(0u);
++        p.recordingHandler(0x800u);
++        start(iop, p);
++        advance(iop, 4u * kVblankPeriodCycles);
++        require(word(iop, p.data()) == 1u && word(iop, p.data(0x40u)) == uint32_t(-100) &&
++                    word(iop, p.data(0x44u)) == uint32_t(-100),
++                "return-zero handler remained installed or callback mutated the handler list");
++    }
++
++    inline void maskedEdgesCoalesceUntilResume()
++    {
++        for (const uint32_t mask : {1u, 2u, 3u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            Program p;
++            p.begin();
++            p.registerHandler(0u, 16u, 0x600u, 7u);
++            if (mask & 1u)
++            {
++                p.constant(4u, p.data(0x40u)); p.call(p.stub(0x1100u));
++            }
++            if (mask & 2u)
++            {
++                p.constant(4u, 0u); p.constant(5u, 0u); p.call(p.stub(0x1100u, 4u));
++            }
++            p.finish(); p.recordingHandler(0x600u);
++            start(iop, p);
++            advance(iop, 3u * kVblankPeriodCycles + 10000u);
++            require(word(iop, p.data()) == 0u, "masked VBlank callback ran before CPU/line resume");
++            Program resume(0x20000u);
++            resume.begin();
++            // Direct mask writes are authoritative, independently of the
++            // intrman's convenience EnableIntr bookkeeping.
++            resume.load(8u, 0xBF801074u); resume.emit(0x35080001u); resume.store(8u, 0xBF801074u);
++            resume.constant(4u, 1u); resume.call(resume.stub(0x1100u, 1u));
++            resume.load(8u, 0xBF801070u); resume.store(8u, resume.data());
++            resume.finish();
++            start(iop, resume);
++            require(word(iop, p.data()) == 1u && word(iop, resume.data()) == 0u,
++                    "resume lost/replayed masked edges or also asserted an unprovided raw interrupt vector");
++            advance(iop, kVblankPeriodCycles);
++            require(word(iop, p.data()) == 2u, "VBlank cadence did not resume after the coalesced edge");
++        }
++    }
++
++    inline void resetDropsRegistrationsAndPendingEdges()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Program p;
++        p.begin(); p.registerHandler(0u, 16u, 0x600u, 1u);
++        p.constant(4u, p.data(0x40u)); p.call(p.stub(0x1100u)); p.finish();
++        p.recordingHandler(0x600u);
++        start(iop, p); advance(iop, 3u * kVblankPeriodCycles);
++        iop.reset();
++        Program empty;
++        empty.begin(); empty.finish();
++        start(iop, empty); advance(iop, 2u * kVblankPeriodCycles);
++        require(word(iop, empty.data()) == 0u, "reset retained a stale VBlank callback or pending phase");
++        Program fresh(0x20000u);
++        fresh.begin(); fresh.registerHandler(0u, 16u, 0x600u, 2u); fresh.finish();
++        fresh.recordingHandler(0x600u);
++        start(iop, fresh); advance(iop, kVblankPeriodCycles);
++        require(word(iop, fresh.data()) == 1u, "fresh VBlank registration did not work after reset");
++    }
++
++    inline void strictCallbacksAndRetirement()
++    {
++        for (const bool retired : {false, true})
++        {
++            Host host;
++            IopEmulator iop(host);
++            Program p;
++            p.begin(); p.registerHandler(0u, 16u, 0x600u, 0u); p.finish();
++            p.begin(0x600u); p.call(p.stub(0x1400u)); p.finish(1u);
++            const int module = start(iop, p);
++            if (retired)
++                require(iop.stopModule(module, nullptr), "could not retire the authored callback owner");
++            rejects([&]() { advance(iop, kVblankPeriodCycles); },
++                    retired ? "unloaded strict module" : "missing import absent:42");
++            rejects([&]() { iop.checkExecutionFailure(); },
++                    retired ? "unloaded strict module" : "missing import absent:42");
++            iop.reset();
++            iop.checkExecutionFailure();
++        }
++    }
++
++    inline void suppliedExportKeepsPrecedence()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Program provider(0x20000u);
++        provider.begin(); provider.constant(4u, provider.base + 0x1600u);
++        provider.call(provider.stub(0x1500u)); provider.finish();
++        provider.image.words(0x800u, {0x03E00008u, 0x24021234u});
++        provider.image.words(0x1600u, {0x41C00000u, 0u, 0x0101u, 0x616C6276u, 0x00006B6Eu,
++            0x20800u, 0x20800u, 0x20800u, 0x20800u, 0x20800u,
++            0x20800u, 0x20800u, 0x20800u, 0x20800u, 0x20800u, 0u});
++        start(iop, provider);
++        Program consumer;
++        consumer.begin();
++        consumer.registerHandler(0u, 16u, 0x600u, 0u); consumer.store(2u, consumer.data());
++        consumer.release(0u, 0x600u); consumer.store(2u, consumer.data(4u)); consumer.finish();
++        start(iop, consumer);
++        require(word(iop, consumer.data()) == 0x1234u && word(iop, consumer.data(4u)) == 0x1234u,
++                "modeled VBlank imports shadowed a compatible supplied guest export");
++    }
++
++    inline void suppliedPhaseInterruptOwnsDelivery()
++    {
++        for (const uint32_t phase : {0u, 1u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            Program p;
++            const uint32_t irq = phase == 0u ? 0u : 11u;
++            p.begin();
++            p.registerHandler(phase, 16u, 0x600u, 1u, 0xA001u);
++            p.constant(4u, irq); p.constant(5u, 0u);
++            p.constant(6u, p.base + 0x700u); p.constant(7u, 2u); p.constant(28u, 0xA002u);
++            p.call(p.stub(0x1100u, 5u)); // Register the actual phase IRQ owner.
++            p.constant(4u, irq); p.call(p.stub(0x1100u, 3u));
++            p.finish(); p.recordingHandler(0x600u); p.recordingHandler(0x700u);
++            start(iop, p);
++            advance(iop, kVblankPeriodCycles);
++            require(word(iop, p.data()) == 1u && word(iop, p.data(0x100u)) == 2u &&
++                        word(iop, p.data(0x104u)) == 0xA002u && word(iop, p.data(0x108u)) == 1u,
++                    "modeled VBlank chain bypassed or duplicated the supplied phase IRQ handler");
++            Program unmask(0x20000u);
++            unmask.begin(); unmask.constant(4u, irq); unmask.constant(5u, 0u);
++            unmask.call(unmask.stub(0x1100u, 4u)); // DisableIntr records a disabled convenience entry.
++            unmask.load(8u, 0xBF801074u); unmask.constant(9u, 1u << irq);
++            unmask.emit(0x01094025u); unmask.store(8u, 0xBF801074u); unmask.finish();
++            start(iop, unmask); advance(iop, kVblankPeriodCycles);
++            require(word(iop, p.data()) == 2u && word(iop, p.data(0x110u)) == 2u,
++                    "stale EnableIntr bookkeeping shadowed the supplied handler after a direct I_MASK re-enable");
++            Program release(0x30000u);
++            release.begin(); release.constant(4u, irq); release.call(release.stub(0x1100u, 6u)); release.finish();
++            start(iop, release);
++            advance(iop, kVblankPeriodCycles);
++            require(word(iop, p.data()) == 3u && word(iop, p.data(0x120u)) == 1u &&
++                        word(iop, p.data(0x124u)) == 0xA001u && word(iop, p.data(0x128u)) == 1u,
++                    "releasing the supplied phase IRQ failed to restore the modeled dispatcher");
++
++            Host onlyHost;
++            IopEmulator onlyIop(onlyHost);
++            Program only;
++            only.begin();
++            only.constant(4u, irq); only.constant(5u, 0u);
++            only.constant(6u, only.base + 0x700u); only.constant(7u, 3u);
++            only.call(only.stub(0x1100u, 5u));
++            only.constant(4u, irq); only.call(only.stub(0x1100u, 3u)); only.finish();
++            only.recordingHandler(0x700u);
++            start(onlyIop, only); advance(onlyIop, 3u * kVblankPeriodCycles);
++            require(word(onlyIop, only.data()) == 3u,
++                    "idle scheduling skipped supplied phase IRQs without modeled VBlank registrations");
++        }
++    }
++
++    inline void callbackWakesAnOriginalStyleWorker()
++    {
++        Host host;
++        IopEmulator iop(host);
++        Program p;
++        p.image.words(0x1600u, {0u, 0u, p.base + 0x800u, 0x400u, 20u});
++        p.image.words(0x1640u, {0u, 0u, 0u});
++        p.begin();
++        p.constant(4u, p.base + 0x1640u); p.call(p.stub(0x1300u)); p.store(2u, p.data(0x40u));
++        p.constant(4u, 0u); p.constant(5u, 16u); p.constant(6u, p.base + 0x600u);
++        p.move(7u, 2u); p.call(p.stub(0x1000u));
++        p.constant(4u, p.base + 0x1600u); p.call(p.stub(0x1200u));
++        p.move(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1200u, 1u)); p.finish();
++        p.begin(0x600u); p.constant(5u, 1u); p.call(p.stub(0x1300u, 1u)); p.finish(1u);
++        p.begin(0x800u); p.load(4u, p.data(0x40u));
++        p.constant(5u, 1u); p.constant(6u, 0x10u); p.constant(7u, 0u);
++        p.call(p.stub(0x1300u, 2u)); p.constant(8u, 0xC0FFEEu); p.store(8u, p.data()); p.finish();
++        start(iop, p);
++        advance(iop, kVblankPeriodCycles / 2u);
++        require(word(iop, p.data()) == 0u, "authored worker did not block on its event flag");
++        advance(iop, kVblankPeriodCycles);
++        require(word(iop, p.data()) == 0xC0FFEEu,
++                "real VBlank callback did not iSetEventFlag and resume the original-style guest worker");
++    }
++}
