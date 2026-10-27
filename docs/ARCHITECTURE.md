@@ -61,6 +61,7 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0026` | Honor conventional optical open flags with existing read-only backing. Reject writes to owned read-only handles while preserving supplied guest exports for foreign handles. |
 | `0027` | Own EE callback stacks outside application stacks and heaps; preserve the original kernel-patch workspace, check aliases and declared ranges, and coordinate stack leases with scheduler reset and owner lifetime. |
 | `0028` | Implement the CDVDMAN mode-2 tray-change query with a consumed notification, validated output and original guest-export precedence. Physical tray motion remains unresolved. |
+| `0029` | Select idle EE events by their guest-cycle deadlines before host-clock tie breaking, preventing an overdue host event from skipping earlier periodic timer callbacks. Preserve host wait pacing. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly from the upstream source directory; its separate GS-cache CTest directory does not run that executable.
 

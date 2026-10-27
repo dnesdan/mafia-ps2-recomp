@@ -1,0 +1,155 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2142,9 +2142,13 @@
+     if (hasTimerDeadline)
+     {
+         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+-        if (timerHostDeadline < hostDeadline)
+-        {
+-            deadlineCycle = m_eeCycle + timerCycles;
++        // Preserve the earliest guest deadline even when host execution is
++        // late. Choosing by host time can skip several periodic timer matches.
++        const uint64_t timerDeadlineCycle = m_eeCycle + timerCycles;
++        if (m_deadlines.empty() || timerDeadlineCycle < deadlineCycle ||
++            (timerDeadlineCycle == deadlineCycle && timerHostDeadline < hostDeadline))
++        {
++            deadlineCycle = timerDeadlineCycle;
+             hostDeadline = timerHostDeadline;
+         }
+     }
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -97,6 +97,15 @@
+     uint64_t g_vsyncTick = 0;
+     uint64_t g_vsyncCsr = 0;
+     std::atomic<bool> g_timer2Resumed{false};
++    constexpr uint32_t kPeriodicTimer1RunPc = 0x00170000u;
++    constexpr uint32_t kPeriodicTimer1HandlerPc = 0x00170100u;
++    constexpr uint32_t kPeriodicTimer1Mode = 0x10000810u;
++    constexpr uint32_t kPeriodicTimer1Ticks = 100u;
++    constexpr uint64_t kPeriodicTimer1CyclesPerTick = 294912u;
++    uint32_t g_periodicTimer1Ticks = 0u;
++    uint64_t g_periodicTimer1FirstVSyncTick = 0u;
++    bool g_periodicTimer1Idle = false;
++    bool g_periodicTimer1DelayHost = false;
+     uint32_t g_irqObservedSp = 0u;
+     uint32_t g_invocationQueueRuns = 0u;
+     uint32_t g_invocationQueueSp = 0u;
+@@ -339,6 +348,93 @@
+         g_timer2Resumed.store(true, std::memory_order_release);
+         ctx->pc = 0u;
+         runtime->requestStop();
++    }
++
++    void schedulerPeriodicTimer1Handler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (g_periodicTimer1Ticks++ == 0u)
++            g_periodicTimer1FirstVSyncTick = runtime->eeScheduler().currentVSyncTick();
++        auto &memory = runtime->memory();
++        // An ordinary read-modify-write acknowledges the observed EQUF bit.
++        memory.writeIORegister(kPeriodicTimer1Mode, memory.readIORegister(kPeriodicTimer1Mode) | 0x200u);
++        ctx->pc = 0u;
++        if (g_periodicTimer1Ticks == kPeriodicTimer1Ticks)
++            runtime->requestStop();
++    }
++
++    void schedulerPeriodicTimer1Run(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (g_periodicTimer1Idle)
++        {
++            // Model a host operation whose cost exceeds the VBlank wall
++            // deadline without advancing the earlier guest timer deadline.
++            if (g_periodicTimer1DelayHost)
++                std::this_thread::sleep_for(std::chrono::milliseconds(30));
++            runtime->eeScheduler().sleepCurrent();
++            return;
++        }
++        while (!runtime->eeScheduler().checkpointDue(EeScheduler::kGeneratedCheckpointCycles))
++        {
++        }
++        ctx->pc = kPeriodicTimer1RunPc;
++    }
++
++    void checkPeriodicTimer1(TestCase &t, bool idle, bool delayHost)
++    {
++        TestEnv env;
++        t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++        env.runtime.registerFunction(kPeriodicTimer1RunPc, schedulerPeriodicTimer1Run);
++        env.runtime.registerFunction(kPeriodicTimer1HandlerPc, schedulerPeriodicTimer1Handler);
++        g_periodicTimer1Ticks = 0u;
++        g_periodicTimer1FirstVSyncTick = 0u;
++        g_periodicTimer1Idle = idle;
++        g_periodicTimer1DelayHost = delayHost;
++        std::atomic<bool> done{false};
++        std::atomic<bool> threw{false};
++        const auto start = std::chrono::steady_clock::now();
++        std::thread gameThread([&]()
++        {
++            try
++            {
++                R5900Context initial{};
++                initial.pc = kPeriodicTimer1RunPc;
++                auto &scheduler = env.runtime.eeScheduler();
++                scheduler.reset(env.rdram.data(), initial);
++                scheduler.addIrqHandler(false, 10u, kPeriodicTimer1HandlerPc, true, 0u, 0u, 0u);
++                scheduler.setIrqCauseEnabled(false, 10u, true);
++                auto &memory = env.runtime.memory();
++                memory.writeIORegister(0x10000800u, 0u);
++                memory.writeIORegister(0x10000820u, 576u);
++                memory.writeIORegister(kPeriodicTimer1Mode, 0x1C2u);
++                scheduler.run();
++            }
++            catch (...)
++            {
++                threw.store(true, std::memory_order_release);
++            }
++            done.store(true, std::memory_order_release);
++        });
++        const bool completed = waitUntil([&]() { return done.load(std::memory_order_acquire); },
++                                         std::chrono::milliseconds(3000));
++        if (!completed)
++            env.runtime.requestStop();
++        gameThread.join();
++        const auto elapsed = std::chrono::steady_clock::now() - start;
++        const uint64_t cycles = env.runtime.eeScheduler().snapshot().eeCycle;
++        const uint64_t expected = kPeriodicTimer1Ticks * kPeriodicTimer1CyclesPerTick;
++        t.IsTrue(completed, "periodic timer must finish before the bounded watchdog");
++        t.IsFalse(threw.load(std::memory_order_acquire), "periodic timer should not throw");
++        t.Equals(g_periodicTimer1Ticks, kPeriodicTimer1Ticks, "every millisecond compare should reach the guest ISR");
++        t.IsTrue(cycles >= expected && cycles - expected < 64u,
++                 "the scheduler must not skip guest timer deadlines while choosing an idle wake");
++        t.Equals(g_periodicTimer1FirstVSyncTick, 0ull,
++                 "the first 1 ms timer deadline must precede the first VBlank guest deadline");
++        // Runnable work is paced at VBlank boundaries: its 100 ms guest
++        // interval can end before the sixth rounded VBlank deadline.
++        // An idle executor instead waits for each 1 ms timer deadline.
++        const uint32_t minimumWallMilliseconds = idle ? kPeriodicTimer1Ticks - 1u : 83u;
++        t.IsTrue(elapsed >= std::chrono::milliseconds(minimumWallMilliseconds),
++                 "preserving guest deadline order must retain host wall-clock pacing");
+     }
+ 
+     void schedulerInvocationQueueHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+@@ -1022,6 +1118,21 @@
+                      "the Timer2 handler should hand the semaphore directly to the waiter");
+         });
+ 
++        tc.Run("periodic Timer1 keeps every compare while the main thread is runnable", [](TestCase &t)
++        {
++            checkPeriodicTimer1(t, false, false);
++        });
++
++        tc.Run("idle Timer1 deadlines stay ahead of later VBlank guest deadlines", [](TestCase &t)
++        {
++            checkPeriodicTimer1(t, true, false);
++        });
++
++        tc.Run("overdue VBlank host time cannot skip earlier idle Timer1 compares", [](TestCase &t)
++        {
++            checkPeriodicTimer1(t, true, true);
++        });
++
+         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
+         {
+             TestEnv env;
