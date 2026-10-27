@@ -1,0 +1,64 @@
+name: source-and-runtime
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check source-only policy
+        run: python3 tools/check_source_tree.py
+      - name: Python and C++ host tests
+        run: bash tools/test.sh
+
+  runtime-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev libasound2-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev pkg-config zlib1g-dev
+      - name: macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          test "$(uname -m)" = arm64
+          brew install python cmake pkg-config ffmpeg
+      - name: Build pinned analyzer and recompiler
+        run: python3 tools/bootstrap.py --tools-only --jobs 2
+      - name: Build and test runtime contracts without commercial inputs
+        shell: bash
+        run: |
+          task_flags=()
+          if [[ "$(uname -s)" == Darwin ]]; then
+            task_flags+=(-DCMAKE_OSX_ARCHITECTURES=arm64)
+          fi
+          cmake -S . -B build/runtime -C .deps/fetchcontent.cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DMAFIA_BUILD_RUNTIME=ON -DMAFIA_ENABLE_FFMPEG=ON -DMAFIA_PS2RECOMP_SOURCE_DIR="$PWD/.deps/PS2Recomp" "${task_flags[@]}"
+          cmake --build build/runtime --target mafia_runtime_contract_tests mafia_host_tests --parallel 2
+          ctest --test-dir build/runtime --output-on-failure
+      - name: Generated integer operations under UBSan
+        shell: bash
+        run: |
+          task_flags=()
+          if [[ "$(uname -m)" == arm64 ]]; then
+            task_flags+=(--sse2neon .deps/sse2neon)
+          fi
+          python3 patches/tests/check_integer_codegen.py --source .deps/PS2Recomp --build build/upstream "${task_flags[@]}"

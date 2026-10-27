@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "name": "Mafia PS2 Native Recomp",
+  "repository": "https://github.com/dnesdan/mafia-ps2-recomp",
+  "license": "GPL-3.0",
+  "game": {
+    "title": "Mafia",
+    "original_platform": "PlayStation 2",
+    "serial": "SLUS-20671",
+    "system_cnf_version": "1.01",
+    "video_mode": "NTSC",
+    "elf_sha256": "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f",
+    "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
+  },
+  "target": {"os": "macOS", "architecture": "arm64", "application": "MafiaNative.app"},
+  "status": {
+    "stage": "native-build-bringup",
+    "playable": false,
+    "input_verified": true,
+    "static_translation_verified": true,
+    "native_elf_loaded": false,
+    "original_entry_executed": false,
+    "first_game_frame_verified": false,
+    "macos_app_execution_verified": false,
+    "pcsx2_differential_tests_verified": false
+  },
+  "progress_report": "docs/PROGRESS.md",
+  "commercial_inputs_in_repository": false,
+  "generated_game_code_in_repository": false
+}
