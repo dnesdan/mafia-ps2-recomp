@@ -52,7 +52,7 @@ jobs:
             task_flags+=(-DCMAKE_OSX_ARCHITECTURES=arm64)
           fi
           cmake -S . -B build/runtime -C .deps/fetchcontent.cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DMAFIA_BUILD_RUNTIME=ON -DMAFIA_ENABLE_FFMPEG=ON -DMAFIA_PS2RECOMP_SOURCE_DIR="$PWD/.deps/PS2Recomp" "${task_flags[@]}"
-          cmake --build build/runtime --target mafia_runtime_contract_tests mafia_host_tests --parallel 2
+          cmake --build build/runtime --target mafia_runtime_contract_tests mafia_host_tests MafiaHostContract --parallel 2
           ctest --test-dir build/runtime --output-on-failure
       - name: Generated integer operations under UBSan
         shell: bash

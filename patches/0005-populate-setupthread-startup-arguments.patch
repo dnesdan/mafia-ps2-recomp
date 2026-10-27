@@ -1,0 +1,368 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9809e3070eb6a4983c7c33cd87469dc070b0c48e..533c9bb1c128af3e76c33467fb3c2648de06d41d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -1,8 +1,116 @@
+ #include "Common.h"
+ #include "System.h"
+ 
++#include <array>
++#include <stdexcept>
++
+ namespace ps2_syscalls
+ {
++    namespace
++    {
++        // PS2SDK ee/startup/include/startup.h: argc, 16 EE argv pointers,
++        // and a 256-byte string payload. crt0 supplies this buffer in $a3.
++        constexpr size_t kStartupArgvCount = 16u;
++        constexpr size_t kStartupPayloadSize = 256u;
++        constexpr size_t kStartupPayloadOffset = sizeof(uint32_t) * (1u + kStartupArgvCount);
++        constexpr size_t kStartupArgsSize = kStartupPayloadOffset + kStartupPayloadSize;
++        static_assert(kStartupArgsSize == 324u);
++
++        bool relativeBootPath(const std::filesystem::path &path,
++                              const std::filesystem::path &root,
++                              std::string &relative)
++        {
++            if (root.empty())
++            {
++                return false;
++            }
++            const std::filesystem::path candidate = path.lexically_normal().lexically_relative(root.lexically_normal());
++            if (candidate.empty() || candidate.is_absolute())
++            {
++                return false;
++            }
++            for (const auto &part : candidate)
++            {
++                if (part == ".." || part == ".")
++                {
++                    return false;
++                }
++            }
++            relative = candidate.generic_string();
++            // A colon would introduce another PS2 device; backslashes in a
++            // native filename would be reinterpreted as guest separators.
++            return !relative.empty() && relative.find_first_of(":\\") == std::string::npos &&
++                   relative.find('\0') == std::string::npos;
++        }
++
++        std::string bootExecutableArgument()
++        {
++            const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
++            if (paths.elfPath.empty())
++            {
++                return {}; // Bare runtime fixtures have no configured program.
++            }
++            std::string relative;
++            if (relativeBootPath(paths.elfPath, paths.cdRoot, relative))
++            {
++                std::replace(relative.begin(), relative.end(), '/', '\\');
++                // Host extraction commonly strips the ISO9660 version. Preserve
++                // an explicit numeric version; otherwise use the first version.
++                const size_t version = relative.find(';');
++                if (version == std::string::npos)
++                {
++                    relative += ";1";
++                }
++                else if (version + 1u == relative.size() ||
++                         !std::all_of(relative.begin() + version + 1u, relative.end(),
++                                      [](unsigned char character) { return character >= '0' && character <= '9'; }))
++                {
++                    throw std::runtime_error("SetupThread: CD boot path has a malformed ISO9660 version suffix");
++                }
++                return "cdrom0:\\" + relative;
++            }
++            if (relativeBootPath(paths.elfPath, paths.hostRoot, relative))
++            {
++                return "host:" + relative;
++            }
++            throw std::runtime_error("SetupThread: configured ELF is outside the guest CD/host roots or has an invalid guest path");
++        }
++
++        void populateStartupArguments(uint8_t *rdram, uint32_t address)
++        {
++            if (address == 0u)
++            {
++                return; // Older callers may omit the optional argument buffer.
++            }
++            uint32_t offset = 0u;
++            bool scratch = false;
++            if (!rdram || (address & 3u) != 0u ||
++                !resolveEeGuestRange(address, kStartupArgsSize, offset, scratch) || scratch)
++            {
++                throw std::runtime_error("SetupThread: startup argument buffer is not a complete aligned EE RAM range");
++            }
++            const std::string argument = bootExecutableArgument();
++            if (argument.size() >= kStartupPayloadSize)
++            {
++                throw std::runtime_error("SetupThread: executable argument exceeds the 256-byte startup payload");
++            }
++            std::array<uint8_t, kStartupArgsSize> arguments{};
++            if (!argument.empty())
++            {
++                arguments[0] = 1u; // Little-endian argc = 1; argv[1..15] stay null.
++                const uint32_t payloadAddress = address + static_cast<uint32_t>(kStartupPayloadOffset);
++                for (size_t byte = 0; byte < sizeof(uint32_t); ++byte)
++                {
++                    arguments[sizeof(uint32_t) + byte] = static_cast<uint8_t>(payloadAddress >> (byte * 8u));
++                }
++                std::copy(argument.begin(), argument.end(), arguments.begin() + kStartupPayloadOffset);
++            }
++            // Validate everything first so malformed host configuration or guest
++            // bounds cannot partially overwrite the caller's startup storage.
++            std::memcpy(rdram + offset, arguments.data(), arguments.size());
++        }
++    }
++
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
+@@ -480,7 +588,9 @@ namespace ps2_syscalls
+         const uint32_t gp = getRegU32(ctx, 4);
+         const uint32_t stack = getRegU32(ctx, 5);
+         const int32_t stackSizeSigned = static_cast<int32_t>(getRegU32(ctx, 6));
++        const uint32_t args = getRegU32(ctx, 7);
+         const uint32_t currentSp = getRegU32(ctx, 29);
++        populateStartupArguments(rdram, args);
+         EeScheduler &scheduler = runtime->eeScheduler();
+         scheduler.bindMainContextForSyscall(*ctx, rdram);
+ 
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 3eaa8b3d28a3cdab3a97f4d9a1e03fec39d44164..0f83c03bef7e7adf9aa41ef26e88bc1e95b7cf9b 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_library(ps2_test_lib STATIC
+     src/pad_input_tests.cpp
+     src/ps2_runtime_io_tests.cpp
+     src/ps2_runtime_kernel_tests.cpp
++    src/ps2_startup_args_tests.cpp
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
+     src/ps2_vu1_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 7b78891488145a1727991e58de9b334c158bd0d7..9351210ba06b1111189d3dc43df03ad4a9c7078a 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -8,6 +8,7 @@ void register_elf_analyzer_tests();
+ void register_pad_input_tests();
+ void register_ps2_runtime_io_tests();
+ void register_ps2_runtime_kernel_tests();
++void register_ps2_startup_args_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
+@@ -31,6 +32,7 @@ int main()
+     register_pad_input_tests();
+     register_ps2_runtime_io_tests();
+     register_ps2_runtime_kernel_tests();
++    register_ps2_startup_args_tests();
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_memory_tests();
+     register_ps2_vu1_tests();
+diff --git a/ps2xTest/src/ps2_startup_args_tests.cpp b/ps2xTest/src/ps2_startup_args_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e7ff082aab67ff9aa2bd7561977177cb93ebb7e
+--- /dev/null
++++ b/ps2xTest/src/ps2_startup_args_tests.cpp
+@@ -0,0 +1,199 @@
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_runtime_macros.h"
++#include "ps2_syscalls.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <filesystem>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kArgs = 0x00010000u;
++    constexpr uint32_t kArgsSize = 324u;
++    constexpr uint32_t kPayload = 68u;
++
++    struct StartupEnv
++    {
++        PS2Runtime::IoPaths previousPaths = PS2Runtime::getIoPaths();
++        std::filesystem::path root = std::filesystem::temp_directory_path() / "ps2-startup-synthetic";
++        std::vector<uint8_t> rdram = std::vector<uint8_t>(PS2_RAM_SIZE, 0xA5u);
++        R5900Context context{};
++        PS2Runtime runtime;
++
++        StartupEnv()
++        {
++            configure(root / "cd" / "SubDir" / "Test.Elf");
++            context.pc = 0x00100000u;
++            SET_GPR_U32(&context, 4, 0x00123400u);
++            SET_GPR_U32(&context, 5, 0u);
++            SET_GPR_U32(&context, 6, 0u);
++            SET_GPR_U32(&context, 7, kArgs);
++            SET_GPR_U32(&context, 29, 0x001FFFF0u);
++        }
++
++        ~StartupEnv()
++        {
++            PS2Runtime::setIoPaths(previousPaths);
++        }
++
++        void configure(const std::filesystem::path &elf)
++        {
++            PS2Runtime::IoPaths paths;
++            paths.elfPath = elf;
++            paths.cdRoot = root / "cd";
++            paths.hostRoot = root / "host";
++            PS2Runtime::setIoPaths(paths);
++        }
++
++        void setup(uint32_t address = kArgs)
++        {
++            SET_GPR_U32(&context, 7, address);
++            if (!ps2_syscalls::dispatchNumericSyscall(0x3Cu, rdram.data(), &context, &runtime))
++            {
++                throw std::runtime_error("synthetic SetupThread did not dispatch");
++            }
++        }
++
++        uint32_t word(uint32_t offset) const
++        {
++            return static_cast<uint32_t>(rdram[offset]) |
++                   (static_cast<uint32_t>(rdram[offset + 1u]) << 8u) |
++                   (static_cast<uint32_t>(rdram[offset + 2u]) << 16u) |
++                   (static_cast<uint32_t>(rdram[offset + 3u]) << 24u);
++        }
++
++        std::string argument(uint32_t physical = kArgs) const
++        {
++            const auto first = rdram.begin() + physical + kPayload;
++            const auto last = first + 256u;
++            return std::string(first, std::find(first, last, uint8_t{0}));
++        }
++
++        void mustFailWithoutWriting(TestCase &test, uint32_t address = kArgs)
++        {
++            bool failed = false;
++            try { setup(address); }
++            catch (const std::runtime_error &) { failed = true; }
++            test.IsTrue(failed, "invalid startup storage/configuration must fail explicitly");
++            test.IsTrue(std::all_of(rdram.begin(), rdram.end(), [](uint8_t value) { return value == 0xA5u; }),
++                        "failure must not partially overwrite guest memory");
++            test.Equals(getRegU32(&context, 28), 0u, "failure must precede GP/thread setup");
++        }
++    };
++}
++
++void register_ps2_startup_args_tests()
++{
++    MiniTest::Case("PS2StartupArguments", [](TestCase &tc)
++    {
++        tc.Run("SetupThread provides exact EE argc argv and bounded payload", [](TestCase &t)
++        {
++            StartupEnv env;
++            env.setup();
++            t.Equals(env.word(kArgs), 1u, "one configured executable produces argc=1");
++            t.Equals(env.word(kArgs + 4u), kArgs + kPayload, "argv[0] is an EE pointer into the payload");
++            t.Equals(env.argument(), std::string("cdrom0:\\SubDir\\Test.Elf;1"),
++                     "boot path must retain guest device syntax, separators and case");
++            t.IsTrue(std::all_of(env.rdram.begin() + kArgs + 8u, env.rdram.begin() + kArgs + kPayload,
++                                [](uint8_t value) { return value == 0u; }), "remaining argv slots must be null");
++            const size_t firstUnused = kArgs + kPayload + env.argument().size();
++            t.IsTrue(std::all_of(env.rdram.begin() + firstUnused, env.rdram.begin() + kArgs + kArgsSize,
++                                [](uint8_t value) { return value == 0u; }), "payload must be terminated and zero-filled");
++            t.Equals(env.rdram[kArgs - 1u], uint8_t{0xA5u}, "prefix canary must survive");
++            t.Equals(env.rdram[kArgs + kArgsSize], uint8_t{0xA5u}, "suffix canary must survive");
++            t.Equals(getRegU32(&env.context, 2), 0x001FFFF0u, "return value remains the aligned initial SP");
++            t.Equals(getRegU32(&env.context, 28), 0x00123400u, "normal SetupThread GP semantics remain intact");
++        });
++
++        tc.Run("existing ISO version and explicit host mapping are preserved", [](TestCase &t)
++        {
++            StartupEnv env;
++            env.configure(env.root / "cd" / "Boot.Elf;7");
++            env.setup();
++            t.Equals(env.argument(), std::string("cdrom0:\\Boot.Elf;7"), "existing numeric ISO version must survive");
++            env.configure(env.root / "host" / "Bin" / "Boot.Elf");
++            env.setup();
++            t.Equals(env.argument(), std::string("host:Bin/Boot.Elf"), "host programs retain the configured guest mount");
++        });
++
++        tc.Run("dot components are normalized before guest mount containment", [](TestCase &t)
++        {
++            StartupEnv env;
++            env.configure(env.root / "cd" / "SubDir" / ".." / "Boot.Elf");
++            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
++            paths.cdRoot = env.root / "cd" / "OtherDir" / "..";
++            PS2Runtime::setIoPaths(paths);
++            env.setup();
++            t.Equals(env.argument(), std::string("cdrom0:\\Boot.Elf;1"), "normalized executable must retain its CD mapping");
++        });
++
++        tc.Run("RAM aliases preserve the guest argv pointer and exact final RAM range", [](TestCase &t)
++        {
++            for (uint32_t alias : {0u, 0x20000000u, 0x80000000u, 0xA0000000u})
++            {
++                StartupEnv env;
++                const uint32_t address = alias + kArgs;
++                env.setup(address);
++                t.Equals(env.word(kArgs), 1u, "aliases must write the same physical RAM buffer");
++                t.Equals(env.word(kArgs + 4u), address + kPayload, "argv[0] must preserve the caller's RAM alias");
++                t.Equals(env.argument(), std::string("cdrom0:\\SubDir\\Test.Elf;1"), "aliased payload must be intact");
++            }
++            StartupEnv env;
++            constexpr uint32_t lastBuffer = PS2_RAM_SIZE - kArgsSize;
++            env.setup(lastBuffer);
++            t.Equals(env.word(lastBuffer), 1u, "a buffer ending exactly at the RAM limit is valid");
++            t.Equals(env.argument(lastBuffer), std::string("cdrom0:\\SubDir\\Test.Elf;1"), "last bounded payload must be intact");
++        });
++
++        tc.Run("null argument storage and absent program configuration remain compatible", [](TestCase &t)
++        {
++            StartupEnv env;
++            env.configure(env.root / "cd" / std::string(300, 'x'));
++            env.setup(0u);
++            t.Equals(env.word(kArgs), 0xA5A5A5A5u, "null optional storage must not be written");
++            t.Equals(getRegU32(&env.context, 2), 0x001FFFF0u, "null optional storage must preserve stack setup");
++            env.configure({});
++            env.setup();
++            t.IsTrue(std::all_of(env.rdram.begin() + kArgs, env.rdram.begin() + kArgs + kArgsSize,
++                                [](uint8_t value) { return value == 0u; }), "no configured ELF must leave argc=0 without inventing argv");
++        });
++
++        tc.Run("payload boundary accepts 255 bytes and rejects 256 without truncation", [](TestCase &t)
++        {
++            StartupEnv valid;
++            valid.configure(valid.root / "cd" / std::string(245, 'A'));
++            valid.setup();
++            t.Equals(valid.argument().size(), size_t{255}, "maximum argv[0] must leave one byte for NUL");
++            t.Equals(valid.rdram[kArgs + kArgsSize - 1u], uint8_t{0}, "last payload byte must terminate argv[0]");
++            StartupEnv oversized;
++            oversized.configure(oversized.root / "cd" / std::string(246, 'A'));
++            oversized.mustFailWithoutWriting(t);
++        });
++
++        tc.Run("unmapped malformed and escaping paths cannot become invented guest names", [](TestCase &t)
++        {
++            for (const std::string &relative : {std::string("../outside.elf"), std::string("bad:device.elf"),
++                                                std::string("bad\\separator.elf"), std::string("bad\0name", 8),
++                                                std::string("Boot.Elf;bad"), std::string("Dir;1/Boot.Elf")})
++            {
++                StartupEnv env;
++                env.configure(env.root / "cd" / relative);
++                env.mustFailWithoutWriting(t);
++            }
++        });
++
++        tc.Run("invalid unaligned scratch and truncated argument ranges fail before mutation", [](TestCase &t)
++        {
++            for (uint32_t address : {kArgs + 1u, PS2_RAM_SIZE - 320u, 0x10010000u, 0x40010000u,
++                                     0x70000000u, 0x80000000u + PS2_RAM_SIZE - 320u, 0xFFFFFFFCu})
++            {
++                StartupEnv env;
++                env.mustFailWithoutWriting(t, address);
++            }
++        });
++    });
++}

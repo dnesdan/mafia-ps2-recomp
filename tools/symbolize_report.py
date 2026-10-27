@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve a runtime failure PC against the exact original ELF's retained symbols."""
+"""Resolve a runtime guest PC and last branch source against the exact input ELF."""
 
 import argparse
 import json
@@ -13,6 +13,41 @@ from mafia.profile import select_profile
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def symbolize(report: dict, elf: ElfImage, profile: dict) -> dict:
+    if not isinstance(report, dict):
+        raise FormatError("runtime report must be a JSON object")
+    if report.get("elf_sha256") != elf.sha256:
+        raise FormatError("runtime report and ELF belong to different builds")
+    for field in ("last_guest_pc", "last_guest_branch_pc"):
+        if field == "last_guest_branch_pc" and field not in report:
+            continue  # Older reports did not capture the branch source.
+        pc = report.get(field)
+        if type(pc) is not int or not 0 <= pc <= 0xFFFFFFFF:
+            raise FormatError(f"runtime report has no valid {field}")
+
+    ranges = [{"name": symbol.name, "start": symbol.address, "end": symbol.address + symbol.size}
+              for symbol in elf.functions() if symbol.size]
+    ranges.extend({"name": symbol["name"], "start": symbol["start"], "end": symbol["end"]}
+                  for symbol in profile.get("verified_untyped_code_ranges", []))
+
+    def matches(pc: int) -> list[dict] | None:
+        return sorted((symbol for symbol in ranges if symbol["start"] <= pc < symbol["end"]),
+                      key=lambda symbol: (symbol["start"], symbol["name"])) or None
+
+    result = dict(report)
+    # Keep the existing field tied to the guest PC, even when the failed target
+    # is zero. A source symbol must never be presented as the target's symbol.
+    result["symbol"] = matches(report["last_guest_pc"])
+    result["branch_source_symbol"] = (matches(report["last_guest_branch_pc"])
+                                      if "last_guest_branch_pc" in report else None)
+    result["symbolization_source"] = "exact ELF retained symbols and verified profile boot ranges"
+    return result
+
+
+def symbol_names(matches: list[dict] | None) -> str:
+    return ", ".join(match["name"] for match in matches or []) or "no symbol covers this address"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
@@ -22,24 +57,17 @@ def main() -> int:
     try:
         elf = ElfImage(args.elf)
         profile = select_profile(elf, ROOT / "profiles")
-        report = json.loads(args.report.read_text())
-        if report.get("elf_sha256") != elf.sha256:
-            raise FormatError("runtime report and ELF belong to different builds")
-        pc = report.get("last_guest_pc")
-        if not isinstance(pc, int) or not 0 <= pc <= 0xFFFFFFFF:
-            raise FormatError("runtime report has no valid guest PC")
-        matches = [{"name": s.name, "start": s.address, "end": s.address + s.size}
-                   for s in elf.functions() if s.size and s.address <= pc < s.address + s.size]
-        matches.extend({"name": s["name"], "start": s["start"], "end": s["end"]}
-                       for s in profile.get("verified_untyped_code_ranges", []) if s["start"] <= pc < s["end"])
-        report["symbol"] = sorted(matches, key=lambda match: (match["start"], match["name"])) or None
-        report["symbolization_source"] = "exact ELF retained symbols and verified profile boot ranges"
+        report = symbolize(json.loads(args.report.read_text()), elf, profile)
         output = args.output or args.report.with_name(args.report.stem + ".symbolized.json")
         if output.resolve() == args.elf.resolve():
             raise FormatError("symbolized report must not replace the ELF")
         write_json(output, report)
-        names = ", ".join(match["name"] for match in matches) or "no symbol covers this address"
-        print(f"0x{pc:08x}: {names}; stage={report.get('stage')}; {report.get('error', '')}")
+        label = "target" if report.get("status") == "missing-dispatch" else "guest PC"
+        locations = [f"{label} 0x{report['last_guest_pc']:08x}: {symbol_names(report['symbol'])}"]
+        if "last_guest_branch_pc" in report:
+            locations.append(f"last branch source 0x{report['last_guest_branch_pc']:08x}: "
+                             f"{symbol_names(report['branch_source_symbol'])}")
+        print("; ".join([*locations, f"stage={report.get('stage')}", report.get("error", "")]))
         return 0
     except (OSError, ValueError) as exc:
         print(f"symbolize_report: {exc}", file=sys.stderr)

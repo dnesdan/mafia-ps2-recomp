@@ -1,0 +1,237 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..aae3eb7 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -270,7 +270,19 @@ void EeScheduler::run()
+         {
+             if (!running->invocations.empty())
+             {
+-                context.pc = 0u;
++                if (m_runtime.missingFunctionPolicy() == PS2Runtime::MissingFunctionPolicy::Stop)
++                {
++                    m_runtime.reportMissingFunction(m_rdram,
++                                                    &context,
++                                                    context.pc,
++                                                    context.pc,
++                                                    PS2Runtime::GuestBranchKind::DirectJump,
++                                                    "EE invocation");
++                }
++                else
++                {
++                    context.pc = 0u;
++                }
+             }
+             else
+             {
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..1868246 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1356,14 +1356,20 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+     // Every inter-function transfer is also a deterministic EE safe point.
+     // Backward edges inside generated functions use eeCheckpointDue(), while
+     // this charge bounds straight-line call chains that have no local loop.
+-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+-    {
+-        return false;
+-    }
++    // Validate the transfer before yielding: the scheduler interprets an
++    // invocation PC of zero as completion, even when a checkpoint is pending.
++    const bool checkpointPending = m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles);
+ 
+     if (!isCall)
+     {
+-        if (!hasFunction(targetPc))
++        // Scheduler-owned callbacks (including guest syscall overrides) use
++        // RA=0 to return to their preserved parent context. This is a sentinel,
++        // not an executable address. Only the active invocation may use it.
++        const GuestThread *thread = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
++        const bool invocationReturn = kind == GuestBranchKind::Return && targetPc == 0u &&
++                                      thread && !thread->invocations.empty() &&
++                                      &thread->invocations.back().context == ctx;
++        if (!invocationReturn && !hasFunction(targetPc))
+         {
+             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+         }
+@@ -1394,6 +1400,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+         return false;
+     }
+ 
++    if (checkpointPending)
++    {
++        return false;
++    }
++
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
+     targetFn(rdram, ctx, this);
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..6d2cc5e 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -123,6 +123,36 @@ namespace
+         ctx->pc = ::getRegU32(ctx, 31);
+     }
+ 
++    PS2Runtime::GuestBranchKind gStrictOverrideBranchKind = PS2Runtime::GuestBranchKind::Return;
++    uint32_t gStrictOverrideTarget = 0u;
++    bool gStrictOverrideWrongContext = false;
++    bool gStrictOverrideStopped = false;
++    bool gStrictOverrideHadZeroRa = false;
++    bool gStrictOverrideForceCheckpoint = false;
++    bool gStrictOverrideCheckpointObserved = false;
++    bool gStrictOverrideStopAfterDispatch = false;
++
++    void overrideStrictReturnHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gStrictOverrideHadZeroRa = ::getRegU32(ctx, 31) == 0u;
++        setReturnU32(ctx, ::getRegU32(ctx, 4) + ::getRegU32(ctx, 5));
++        if (gStrictOverrideForceCheckpoint)
++        {
++            runtime->eeScheduler().postEvent({EeEventType::ExternalWake, 0u, 0u});
++            gStrictOverrideCheckpointObserved = runtime->eeScheduler().checkpointDue(0u);
++        }
++        R5900Context unrelatedContext = *ctx;
++        runtime->dispatchGuestBranch(rdram, gStrictOverrideWrongContext ? &unrelatedContext : ctx,
++                                     gStrictOverrideTarget, ctx->pc, 0u,
++                                     gStrictOverrideBranchKind, "synthetic invocation branch");
++        gStrictOverrideStopped = runtime->isStopRequested();
++        if (gStrictOverrideStopAfterDispatch && !gStrictOverrideStopped)
++        {
++            // Bound a failing regression even if the invalid context remains runnable.
++            runtime->requestStop();
++        }
++    }
++
+     void overrideBrokenHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+     {
+         setReturnU32(ctx, 0xDEADBEEFu);
+@@ -1369,6 +1399,128 @@ void register_ps2_runtime_kernel_tests()
+                      "the completed invocation should propagate the guest handler return value");
+         });
+ 
++        tc.Run("strict return dispatch accepts the active syscall invocation completion sentinel", [](TestCase &t)
++        {
++            for (bool forceCheckpoint : {false, true})
++            {
++                TestEnv env;
++                constexpr uint32_t kSyscallIndex = 0x95u;
++                constexpr uint32_t kHandler = 0x00200050u;
++                env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                env.runtime.registerFunction(kHandler, overrideStrictReturnHandler);
++                env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
++                env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
++                env.runtime.setEeSyscallOverride(env.rdram.data(), kSyscallIndex, kHandler);
++                gOverrideSyscall = kSyscallIndex;
++                gOverrideResult = {};
++                gStrictOverrideBranchKind = PS2Runtime::GuestBranchKind::Return;
++                gStrictOverrideTarget = 0u;
++                gStrictOverrideWrongContext = false;
++                gStrictOverrideStopped = true;
++                gStrictOverrideHadZeroRa = false;
++                gStrictOverrideForceCheckpoint = forceCheckpoint;
++                gStrictOverrideCheckpointObserved = false;
++                gStrictOverrideStopAfterDispatch = false;
++                R5900Context mainContext{};
++                mainContext.pc = K_OVERRIDE_ENTRY;
++                setRegU32(mainContext, 4, 7u);
++                setRegU32(mainContext, 5, 5u);
++                setRegU32(mainContext, 31, 0x00123450u);
++                env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++                env.runtime.eeScheduler().run();
++
++                t.IsTrue(gStrictOverrideHadZeroRa, "the runtime must supply the callback return sentinel");
++                t.IsFalse(gStrictOverrideStopped, "strict return validation must allow scheduler callback completion");
++                t.Equals(::getRegU32(&gOverrideResult, 2), 12u, "the actual callback result must reach its parent");
++                t.Equals(::getRegU32(&gOverrideResult, 31), 0x00123450u, "the parent's return address must be preserved");
++                t.Equals(gOverrideResult.pc, K_OVERRIDE_RESUME, "the parent must resume after its syscall");
++                t.Equals(gStrictOverrideCheckpointObserved, forceCheckpoint, "the pending checkpoint must be exercised");
++            }
++        });
++
++        tc.Run("invocation completion does not exempt invalid guest branches or unrelated contexts", [](TestCase &t)
++        {
++            struct BranchCase
++            {
++                PS2Runtime::GuestBranchKind kind;
++                uint32_t target;
++                bool wrongContext;
++            };
++            const BranchCase cases[] = {
++                {PS2Runtime::GuestBranchKind::DirectJump, 0u, false},
++                {PS2Runtime::GuestBranchKind::IndirectJump, 0u, false},
++                {PS2Runtime::GuestBranchKind::DirectCall, 0u, false},
++                {PS2Runtime::GuestBranchKind::IndirectCall, 0u, false},
++                {PS2Runtime::GuestBranchKind::Return, 0u, true},
++                {PS2Runtime::GuestBranchKind::Return, 0x12345678u, false},
++            };
++            for (bool forceCheckpoint : {false, true})
++            {
++                for (const auto &branch : cases)
++                {
++                    TestEnv env;
++                    constexpr uint32_t kSyscallIndex = 0x95u;
++                    constexpr uint32_t kHandler = 0x00200050u;
++                    env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                    env.runtime.registerFunction(kHandler, overrideStrictReturnHandler);
++                    env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
++                    env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
++                    env.runtime.setEeSyscallOverride(env.rdram.data(), kSyscallIndex, kHandler);
++                    gOverrideSyscall = kSyscallIndex;
++                    gOverrideResult = {};
++                    gStrictOverrideBranchKind = branch.kind;
++                    gStrictOverrideTarget = branch.target;
++                    gStrictOverrideWrongContext = branch.wrongContext;
++                    gStrictOverrideStopped = false;
++                    gStrictOverrideForceCheckpoint = forceCheckpoint;
++                    gStrictOverrideCheckpointObserved = false;
++                    gStrictOverrideStopAfterDispatch = true;
++                    R5900Context mainContext{};
++                    mainContext.pc = K_OVERRIDE_ENTRY;
++                    env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++                    env.runtime.eeScheduler().run();
++                    t.IsTrue(gStrictOverrideStopped, "invalid branches must retain strict missing-dispatch failure");
++                    t.Equals(gOverrideResult.pc, 0u, "a failed callback must not resume the parent as a success");
++                    t.Equals(gStrictOverrideCheckpointObserved, forceCheckpoint, "the pending checkpoint must be exercised");
++                }
++            }
++
++            for (bool forceCheckpoint : {false, true})
++            {
++                TestEnv env;
++                env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++                if (forceCheckpoint)
++                {
++                    env.runtime.eeScheduler().postEvent({EeEventType::ExternalWake, 0u, 0u});
++                    t.IsTrue(env.runtime.eeScheduler().checkpointDue(0u), "the ordinary return must have a pending checkpoint");
++                }
++                env.runtime.dispatchGuestBranch(env.rdram.data(), &env.ctx, 0u, 0x00101010u, 0u,
++                                                PS2Runtime::GuestBranchKind::Return, "ordinary zero return");
++                t.IsTrue(env.runtime.isStopRequested(), "zero return without an active invocation must still fail");
++            }
++        });
++
++        tc.Run("strict scheduler rejects an invalid callback PC instead of completing the invocation", [](TestCase &t)
++        {
++            TestEnv env;
++            constexpr uint32_t kHandler = 0x00200010u;
++            env.runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
++            env.runtime.registerFunction(kHandler, overrideBrokenHandler);
++            env.runtime.registerFunction(K_OVERRIDE_ENTRY, schedulerOverrideEntry);
++            env.runtime.registerFunction(K_OVERRIDE_RESUME, schedulerOverrideResume);
++            env.runtime.setEeSyscallOverride(env.rdram.data(), 0x83u, kHandler);
++            gOverrideSyscall = 0x83u;
++            gOverrideResult = {};
++            R5900Context mainContext{};
++            mainContext.pc = K_OVERRIDE_ENTRY;
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++            t.IsTrue(env.runtime.isStopRequested(), "invalid callback PC must trigger the strict failure policy");
++            t.Equals(gOverrideResult.pc, 0u, "an invalid callback must not resume its parent as a success");
++            const GuestThread *thread = env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId);
++            t.IsTrue(thread && !thread->invocations.empty(), "retain the invalid invocation for diagnosis");
++        });
++
+         tc.Run("SetSyscall override preserves KSEG argument sign extension", [](TestCase &t)
+         {
+             TestEnv env;

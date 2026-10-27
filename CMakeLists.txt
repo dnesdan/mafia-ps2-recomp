@@ -52,6 +52,8 @@ if(MAFIA_BUILD_RUNTIME)
             COMMAND "${CMAKE_COMMAND}" "-DEXECUTABLE=$<TARGET_FILE:mafia_runtime_contract_tests>"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/unwind_timeout_test.cmake")
         set_tests_properties(mafia_exception_shutdown_timeout PROPERTIES TIMEOUT 12)
+        include(cmake/NativeHostContract.cmake)
+        mafia_add_native_host_contract()
     endif()
     if(MAFIA_GENERATED_DIR)
         find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)

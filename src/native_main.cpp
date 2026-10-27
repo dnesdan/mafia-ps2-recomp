@@ -126,7 +126,7 @@ void observe_entry(std::uint8_t *ram, R5900Context *context, PS2Runtime *runtime
 struct Report {
     std::string status = "failed", stage = "arguments", error;
     bool elf_verified = false, elf_loaded = false, entered = false, metrics_available = false;
-    std::uint32_t last_pc = 0;
+    std::uint32_t last_pc = 0, last_branch_pc = 0;
     std::uint64_t presentations = 0, dma = 0, gif = 0, gs = 0, vif = 0;
 };
 
@@ -143,6 +143,7 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"entry_executed\": " + boolean(report.entered) +
         ",\n  \"metrics_available\": " + boolean(report.metrics_available) +
         ",\n  \"last_guest_pc\": " + std::to_string(report.last_pc) +
+        ",\n  \"last_guest_branch_pc\": " + std::to_string(report.last_branch_pc) +
         ",\n  \"symbol\": null,\n  \"gameplay_verified\": false,\n  \"game_frame_verified\": false" +
         ",\n  \"ffmpeg_enabled\": " + boolean(mafia::build::ffmpeg_enabled) +
         ",\n  \"presentations\": " + std::to_string(report.presentations) +
@@ -237,8 +238,10 @@ void collect(PS2Runtime &runtime, Report &report) {
     report.entered = entry_executed.load(std::memory_order_acquire);
     // Called only before execution starts or after the worker has joined.
     // The sampled debug PC can lag; the final guest context is authoritative.
-    if (const auto *context = runtime.eeScheduler().currentContext()) report.last_pc = context->pc;
-    else report.last_pc = runtime.cpu().pc;
+    const auto *context = runtime.eeScheduler().currentContext();
+    if (!context) context = &runtime.cpu();
+    report.last_pc = context->pc;
+    report.last_branch_pc = context->branch_pc;
     report.dma = runtime.memory().dmaStartCount();
     report.gif = runtime.memory().gifCopyCount();
     report.gs = runtime.memory().gsWriteCount();
@@ -371,7 +374,8 @@ int main(int argc, char **argv) {
         report.error = error.what();
         if (runtime) collect(*runtime, report);
         std::cerr << "MafiaNative: " << report.error << " (stage=" << report.stage
-                  << ", guest_pc=0x" << std::hex << report.last_pc << std::dec << ")\n";
+                  << ", guest_pc=0x" << std::hex << report.last_pc
+                  << ", last_branch_pc=0x" << report.last_branch_pc << std::dec << ")\n";
     }
     if (!options.headless && IsWindowReady()) CloseWindow();
     try { emit_report(options, report); }
