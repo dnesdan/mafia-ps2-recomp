@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "profile_id": "slus-20671-adf4944c",
+  "title": "Mafia",
+  "platform": "PlayStation 2",
+  "serial": "SLUS-20671",
+  "region": "North America",
+  "system_cnf_version": "1.01",
+  "video_mode": "NTSC",
+  "boot_path": "SLUS_206.71",
+  "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0",
+  "iso_bytes": 4128538624,
+  "elf_sha256": "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f",
+  "elf_bytes": 5613500,
+  "entry_point": 1048584,
+  "entry_points": ["_start@0x00100008"],
+  "verified_untyped_code_ranges": [
+    {"name": "_start", "start": 1048584, "end": 1049032, "evidence": "ELF entry and symbols; final J Exit at 0x001001C0 plus its delay slot"},
+    {"name": "_exit", "start": 1049032, "end": 1049040, "evidence": "ELF symbol and two-instruction tail branch"},
+    {"name": "_root", "start": 1049040, "end": 1049048, "evidence": "ELF symbol; addiu v1,zero,0x23 and syscall; matches .text extent end"}
+  ],
+  "stubs": [],
+  "instruction_patches": [],
+  "policy": {
+    "missing_function": "stop",
+    "unknown_syscall": "stop",
+    "unsupported_instruction": "trap",
+    "allow_interpreter_fallback": false,
+    "allow_jit_fallback": false,
+    "automatic_instruction_patches": false
+  },
+  "evidence": {
+    "source": "user-provided disc, streamed in full and archive CRC verified",
+    "file_count": 281,
+    "directory_count": 16,
+    "defined_function_symbols": 7788,
+    "debug_sections": [],
+    "entry_hint": "ELF entry and _start/ENTRYPOINT STT_NOTYPE symbols agree; no inferred function substitution"
+  }
+}

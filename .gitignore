@@ -18,6 +18,15 @@ reports/
 *.BIN
 *.pss
 *.mfa
+*.dta
+*.DTA
+*.fql
+*.FQL
+*.dat
+*.DAT
+*.img
+*.IMG
+*.PSS
 SLES_*
 SLUS_*
 SLPS_*
