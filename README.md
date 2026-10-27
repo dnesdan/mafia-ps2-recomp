@@ -1,12 +1,31 @@
 # Mafia PS2 Native Recomp
 
-Static recompilation of the original PlayStation 2 **Mafia** executable, targeting Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
+Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original-entry bring-up, not a playable release.** The complete translated program builds on Linux, loads the original ELF and reaches the original `main`; initialization stops with an explicit error at the missing upstream SIF/IOP packet path. The native host and runtime also build and pass synthetic application tests on ARM64 macOS. Read [the verified progress report](docs/PROGRESS.md) for exact execution evidence and remaining work.
+**Status: original startup graphics on Linux; menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the Gathering publisher splash through the GS. The native host and runtime previously passed synthetic application tests on ARM64 macOS; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for exact execution evidence and remaining work.
+
+![Original Gathering startup splash rendered by the translated game on Linux](docs/screenshots/mafia-linux-gathering.png)
+
+Actual 640×448 GS capture from the original program on Linux, encoded as PNG without changing or adding pixels. This is a startup splash, not the main menu. The capture path also works without a display server.
 
 ## Build from your own disc
 
-Requires Python 3.11+, CMake 3.24+, Git, a C++20 compiler and FFmpeg development libraries. On Apple Silicon:
+Requires Python 3.11+, CMake 3.24+, Git, a C++20 compiler and FFmpeg development libraries. The verified Linux host is x86-64; the Linux scripts also accept ARM64, which has not yet been exercised with the original game.
+
+On Ubuntu 24.04:
+
+```sh
+sudo apt install build-essential cmake python3 git pkg-config \
+  libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+  libgl1-mesa-dev libasound2-dev libavcodec-dev libavformat-dev \
+  libavutil-dev libswresample-dev libswscale-dev zlib1g-dev
+export MAFIA_PS2_ISO="/absolute/path/to/Mafia.iso"
+python3 tools/bootstrap.py --diagnostic
+bash tools/build_linux.sh
+bash tools/run_linux.sh
+```
+
+On Apple Silicon:
 
 ```sh
 brew install python cmake pkg-config ffmpeg
@@ -22,19 +41,20 @@ The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA
 
 `MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and running the original game corpus on Apple Silicon remain separate milestones. F11 toggles fullscreen. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio; no substitute title scene is included.
 
-For a bounded headless run after building:
+For a bounded headless Linux run after building (use `run_macos.sh` on macOS):
 
 ```sh
-bash tools/run_macos.sh \
+bash tools/run_linux.sh \
   --elf .work/extracted/SLUS_206.71 \
   --data-root .work/extracted \
   --iso "$MAFIA_PS2_ISO" \
-  --headless --timeout-ms 10000 --report .work/runtime.json
+  --headless --timeout-ms 10000 --report .work/runtime.json \
+  --capture-frame .work/frame.ppm
 python3 tools/symbolize_report.py .work/runtime.json \
   --elf .work/extracted/SLUS_206.71
 ```
 
-Timeouts, unresolved function dispatch and unsupported services return nonzero exit codes. `--validate-only` verifies input identity without claiming execution. `--timeout-ms 0` disables the execution deadline for interactive investigation.
+Timeouts, unresolved function dispatch and unsupported services return nonzero exit codes. `--validate-only` verifies input identity without claiming execution. `--timeout-ms 0` disables the execution deadline for interactive investigation. Frame capture writes the actual GS presentation surface as lossless PPM; it reports unavailable output explicitly and refuses to overwrite an existing file. A captured black frame alone is not evidence of successful rendering.
 
 ## Inspect and test
 
@@ -56,4 +76,4 @@ CI runs source-only Python/C++ tests and synthetic runtime contracts on Linux an
 
 This project is GPL-3.0; see [LICENSE](LICENSE). PS2Recomp is GPL-3.0. Dependency identities are in [dependencies.lock.json](dependencies.lock.json); their own licenses remain applicable. [VCS Recomp](https://github.com/OverkillLabs3/vice-city-stories-recomp) was studied for architecture. Its PSP graphics code and separately licensed shaders are not copied into this project.
 
-No ISO, ELF, IRX, BIOS, original asset or binary-derived C++ is tracked. Tests construct their own small executables and discs.
+No ISO, ELF, IRX, BIOS, extracted asset or binary-derived C++ is tracked. The screenshot above documents an actual run; it is not a runtime asset. Tests construct their own small executables and discs.

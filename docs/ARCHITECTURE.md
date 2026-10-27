@@ -9,7 +9,7 @@
 | `profiles/` | Exact disc/ELF identity and reviewed build-specific code boundaries. No generic runtime hacks. |
 | `tools/mafia/symbolmap.py` | Function map from sized ELF symbols plus reviewed untyped boot ranges. |
 | `tools/recompile.py` | Real upstream analyzer/recompiler invocation, source audit and generation provenance. |
-| `patches/` | Small generic upstream fixes with regression coverage. |
+| `patches/` | Reviewed generic upstream corrections and runtime extensions with regression coverage. |
 | `src/` | Hash-checked ELF loading, native process/window lifecycle, scheduler execution and diagnostic reports. |
 | PS2Recomp | EE AOT code generation, guest memory, kernel services, IOP, DMA, VIF/VU/GIF/GS and audio/media runtime. |
 
@@ -47,12 +47,22 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0004` | Strict return dispatch accepts the scheduler's zero return-address sentinel only for its active callback context. Invalid transfers are checked before a scheduler yield; unmapped invocation PCs remain errors. The original game's first syscall callback exposed this generic runtime inconsistency. |
 | `0005` | `SetupThread` supplies the default executable argument through the original 324-byte startup ABI. The guest path comes from configured CD/host roots; bounds, aliases, version suffixes and payload limits are checked before mutation. The game's original `argc == 1` assertion remains intact. |
 | `0006` | Strict mode rejects the negotiated guest SIF command path with packet and missing-transport diagnostics before any descriptor in the batch commits. Full physical RAM/scratchpad bounds prevent descriptor or payload wrapping; valid aliases and ordinary DMA remain supported. This exposes the missing IOP packet receiver, bootstrap RPC services and guest interrupt replies; it does not implement them. |
+| `0007`–`0009` | Add a per-runtime SIF command endpoint, bounded batch snapshots, negotiated RPC initialization, original EE DMAC5 reply delivery and strict physical IOP loading. Implement SIF receive-DMA stop and modeled reset from the supplied IOP image. Original LOADFILE entry and RPC registration run before reset completion is advertised. |
+| `0010`–`0014` | Start the supplied CDVDFSV service with owned workspace; expose live CD/DVD controller state; load mounted modules with their original argument ABI; model IOP DMA priority/channel enables and the PS2 RTC representation. |
+| `0015`–`0017` | Start original FILEIO, return the real shared CD/DVD event, implement owned IOP mailboxes and interrupt callback contexts, and provide bounded read-only host file handles through the IOP imports used by the original service. |
+| `0018` | Preserve deferred VIF command bytes across partial payloads and interrupt stalls. Deliver VIF I-bit interrupts from the EE executor, respect INTC acknowledgement/masks, and distinguish stream resume, reset and DMA cancellation. |
+| `0019` | Preserve the PS2 optical-drive convention that permits a read/write open request while keeping the mounted disc handle read-only. No host write capability is granted. |
+| `0020` | Own host image-file handles immediately and close them exactly once on read, size, allocation or parsing failures. Cleanup preserves the original exception even if the host close callback throws. |
+| `0021` | Initialize and own the reserved IOP invocation stack once at reset, including its O32 argument home area. Physical RPC results retain the actual stack bytes; null pointers, unsupported aliases and unowned ranges remain errors. |
+| `0022` | Accept the optical driver's mode-zero read convention for explicit CD-ROM paths. Registered guest drivers retain priority; host and memory-card mode zero, writes and unmodeled option bits remain unsupported. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly; its separate GS-cache CTest directory does not run that executable.
 
 The startup argument layout and syscall handoff were checked against the primary PS2SDK [startup header](https://ps2dev.github.io/ps2sdk/startup_8h_source.html) and [CRT source](https://ps2dev.github.io/ps2sdk/ee_2startup_2src_2crt0_8c_source.html), as well as the original executable's startup instructions. This supplies the default program name; a general multi-argument `ExecPS2` implementation is outside this correction.
 
-The SIF boundary recognizes the published command route and `ERT | INT_O` framing defined by the PS2SDK [DMA header](https://ps2dev.github.io/ps2sdk/sifdma_8h_source.html) and [EE command implementation](https://ps2dev.github.io/ps2sdk/ee_2kernel_2src_2sifcmd_8c_source.html). It is scoped to that negotiated path, not a detector for every custom DMA protocol. Readiness must eventually follow real IOP initialization and replies delivered through the original guest handler.
+The SIF boundary recognizes the published command route and `ERT | INT_O` framing defined by the PS2SDK [DMA header](https://ps2dev.github.io/ps2sdk/sifdma_8h_source.html) and [EE command implementation](https://ps2dev.github.io/ps2sdk/ee_2kernel_2src_2sifcmd_8c_source.html). It is scoped to that negotiated path. Patches after `0006` replace its diagnostic stop with supported transport: readiness follows endpoint/service initialization, and the original guest handler consumes replies and updates its own software registers.
+
+IOP reset is explicitly modeled. The runtime parses the supplied replacement image, resets its owned kernel/allocator and starts the original LOADFILE, CDVDFSV and FILEIO service modules. Their entry functions must return resident and register actual RPC servers within a bounded interval. This is not execution of a PS2 ROM boot sequence; neither a guessed firmware entry nor a host stub is reported as an executed original service. Strict loads retain original import and module-start failures as errors.
 
 ## Runtime and platform
 
@@ -64,9 +74,15 @@ Guest saves have a separate root; macOS defaults to `~/Library/Application Suppo
 
 macOS builds request `arm64`, reject Rosetta and verify the produced Mach-O architecture. ARM translation uses a pinned sse2neon revision. Generated code/runtime disable fast-math and FMA contraction. This is a portability configuration, not a claim of complete R5900/VU floating-point equivalence.
 
+Linux has dedicated build/run scripts and uses the same host, generated corpus and runtime. The actual game has been exercised on x86-64. Linux ARM64 is accepted by the build configuration but remains unverified with the game. Desktop window/input behavior is separate from the headless runs available in this environment.
+
 ## Evidence
 
 The host reports input verification, ELF loading and actual original-entry invocation separately. Window presentations and hardware counters are diagnostic values, not proof of a correct game frame. Failures retain the stage, guest PC, last branch source and error; `symbolize_report.py` resolves addresses against the exact input ELF.
+
+The host can capture a GS presentation surface after the EE worker has joined. Capture records its dimensions, VBlank, source/display framebuffer, pixel hash and nonblack count, and writes a new lossless PPM without overwriting existing files. Synthetic fixture captures remain test evidence only. Screenshots under `docs/screenshots/` require an actual original-program run, exact RGB identity with its raw capture and visual review; the current image shows the Gathering startup splash. Headless captures can therefore exist while the window-presentation counter remains zero.
+
+Failure reports also include bounded snapshots of EE threads, semaphores, registers/stack and IOP modules/services after execution has stopped. Verified ELF symbols drive address lookup; diagnostics do not dereference arbitrary host pointers or trigger reads through device MMIO handlers.
 
 Tests use constructed input bytes. They cover malformed discs/ELFs, source provenance, real runtime memory/scheduling, missing dispatch and upstream instruction regressions. PCSX2 differential tests, visual/audio comparisons, mission completion and Apple Silicon performance measurements require the original game running in both environments; none is inferred from unit-test totals.
 

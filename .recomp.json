@@ -12,9 +12,8 @@
     "elf_sha256": "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f",
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
-  "target": {"os": "macOS", "architecture": "arm64", "application": "MafiaNative.app"},
   "status": {
-    "stage": "initialization-blocked-sif-transport",
+    "stage": "original-startup-graphics-initialization-in-progress",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -24,22 +23,56 @@
     "game_initialization_complete": false,
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
-      "subsystem": "SIF/IOP command transport",
+      "subsystem": "IOP optical file open",
       "guest_pc": "0x004057E8",
       "symbol": "sceSifSetDma",
       "branch_source_pc": "0x004079E4",
       "branch_source_symbol": "_sceSifSendCmd",
-      "command_id": "0x80000002",
-      "command_option": 0,
+      "iop_pc": "0x0004D564",
+      "iop_module": "SOUND2.IRX",
+      "import": "ioman:4",
+      "import_version": "0x0104",
+      "optical_open_mode": 0,
       "exit_code": 1,
-      "error": "Unsupported guest SIF command DMA: IOP packet receiver, bootstrap RPC services and guest EE DMAC reply path are not implemented"
+      "error": "Strict IOP execution: missing import ioman:4 version=0x104 pc=0x4d564 cause=0x0 epc=0x0"
     },
     "macos_arm64_synthetic_host_verified": true,
     "first_game_frame_verified": false,
     "macos_app_execution_verified": false,
-    "pcsx2_differential_tests_verified": false
+    "pcsx2_differential_tests_verified": false,
+    "original_startup_graphics_verified": true,
+    "startup_graphics_kind": "Gathering publisher splash",
+    "startup_screenshot": "docs/screenshots/mafia-linux-gathering.png",
+    "menu_verified": false,
+    "macos_arm64_synthetic_host_verified_patch_set": "0001-0006",
+    "latest_runtime_patch_set": "0001-0021",
+    "latest_runtime_platform": "linux-x86_64",
+    "latest_runtime_binary_sha256": "7adfd1612dbd6fdd842222d9f36d929fc67d05037abbbecafd30c13cb8168d07",
+    "updated_macos_ci_verified": false,
+    "linux_arm64_game_execution_verified": false
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,
-  "generated_game_code_in_repository": false
+  "generated_game_code_in_repository": false,
+  "targets": [
+    {
+      "os": "macOS",
+      "architecture": "arm64",
+      "application": "MafiaNative.app"
+    },
+    {
+      "os": "Linux",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "application": "MafiaNative"
+    }
+  ],
+  "retained_local_inputs": {
+    "complete_installation": false,
+    "files": 51,
+    "bytes": 693643635,
+    "complete_iso_retained": false
+  }
 }
