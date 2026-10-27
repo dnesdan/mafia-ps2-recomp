@@ -1,0 +1,673 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_sif_transfer.h b/ps2xIOP/include/ps2x/iop/iop_sif_transfer.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_sif_transfer.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace ps2x::iop
++{
++    // A captured plain-data IOP -> EE DMA. The ordered SIF transport owns
++    // these bytes after the IOP source is consumed.
++    struct SifEeTransfer
++    {
++        uint32_t address = 0;
++        std::vector<uint8_t> data;
++    };
++}
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2x/iop/iop_types.h"
++#include "ps2x/iop/iop_sif_transfer.h"
+ 
+ #include <memory>
+ #include <span>
+@@ -11,10 +12,11 @@
+ 
+ namespace ps2x::iop
+ {
+-    // One IOP -> EE transfer: optional result bytes precede either a command
+-    // packet in the negotiated receive buffer or a direct RPC completion.
++    // One ordered IOP -> EE reply: callback DMA snapshots precede result bytes
++    // and either a command packet or direct RPC completion.
+     struct SifEeReply
+     {
++        std::vector<SifEeTransfer> precedingTransfers;
+         std::vector<uint8_t> packet;
+         std::vector<uint8_t> data;
+         uint32_t dataAddress = 0u;
+@@ -67,7 +69,8 @@
+                                                uint32_t &callbackBuffer) const;
+         void validatePacketRpc(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const;
+         [[nodiscard]] std::vector<uint8_t> executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
+-                                                           std::span<const uint8_t> input, uint32_t receiveSize);
++                                                           std::span<const uint8_t> input, uint32_t receiveSize,
++                                                           std::vector<SifEeTransfer> *precedingTransfers = nullptr);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t getSifRegister(uint32_t reg);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1499,7 +1499,8 @@
+     }
+ 
+     std::vector<uint8_t> IopEmulator::executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
+-                                                    std::span<const uint8_t> input, uint32_t receiveSize)
++                                                    std::span<const uint8_t> input, uint32_t receiveSize,
++                                                    std::vector<SifEeTransfer> *precedingTransfers)
+     {
+         if (input.size() > IopMemory::RamSize)
+             throw std::runtime_error("Physical IOP packet RPC: payload size exceeds IOP RAM");
+@@ -1507,7 +1508,7 @@
+         const RestoreValue strictGuard(m_impl->strictExecution, true);
+         try
+         {
+-            return m_impl->rpc.executePacketCall(sid, server, function, input, receiveSize, *m_impl);
++            return m_impl->rpc.executePacketCall(sid, server, function, input, receiveSize, *m_impl, precedingTransfers);
+         }
+         catch (const std::exception &error)
+         {
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -2,6 +2,7 @@
+ 
+ #include "ps2x/iop/iop_host.h"
+ #include "ps2x/iop/iop_types.h"
++#include "ps2x/iop/iop_sif_transfer.h"
+ 
+ #include <cstdint>
+ #include <memory>
+@@ -43,7 +44,8 @@
+                                                uint32_t &bufferOut, uint32_t &callbackBufferOut) const;
+         void validatePacketRpc(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const;
+         [[nodiscard]] std::vector<uint8_t> executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
+-                                                          std::span<const uint8_t> input, uint32_t receiveSize);
++                                                          std::span<const uint8_t> input, uint32_t receiveSize,
++                                                          std::vector<SifEeTransfer> *precedingTransfers = nullptr);
+         void onSifTransfer(const SifTransfer &transfer);
+ 
+         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -12,6 +12,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -47,6 +48,7 @@
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
+         m_packetCallActive = false;
++        m_packetTransfers = nullptr;
+     }
+ 
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+@@ -65,7 +67,12 @@
+         case 7: // sceSifSetDma
+         {
+             if (m_packetCallActive)
+-                throw std::runtime_error("Physical IOP packet RPC: callback SIF DMA requires an ordered packet transport");
++            {
++                if (!m_packetTransfers)
++                    throw std::runtime_error("Physical IOP packet RPC: callback SIF DMA requires an ordered packet transport");
++                capturePacketDma(cpu);
++                return true;
++            }
+             constexpr uint32_t kDescriptorSize = 16u;
+             constexpr uint32_t kMaxDescriptors = 32u;
+             const uint32_t descriptorAddress = cpu.gpr[4];
+@@ -154,6 +161,69 @@
+         default:
+             return false; // resolve a real export or let the caller apply its strict/legacy missing-import policy
+         }
++    }
++
++    void IopRpcBridge::capturePacketDma(IopCpuState &cpu)
++    {
++        constexpr uint32_t kMaxDescriptors = 32u; // SIFMAN's queued tag array
++        constexpr uint32_t kEeRamSize = 32u * 1024u * 1024u;
++        const auto fail = [](const char *cause)
++        {
++            throw std::runtime_error(std::string("Physical IOP packet RPC: callback SIF DMA ") + cause);
++        };
++        const uint32_t descriptorAddress = cpu.gpr[4];
++        const uint32_t count = cpu.gpr[5];
++        if (count == 0u || count > kMaxDescriptors || (descriptorAddress & 3u) != 0u ||
++            !ownedPacketRange(m_memory, descriptorAddress, size_t(count) * 16u))
++            fail("requires a complete aligned owned descriptor array");
++        if (m_packetTransfers->size() > kMaxDescriptors - count)
++            fail("exceeds the bounded ordered descriptor queue");
++
++        size_t totalBytes = 0u;
++        for (const auto &transfer : *m_packetTransfers)
++            totalBytes += transfer.data.size();
++        std::vector<SifEeTransfer> captured;
++        captured.reserve(count);
++        for (uint32_t index = 0u; index < count; ++index)
++        {
++            std::array<uint32_t, 4u> descriptor{};
++            if (!m_memory.readRam(descriptorAddress + index * 16u, descriptor.data(), sizeof(descriptor)))
++                fail("could not read its validated descriptor");
++            const auto [source, destination, size, attributes] = descriptor;
++            // PS2SDK iop/system/sifman/src/sifman.c:sif_dma_setup_tag rounds
++            // source words and EE quadwords. Only complete plain-data qwords
++            // are modeled here; do not invent bytes for partial hardware tags.
++            if (attributes != 0u || size == 0u || (size & 15u) != 0u ||
++                (source & 3u) != 0u || (destination & 15u) != 0u)
++                fail("requires plain aligned complete-quadword data descriptors");
++            if (size > IopMemory::RamSize || !ownedPacketRange(m_memory, source, size))
++                fail("source is outside complete owned IOP RAM");
++            // SIFMAN masks the EE DMA destination with 0x1fffffff. Accept
++            // physical/KSEG0/KSEG1 and the uncached RAM mirror, never MMIO or
++            // an arbitrary segment which happens to mask to a RAM address.
++            const uint32_t segment = destination & 0xE0000000u;
++            const uint32_t physical = destination & 0x1FFFFFFFu;
++            if ((segment != 0u && segment != 0x20000000u &&
++                 segment != 0x80000000u && segment != 0xA0000000u) ||
++                physical >= kEeRamSize || size > kEeRamSize - physical)
++                fail("destination is outside complete EE RAM");
++            if (size > IopMemory::RamSize - totalBytes)
++                fail("exceeds the bounded ordered byte queue");
++            totalBytes += size;
++            SifEeTransfer transfer{physical, std::vector<uint8_t>(size)};
++            if (!m_memory.readRam(source, transfer.data.data(), size))
++                fail("could not snapshot its validated source");
++            captured.push_back(std::move(transfer));
++        }
++        // No host EE access occurs here. Once captured, source ownership has
++        // passed to the transport so DmaStat may report the IOP send complete;
++        // the EE cannot observe RPC completion until these bytes are delivered.
++        m_packetTransfers->reserve(m_packetTransfers->size() + captured.size());
++        for (auto &transfer : captured)
++            m_packetTransfers->push_back(std::move(transfer));
++        cpu.gpr[2] = m_nextDmaId++;
++        if (m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
++            m_nextDmaId = 1u;
+     }
+ 
+     bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu)
+@@ -408,7 +478,8 @@
+ 
+     std::vector<uint8_t> IopRpcBridge::executePacketCall(uint32_t sid, uint32_t serverAddress, uint32_t function,
+                                                        std::span<const uint8_t> input, uint32_t receiveSize,
+-                                                       IopGuestExecutor &executor)
++                                                       IopGuestExecutor &executor,
++                                                       std::vector<SifEeTransfer> *precedingTransfers)
+     {
+         if (input.size() > IopMemory::RamSize)
+             packetFailure(sid, "payload size exceeds IOP RAM");
+@@ -419,25 +490,36 @@
+         // The guest may register/remove services while its callback runs. Keep a
+         // value snapshot, never a map reference which that code could invalidate.
+         const RpcServer server = m_servers.at(sid);
++        std::vector<SifEeTransfer> pending;
+         struct PacketCallGuard
+         {
+-            bool &active;
+-            explicit PacketCallGuard(bool &value) : active(value) { active = true; }
+-            ~PacketCallGuard() { active = false; }
+-        } guard(m_packetCallActive);
++            IopRpcBridge &bridge;
++            PacketCallGuard(IopRpcBridge &value, std::vector<SifEeTransfer> *transfers) : bridge(value)
++            {
++                bridge.m_packetCallActive = true;
++                bridge.m_packetTransfers = transfers;
++            }
++            ~PacketCallGuard()
++            {
++                bridge.m_packetTransfers = nullptr;
++                bridge.m_packetCallActive = false;
++            }
++        } guard(*this, precedingTransfers ? &pending : nullptr);
+         if (!input.empty() && !m_memory.writeRam(server.buffer, input.data(), input.size()))
+             packetFailure(sid, "validated request copy failed");
+ 
+         const uint32_t resultAddress = executor.executeGuestFunction(server.function, function, server.buffer,
+                                                                      static_cast<uint32_t>(input.size()), 0u, server.gp);
+-        if (receiveSize == 0u)
+-            return {};
+-        if (resultAddress == 0u || !ownedPacketRange(m_memory, resultAddress, receiveSize))
++        if (receiveSize != 0u && (resultAddress == 0u || !ownedPacketRange(m_memory, resultAddress, receiveSize)))
+             packetFailure(sid, "callback did not return the complete requested result in owned IOP RAM");
+ 
+         std::vector<uint8_t> result(receiveSize);
+-        if (!m_memory.readRam(resultAddress, result.data(), result.size()))
++        if (receiveSize != 0u && !m_memory.readRam(resultAddress, result.data(), result.size()))
+             packetFailure(sid, "validated callback result read failed");
++        // Publish only after the complete callback and result validate. A guest
++        // exception, invalid result or reset cannot leak a partial EE transfer.
++        if (precedingTransfers)
++            *precedingTransfers = std::move(pending);
+         // The caller owns EE payload DMA and END-packet ordering. There are no
+         // direct EE reads/writes, zero padding, or null-result substitutions here.
+         return result;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ps2x/iop/iop_types.h"
++#include "ps2x/iop/iop_sif_transfer.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -56,7 +57,8 @@
+         void validatePacketCall(uint32_t sid, uint32_t server, uint32_t sendSize, uint32_t receiveSize) const;
+         [[nodiscard]] std::vector<uint8_t> executePacketCall(uint32_t sid, uint32_t server, uint32_t function,
+                                                            std::span<const uint8_t> input, uint32_t receiveSize,
+-                                                           IopGuestExecutor &executor);
++                                                           IopGuestExecutor &executor,
++                                                           std::vector<SifEeTransfer> *precedingTransfers = nullptr);
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+ 
+@@ -77,6 +79,7 @@
+         };
+ 
+         void validatePacketServer(const RpcServer &server) const;
++        void capturePacketDma(IopCpuState &cpu);
+ 
+         IopHost &m_host;
+         IopMemory &m_memory;
+@@ -85,5 +88,6 @@
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+         bool m_packetCallActive = false;
++        std::vector<SifEeTransfer> *m_packetTransfers = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/iop_sif_command.cpp b/ps2xIOP/src/iop_sif_command.cpp
+--- a/ps2xIOP/src/iop_sif_command.cpp
++++ b/ps2xIOP/src/iop_sif_command.cpp
+@@ -447,7 +447,8 @@
+                 throw std::runtime_error("Cannot read SIF RPC request bytes from IOP RAM");
+             reply.dataAddress = word(packet, 40u);
+             reply.data = server.guest
+-                ? m_owner->executePacketRpc(server.sid, server.address, word(packet, 32u), input, word(packet, 44u))
++                ? m_owner->executePacketRpc(server.sid, server.address, word(packet, 32u), input, word(packet, 44u),
++                                            &reply.precedingTransfers)
+                 : m_bootstrap.call(server.sid, word(packet, 32u), input, word(packet, 44u));
+             if (reply.data.size() > word(packet, 44u))
+                 throw std::runtime_error("IOP SIF RPC service exceeded the requested reply size");
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -412,10 +412,11 @@
+     }
+ 
+     std::vector<uint8_t> IopSubsystem::executePacketRpc(uint32_t sid, uint32_t server, uint32_t function,
+-                                                       std::span<const uint8_t> input, uint32_t receiveSize)
+-    {
+-        checkExecutionFailure();
+-        return m_impl->emulator.executePacketRpc(sid, server, function, input, receiveSize);
++                                                       std::span<const uint8_t> input, uint32_t receiveSize,
++                                                    std::vector<SifEeTransfer> *precedingTransfers)
++    {
++        checkExecutionFailure();
++        return m_impl->emulator.executePacketRpc(sid, server, function, input, receiveSize, precedingTransfers);
+     }
+ 
+     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -308,8 +308,21 @@
+             if (destination == 0u || !canAccessEeRange(rdram, destination, packetBytes) ||
+                 (!reply.data.empty() && !canAccessEeRange(rdram, reply.dataAddress, static_cast<uint32_t>(reply.data.size()))))
+                 throw std::runtime_error("IOP SIF reply contains an inaccessible EE destination");
++            // Validate the whole ordered reply before any EE byte changes.
++            // Callback DMA snapshots precede the ordinary result and END packet.
++            for (const auto &transfer : reply.precedingTransfers)
++            {
++                if (transfer.data.size() > PS2_RAM_SIZE ||
++                    !canAccessEeRange(rdram, transfer.address, static_cast<uint32_t>(transfer.data.size())))
++                    throw std::runtime_error("IOP SIF callback DMA contains an inaccessible EE destination");
++            }
+             if (reply.command && *getConstMemPtr(rdram, destination) != 0u)
+                 return; // The original interrupt handler has not consumed this buffer.
++            for (const auto &transfer : reply.precedingTransfers)
++            {
++                if (!writeEeRange(rdram, transfer.address, transfer.data.data(), static_cast<uint32_t>(transfer.data.size())))
++                    throw std::runtime_error("Cannot transfer IOP SIF callback data to EE memory");
++            }
+             if (!reply.data.empty() && !writeEeRange(rdram, reply.dataAddress, reply.data.data(), static_cast<uint32_t>(reply.data.size())))
+                 throw std::runtime_error("Cannot transfer IOP SIF reply data to EE memory");
+             reply.packet.resize(packetBytes, 0u);
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -25,6 +25,8 @@
+     constexpr uint32_t kClient = 0x00024000u, kRequest = 0x00025000u, kResult = 0x00026000u;
+     std::vector<uint32_t> receivedValues;
+     std::vector<uint32_t> receivedRpcResults;
++    constexpr uint32_t kSecondaryResult = 0x00027000u;
++    std::vector<uint32_t> receivedSecondaryResults;
+ 
+     void put(std::vector<uint8_t> &bytes, size_t offset, uint32_t value)
+     {
+@@ -107,6 +109,56 @@
+         return relocatedRpcServer(sid, reply, 0x20000u);
+     }
+ 
++    iop_test::Irx secondaryDmaServer(uint32_t sid,
++                                    std::array<uint32_t, 4> descriptor = {0x10420u, kSecondaryResult, 16u, 0u},
++                                    uint32_t count = 1u, uint32_t calls = 1u,
++                                    uint32_t descriptorAddress = 0x10600u, bool stackSource = false,
++                                    unsigned failure = 0u)
++    {
++        auto image = iop_test::rpcServer(sid, 0x76543210u);
++        image.bytes.resize(0x900u, 0u);
++        put(image.bytes, 68u, 0x800u);
++        put(image.bytes, 72u, 0x800u);
++        image.words(0x100u, {0x41E00000u, 0u, 0x0101u, 0x6D666973u, 0x00006E61u,
++            0x03E00008u, 0x24000007u, 0x03E00008u, 0x24000008u, 0u, 0u});
++        uint32_t cursor = 0x300u;
++        const auto emit = [&](std::initializer_list<uint32_t> words)
++        {
++            image.words(cursor, words);
++            cursor += static_cast<uint32_t>(words.size() * 4u);
++        };
++        // Authored callback saves its link/counter, emits plain SIFMAN DMA,
++        // polls DmaStat, then deliberately overwrites the transferred source.
++        emit({0x27BDFFC0u, 0xAFBF003Cu, 0xAFB00038u});
++        if (stackSource)
++            emit({0x3C080001u, 0x35080600u, 0x27A90010u, 0xAD090000u,
++                  0x3C0AAABBu, 0x354ACCDDu, 0xAFAA0010u});
++        emit({0x24100000u | calls});
++        const uint32_t loop = cursor;
++        emit({0x3C040000u | (descriptorAddress >> 16u), 0x34840000u | (descriptorAddress & 0xFFFFu),
++              0x24050000u | count, 0x0C004045u, 0u, // SetDma at 0x10114
++              0x00402021u, 0x0C004047u, 0u,       // DmaStat at 0x1011c
++              0x3C080001u, 0xAD020470u, 0x2610FFFFu});
++        const int32_t offset = (static_cast<int32_t>(loop) - static_cast<int32_t>(cursor + 4u)) / 4;
++        emit({0x16000000u | (static_cast<uint32_t>(offset) & 0xFFFFu), 0u});
++        if (stackSource)
++            emit({0xAFA00010u});
++        else
++            emit({0xAD000420u});
++        if (failure == 1u)
++            emit({0x0000000Cu});
++        emit({0x8FB00038u, 0x8FBF003Cu, 0x27BD0040u,
++              failure == 2u ? 0x00001021u : 0x3C020001u,
++              failure == 2u ? 0u : 0x34420400u, 0x03E00008u, 0u});
++        for (uint32_t index = 0u; index < 192u; ++index)
++            image.bytes[0x100u + 0x420u + index] = static_cast<uint8_t>(index + 1u);
++        image.words(0x420u, {0xAABBCCDDu});
++        image.words(0x440u, {0x11223344u});
++        for (uint32_t index = 0u; index < 32u; ++index)
++            image.words(0x600u + index * 16u, {descriptor[0], descriptor[1], descriptor[2], descriptor[3]});
++        return image;
++    }
++
+     struct ResetImageFixture
+     {
+         PS2Runtime::IoPaths saved = PS2Runtime::getIoPaths();
+@@ -178,6 +230,7 @@
+                 // A guest END callback observes DMA result bytes before its
+                 // completion semaphore is signaled, as in the original SDK.
+                 receivedRpcResults.push_back(word(rdram, word(local.data(), 4u)));
++                receivedSecondaryResults.push_back(word(rdram, kSecondaryResult));
+                 const int32_t semaphore = static_cast<int32_t>(word(rdram, client + 8u));
+                 if (semaphore >= 0)
+                     (void)runtime->eeScheduler().signalSemaphore(semaphore, true);
+@@ -200,6 +253,7 @@
+             ps2_stubs::resetSifState();
+             receivedValues.clear();
+             receivedRpcResults.clear();
++            receivedSecondaryResults.clear();
+             runtime.setMissingFunctionPolicy(PS2Runtime::MissingFunctionPolicy::Stop);
+             runtime.registerFunction(kMain, mainStop);
+             runtime.registerFunction(kHandler, guestCommandHandler);
+@@ -880,6 +934,238 @@
+             }
+         });
+ 
++        tc.Run("physical callback DMA captures stack bytes before reuse and precedes END observation", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            const auto image = secondaryDmaServer(sid, {0u, kSecondaryResult, 16u, 0u}, 1u, 1u, 0x10600u, true);
++            t.IsTrue(env.iop().loadModuleImage("stack-dma.irx", image.bytes).moduleId > 0, "register actual authored callback");
++            const auto server = env.bindService(sid);
++            const int semaphore = env.runtime.eeScheduler().createSemaphore(0, 1, 0u, 0u);
++            std::memcpy(env.rdram.data() + kClient + 8u, &semaphore, sizeof(semaphore));
++            env.submitRpc(server, 0u, {}, 4u);
++            uint32_t dmaStatus = 0u;
++            t.IsTrue(env.runtime.readIopMemory(0x10470u, &dmaStatus, 4u) && dmaStatus == 0xFFFFFFFFu,
++                     "source ownership passes to queued DMA before the original DmaStat poll returns");
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "unarmed SIF0 cannot expose callback bytes");
++            env.installHandler();
++            env.arm();
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "stack reuse must not replace the snapshot");
++            t.Equals(word(env.rdram.data(), kResult), 0x76543210u, "ordinary result follows the callback DMA");
++            t.IsTrue(receivedRpcResults.empty() && env.runtime.eeScheduler().pollSemaphore(semaphore) < 0,
++                     "transport alone cannot run END or signal its semaphore");
++            env.runtime.eeScheduler().run();
++            t.IsTrue(receivedSecondaryResults == std::vector<uint32_t>{0xAABBCCDDu} &&
++                     receivedRpcResults == std::vector<uint32_t>{0x76543210u}, "guest END observes both actual payloads");
++            t.Equals(env.runtime.eeScheduler().pollSemaphore(semaphore), semaphore, "only original END signals completion");
++        });
++
++        tc.Run("physical callback DMA preserves all bytes of a 192-byte parameter block", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 192u, 0u});
++            const std::vector<uint8_t> expected(image.bytes.begin() + 0x520u, image.bytes.begin() + 0x5E0u);
++            t.IsTrue(env.iop().loadModuleImage("parameter-dma.irx", image.bytes).moduleId > 0, "register parameter producer");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 4u, 0u);
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "data cannot bypass unarmed transport");
++            env.arm();
++            t.IsTrue(std::equal(expected.begin(), expected.end(), env.rdram.begin() + kSecondaryResult),
++                     "source mutation after SetDma must not change any captured parameter byte");
++            t.Equals(word(env.rdram.data(), kRequest + 24u), 0u, "rmode0 completes the original request after both data blocks");
++            t.IsTrue(receivedRpcResults.empty(), "rmode0 cannot fabricate an END callback");
++        });
++
++        tc.Run("physical callback DMA accepts RAM aliases with hardware destination normalization", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (uint32_t sourceAlias : {0u, 0x80000000u, 0xA0000000u})
++                for (uint32_t destinationAlias : {0u, 0x20000000u, 0x80000000u, 0xA0000000u})
++                {
++                    PacketEnv env;
++                    const auto image = secondaryDmaServer(sid,
++                        {sourceAlias | 0x10420u, destinationAlias | kSecondaryResult, 16u, 0u},
++                        1u, 1u, sourceAlias | 0x10600u);
++                    t.IsTrue(env.iop().loadModuleImage("aliased-dma.irx", image.bytes).moduleId > 0, "register alias producer");
++                    const auto server = env.bindService(sid);
++                    env.submitRpc(server, 0u, {}, 4u, 0u);
++                    env.arm();
++                    t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "valid aliases reach the same EE RAM bytes");
++                }
++        });
++
++        tc.Run("physical callback DMA preserves descriptor order and ordinary result precedence", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 3u);
++            image.words(0x610u, {0x10440u, kSecondaryResult, 16u, 0u});
++            image.words(0x620u, {0x10420u, kResult, 16u, 0u});
++            t.IsTrue(env.iop().loadModuleImage("ordered-dma.irx", image.bytes).moduleId > 0, "register ordered producer");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 4u, 0u);
++            env.arm();
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0x11223344u, "later descriptors overwrite earlier data in issue order");
++            t.Equals(word(env.rdram.data(), kResult), 0x76543210u, "main result follows every callback descriptor");
++        });
++
++        tc.Run("physical callback DMA waits for DMAC enable handler and free receive buffer", [](TestCase &t)
++        {
++            for (unsigned gate = 0u; gate < 3u; ++gate)
++            {
++                PacketEnv env;
++                constexpr uint32_t sid = 0x80001234u;
++                const auto image = secondaryDmaServer(sid);
++                t.IsTrue(env.iop().loadModuleImage("gated-dma.irx", image.bytes).moduleId > 0, "register gated producer");
++                const auto server = env.bindService(sid);
++                env.submitRpc(server, 0u, {}, 4u);
++                env.installHandler(gate != 1u);
++                if (gate == 0u) env.runtime.memory().m_ioRegisters[0x1000E000u] = 0u;
++                if (gate == 2u) env.rdram[kReceive] = 16u;
++                env.arm();
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "a blocked completion cannot leak secondary data");
++                t.Equals(word(env.rdram.data(), kResult), 0u, "a blocked completion cannot leak main result data");
++                if (gate == 0u) env.runtime.memory().m_ioRegisters[0x1000E000u] = 1u;
++                if (gate == 1u) env.runtime.eeScheduler().setIrqCauseEnabled(true, 5u, true);
++                if (gate == 2u) env.rdram[kReceive] = 0u;
++                ps2_stubs::pumpSifCommands(env.rdram.data(), &env.runtime);
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "unblocking the actual receiver releases its queued data");
++            }
++        });
++
++        tc.Run("invalid callback DMA rejects the whole batch without EE writes or completion", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            const std::array<std::array<uint32_t, 4>, 14> invalid{{
++                {0x10420u, kSecondaryResult, 16u, 4u},
++                {0x10420u, kSecondaryResult, 16u, 0x40u},
++                {0x10420u, kSecondaryResult, 17u, 0u},
++                {0x10420u, kSecondaryResult, 0u, 0u},
++                {0x10422u, kSecondaryResult, 16u, 0u},
++                {0x40010420u, kSecondaryResult, 16u, 0u},
++                {0x10800u, kSecondaryResult, 16u, 0u},
++                {0x801FFFF0u, kSecondaryResult, 32u, 0u},
++                {0x10420u, kSecondaryResult + 1u, 16u, 0u},
++                {0x10420u, 0x01FFFFF0u, 32u, 0u},
++                {0x10420u, 0x22000000u, 16u, 0u},
++                {0x10420u, 0x30027000u, 16u, 0u},
++                {0x10420u, 0x40027000u, 16u, 0u},
++                {0x10420u, 0x10000000u, 16u, 0u},
++            }};
++            for (const auto &bad : invalid)
++            {
++                PacketEnv env;
++                auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 2u);
++                image.words(0x610u, {bad[0], bad[1], bad[2], bad[3]});
++                t.IsTrue(env.iop().loadModuleImage("bad-dma.irx", image.bytes).moduleId > 0, "register invalid-descriptor producer");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u); }
++                catch (const std::runtime_error &error)
++                { failed = std::string(error.what()).find("callback SIF DMA") != std::string::npos; }
++                t.IsTrue(failed, "unsupported/malformed descriptor remains a strict failure");
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "valid descriptor before a bad one cannot write EE");
++                t.Equals(word(env.rdram.data(), kResult), 0u, "invalid secondary DMA cannot publish an RPC result");
++                bool sticky = false;
++                try { env.iop().checkExecutionFailure(); }
++                catch (const std::runtime_error &) { sticky = true; }
++                t.IsTrue(sticky && env.rdram[kReceive] == 0u, "invalid secondary DMA stays failed without END");
++            }
++        });
++
++        tc.Run("callback DMA validates complete descriptor ownership and bounded queue capacity", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (const auto [address, count, calls] : std::array<std::array<uint32_t, 3>, 6>{{
++                {0x10601u, 1u, 1u}, {0x40010600u, 1u, 1u}, {0x107F0u, 2u, 1u},
++                {0x10600u, 0u, 1u}, {0x10600u, 33u, 1u}, {0x10600u, 1u, 33u}}})
++            {
++                PacketEnv env;
++                const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, count, calls, address);
++                t.IsTrue(env.iop().loadModuleImage("descriptor-bounds.irx", image.bytes).moduleId > 0, "register bounds producer");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u); }
++                catch (const std::runtime_error &) { failed = true; }
++                t.IsTrue(failed, "invalid array or exhausted queue must fail before publication");
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "queued captures cannot escape a later failed descriptor call");
++            }
++            PacketEnv env;
++            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 1u, 32u);
++            t.IsTrue(env.iop().loadModuleImage("full-queue.irx", image.bytes).moduleId > 0, "register exact-bound producer");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 4u, 0u);
++            env.arm();
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "the exact 32-descriptor bound remains valid");
++        });
++
++        tc.Run("callback DMA with no ordinary receive bytes still precedes direct completion", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 1u, 1u, 0x10600u, false, 2u);
++            t.IsTrue(env.iop().loadModuleImage("void-dma.irx", image.bytes).moduleId > 0, "register void result producer");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 0u, 0u);
++            env.arm();
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "zero receive size cannot drop secondary data");
++            t.Equals(word(env.rdram.data(), kResult), 0u, "void result cannot invent ordinary output");
++            t.Equals(word(env.rdram.data(), kRequest + 24u), 0u, "direct completion follows captured DMA");
++        });
++
++        tc.Run("callback DMA bounds cumulative snapshot bytes before publication", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 5u);
++            t.IsTrue(env.iop().loadModuleImage("large-dma.irx", image.bytes).moduleId > 0, "register byte-bound producer");
++            const auto source = env.runtime.allocateIopMemory(0x80000u, 16u);
++            t.IsTrue(source != 0u, "allocate a real owned half-MiB source");
++            const std::array<uint32_t, 4> descriptor{source, kSecondaryResult, 0x80000u, 0u};
++            for (uint32_t index = 0u; index < 5u; ++index)
++                t.IsTrue(env.runtime.writeIopMemory(0x10600u + index * 16u, descriptor.data(), sizeof(descriptor)),
++                         "prepare complete live source descriptors");
++            const auto server = env.bindService(sid);
++            bool failed = false;
++            try { env.submitRpc(server, 0u, {}, 4u); }
++            catch (const std::runtime_error &error)
++            { failed = std::string(error.what()).find("bounded ordered byte queue") != std::string::npos; }
++            t.IsTrue(failed, "captured bytes cannot grow beyond one IOP RAM image per reply");
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "exhaustion cannot expose earlier captures");
++        });
++
++        tc.Run("callback failure or reset discards already captured secondary DMA", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (unsigned failure : {1u, 2u})
++            {
++                PacketEnv env;
++                const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 1u, 1u, 0x10600u, false, failure);
++                t.IsTrue(env.iop().loadModuleImage("failed-callback.irx", image.bytes).moduleId > 0, "register failing callback");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u); }
++                catch (const std::runtime_error &) { failed = true; }
++                t.IsTrue(failed, "original exception or invalid result cannot complete the RPC");
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "callback failure discards prior captures");
++                bool sticky = false;
++                try { env.iop().checkExecutionFailure(); }
++                catch (const std::runtime_error &) { sticky = true; }
++                t.IsTrue(sticky && env.rdram[kReceive] == 0u, "callback failure remains sticky without END");
++            }
++            PacketEnv env;
++            const auto image = secondaryDmaServer(sid);
++            t.IsTrue(env.iop().loadModuleImage("reset-callback.irx", image.bytes).moduleId > 0, "register reset producer");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 4u, 0u);
++            PS2IopTransport::reset(&env.runtime);
++            env.arm();
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "reset discards stale callback transfers");
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(!env.iop().peekSifReply(reply), "reset also discards completion and old server state");
++        });
++
+         tc.Run("IOP reset discards packet replies and bindings before a new handshake", [](TestCase &t)
+         {
+             PacketEnv env;

@@ -62,6 +62,7 @@ Built analyzer/recompiler binaries also have a stamp covering their hashes, the 
 | `0027` | Own EE callback stacks outside application stacks and heaps; preserve the original kernel-patch workspace, check aliases and declared ranges, and coordinate stack leases with scheduler reset and owner lifetime. |
 | `0028` | Implement the CDVDMAN mode-2 tray-change query with a consumed notification, validated output and original guest-export precedence. Physical tray motion remains unresolved. |
 | `0029` | Select idle EE events by their guest-cycle deadlines before host-clock tie breaking, preventing an overdue host event from skipping earlier periodic timer callbacks. Preserve host wait pacing. |
+| `0030` | Capture owned secondary IOP-to-EE DMA from original RPC callbacks and deliver it before the ordinary result and completion packet. Validate all destinations before writing, preserve SIF0/DMAC gates, and discard queued replies on reset. Unsupported attributes and partial quadwords remain errors. |
 
 The patches apply in order to the locked revision. Regression tests use constructed input. `patches/tests/check_integer_codegen.py` compiles code emitted by the real translator and executes signed-boundary cases under UBSan. The upstream `ps2x_tests` executable must be run directly from the upstream source directory; its separate GS-cache CTest directory does not run that executable.
 
