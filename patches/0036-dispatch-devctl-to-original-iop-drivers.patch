@@ -1,0 +1,792 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
+@@ -12,6 +12,7 @@
+ #include <exception>
+ #include <filesystem>
+ #include <limits>
++#include <optional>
+ #include <stdexcept>
+ #include <string_view>
+ 
+@@ -65,6 +66,52 @@
+             return device.starts_with(name) &&
+                    std::all_of(device.begin() + static_cast<std::ptrdiff_t>(name.size()), device.end(),
+                                [](char value) { return value == '0'; });
++        }
++
++        struct DevctlDevicePath
++        {
++            std::string_view name;
++            uint32_t unit = 0u;
++            uint32_t suffixOffset = 0u;
++        };
++
++        std::optional<DevctlDevicePath> devctlDevicePath(std::string_view path)
++        {
++            // IOMAN parsefile trims spaces, removes a trailing decimal unit,
++            // and compares the device name exactly. The suffix stays in RAM.
++            // https://ps2dev.github.io/ps2sdk/ioman_x_8c_source.html (parsefile)
++            const size_t first = path.find_first_not_of(' ');
++            const size_t colon = path.find(':', first);
++            if (first == std::string_view::npos || colon == std::string_view::npos ||
++                colon == first || colon - first > 31u)
++                return std::nullopt;
++            size_t unitStart = colon;
++            while (unitStart > first && path[unitStart - 1u] >= '0' && path[unitStart - 1u] <= '9')
++                --unitStart;
++            if (unitStart == first)
++                return std::nullopt;
++            uint32_t unit = 0u;
++            for (size_t i = unitStart; i < colon; ++i)
++            {
++                const uint32_t digit = static_cast<uint32_t>(path[i] - '0');
++                if (unit > (static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) - digit) / 10u)
++                    throw std::runtime_error("IOP Devctl unit exceeds the signed IOMAN range");
++                unit = unit * 10u + digit;
++            }
++            return DevctlDevicePath{path.substr(first, unitStart - first), unit,
++                                    static_cast<uint32_t>(colon + 1u)};
++        }
++
++        std::array<uint32_t, 2u> devctlOutputArguments(const IopMemory &memory, uint32_t stack)
++        {
++            if ((stack & 3u) != 0u)
++                throw std::runtime_error("IOP Devctl argument stack is not word aligned");
++            // O32's first four home slots need not have initialized contents.
++            // Validate the whole physical span before offset arithmetic, then
++            // require ownership only for the two argument words actually read.
++            requireRamSpan(stack, 24u, "argument stack");
++            requireOwnedRam(memory, stack + 16u, 8u, "argument words");
++            return {memory.read32(stack + 16u), memory.read32(stack + 20u)};
+         }
+ 
+         uint64_t fileBufferOwner(const IopMemory &memory, uint32_t address, size_t size)
+@@ -443,33 +490,76 @@
+         case 31: // devctl(name, cmd, arg, arglen, output, outputlen)
+         {
+             // IOMAN 1.4 uses the extended ABI also documented by IOMANX.
++            // A registered driver receives seven arguments, including the
++            // temporary file record and the untouched path after its colon.
++            // https://ps2dev.github.io/ps2sdk/ioman_x_8c_source.html (iomanX_devctl)
++            if (m_devices.empty() && cpu.gpr[5] != 0x4391u)
++                return false;
++            const std::string path = devctlPath(m_memory, a0);
++            const auto parsed = devctlDevicePath(path);
++            const auto found = std::find_if(m_devices.begin(), m_devices.end(),
++                [&](const Device &device) { return parsed && device.name == parsed->name; });
++            if (found != m_devices.end())
++            {
++                // Guest callbacks can add/remove devices. Retain no vector
++                // references or iterators across execution of original code.
++                const Device device = *found;
++                if ((device.address & 3u) != 0u)
++                    throw std::runtime_error("IOP Devctl device record is not word aligned");
++                requireOwnedRam(m_memory, device.address, 20u, "device record");
++                if ((m_memory.read32(device.address + 4u) & 0xF0000000u) != 0x10000000u)
++                {
++                    setV0(static_cast<uint32_t>(-48)); // EUNSUP: no extended device operations.
++                    return true;
++                }
++                const uint32_t operations = m_memory.read32(device.address + 16u);
++                if ((operations & 3u) != 0u)
++                    throw std::runtime_error("IOP Devctl operations table is not word aligned");
++                requireOwnedRam(m_memory, operations, 24u * 4u, "operations table");
++                const uint32_t callback = m_memory.read32(operations + 23u * 4u);
++                if ((callback & 3u) != 0u)
++                    throw std::runtime_error("IOP Devctl callback is not word aligned");
++                requireOwnedRam(m_memory, callback, 4u, "callback");
++                const auto [output, outputBytes] = devctlOutputArguments(m_memory, cpu.gpr[29]);
++                const uint32_t input = cpu.gpr[6], inputBytes = cpu.gpr[7];
++                if (inputBytes != 0u)
++                    requireOwnedRam(m_memory, input, inputBytes, "input payload");
++                if (outputBytes != 0u)
++                    requireOwnedRam(m_memory, output, outputBytes, "output payload");
++
++                // This record lives only for the synchronous device operation.
++                // An identity guard must not free a replacement allocation if
++                // a nested guest call deliberately releases/reuses its address.
++                const uint32_t file = m_memory.allocate(16u);
++                if (file == 0u)
++                    throw std::runtime_error("IOP Devctl temporary file allocation failed");
++                const uint64_t identity = m_memory.allocationContaining(file)->identity;
++                struct FileRecordGuard
++                {
++                    IopMemory &memory;
++                    uint32_t address;
++                    uint64_t identity;
++                    ~FileRecordGuard() { (void)memory.freeAllocation(address, identity); }
++                } guard{m_memory, file, identity};
++                m_memory.write32(file, 0u);
++                m_memory.write32(file + 4u, parsed->unit);
++                m_memory.write32(file + 8u, device.address);
++                m_memory.write32(file + 12u, 0u);
++                const std::array<uint32_t, 3u> stackArguments{inputBytes, output, outputBytes};
++                setV0(executor.executeGuestFunctionWithStackArguments(callback, file,
++                    a0 + parsed->suffixOffset, cpu.gpr[5], input, device.gp, stackArguments));
++                return true;
++            }
++
+             // CDVD command 0x4391 returns sceCdSC(-11), the existing interrupt
+             // event flag; it does not signal power-off or complete an operation.
+             // https://ps2dev.github.io/ps2sdk/ioman_x_8h_source.html
+             // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html
+-            if (cpu.gpr[5] != 0x4391u)
+-                return false;
+-            const std::string path = devctlPath(m_memory, a0);
+-            if (!isModeledCdromUnit(path))
+-                return false;
+-            // A registered original driver must not be silently replaced by
+-            // this modeled device route. Leave it to a genuine export handler.
+-            if (std::any_of(m_devices.begin(), m_devices.end(),
+-                            [](const Device &device) { return device.name == "cdrom"; }))
++            if (cpu.gpr[5] != 0x4391u || !isModeledCdromUnit(path))
+                 return false;
+             if (cpu.gpr[7] != 0u)
+                 throw std::runtime_error("IOP CDVD Devctl 0x4391 does not support an input payload");
+-            const uint32_t stack = cpu.gpr[29];
+-            if ((stack & 3u) != 0u)
+-                throw std::runtime_error("IOP Devctl argument stack is not word aligned");
+-            // O32 reserves four register-argument slots at sp, but callers do
+-            // not have to initialize them. Validate the complete physical
+-            // span before offset arithmetic, then only require ownership for
+-            // the fifth and sixth arguments actually read by this import.
+-            requireRamSpan(stack, 24u, "argument stack");
+-            requireOwnedRam(m_memory, stack + 16u, 8u, "argument words");
+-            const uint32_t output = m_memory.read32(stack + 16u);
+-            const uint32_t outputBytes = m_memory.read32(stack + 20u);
++            const auto [output, outputBytes] = devctlOutputArguments(m_memory, cpu.gpr[29]);
+             if ((output & 3u) != 0u || outputBytes < 4u)
+                 throw std::runtime_error("IOP CDVD Devctl event output requires an aligned four-byte result");
+             requireOwnedRam(m_memory, output, outputBytes, "event output");
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -771,7 +771,12 @@
+                     break;
+                 }
+             }
+-            if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
++            // A supplied IOMAN devctl export owns its own device registry and
++            // argument policy. Only model the 1.x fallback when none resolves.
++            if (iequals(call.library, "ioman") &&
++                (call.ordinal != 31u || ((call.version >> 8u) == 1u &&
++                    imports.resolve(call.library, call.ordinal, call.version) == 0u)) &&
++                ioman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "sifman") && rpc.dispatchSifManImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+@@ -924,9 +929,14 @@
+                               uint32_t a2,
+                               uint32_t a3,
+                               uint32_t gp,
+-                              uint32_t budget = kMaxCallInstructions)
++                              uint32_t budget = kMaxCallInstructions,
++                              std::span<const uint32_t> stackArguments = {})
+         {
+             checkExecutionFailure();
++            // The fresh callback frame reserves 32 bytes: four O32 register
++            // home slots followed by at most four additional argument words.
++            if (stackArguments.size() > 4u)
++                throw std::runtime_error("IOP guest call exceeds its bounded O32 argument area");
+             const RestoreValue strictGuard(strictExecution, strictExecution || strictAddress(address));
+             struct CallDepthGuard
+             {
+@@ -943,7 +953,7 @@
+             cpu.gpr[6] = a2;
+             cpu.gpr[7] = a3;
+             cpu.gpr[28] = gp;
+-            if (strictExecution && depth >= kCallStackCapacity)
++            if ((strictExecution || !stackArguments.empty()) && depth >= kCallStackCapacity)
+                 executionFailure("bounded call stack exhausted", cpu);
+             if (depth < kCallStackCapacity)
+             {
+@@ -961,6 +971,8 @@
+             {
+                 cpu.gpr[29] = kCallStackBase - 32u;
+             }
++            for (size_t i = 0u; i < stackArguments.size(); ++i)
++                memory.write32(cpu.gpr[29] + 16u + static_cast<uint32_t>(i) * 4u, stackArguments[i]);
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
+             if (strictExecution && (cpu.pc != kCallReturnSentinel || cpu.branchPending || cpu.yielded))
+@@ -989,6 +1001,13 @@
+                                                 uint32_t instructionBudget) override
+         {
+             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
++        }
++
++        uint32_t executeGuestFunctionWithStackArguments(
++            uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++            uint32_t gp, std::span<const uint32_t> stackArguments) override
++        {
++            return callFunction(address, a0, a1, a2, a3, gp, kMaxCallInstructions, stackArguments);
+         }
+ 
+         void serviceVblankCallbacks()
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -6,6 +6,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <span>
++#include <stdexcept>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -39,6 +40,14 @@
+                                                                       uint32_t gp,
+                                                                       uint32_t instructionBudget)
+         {
++            return executeGuestFunction(address, a0, a1, a2, a3, gp);
++        }
++        [[nodiscard]] virtual uint32_t executeGuestFunctionWithStackArguments(
++            uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++            uint32_t gp, std::span<const uint32_t> stackArguments)
++        {
++            if (!stackArguments.empty())
++                throw std::runtime_error("IOP guest executor does not support stack arguments");
+             return executeGuestFunction(address, a0, a1, a2, a3, gp);
+         }
+     };
+diff --git a/ps2xIOP/tests/iop_ioman_devctl_tests.cpp b/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
+--- a/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
++++ b/ps2xIOP/tests/iop_ioman_devctl_tests.cpp
+@@ -8,6 +8,8 @@
+ #include "iop_compat_test_support.h"
+ 
+ #include <functional>
++#include <tuple>
++#include "iop_ioman_driver_fixtures.h"
+ 
+ namespace
+ {
+@@ -211,8 +213,9 @@
+         require(f.ioman.dispatchImport(20u, add, f.executor) && add.gpr[2] == 0u,
+                 "could not register authored original-driver metadata");
+         cpu.gpr[5] = 0x4391u;
+-        require(!f.ioman.dispatchImport(31u, cpu, f.executor),
+-                "modeled CDVD query silently replaced a registered original device");
++        require(f.ioman.dispatchImport(31u, cpu, f.executor) &&
++                    static_cast<int32_t>(cpu.gpr[2]) == -48,
++                "legacy registered device did not reject its unsupported extended operation");
+     }
+ 
+     void deletedEventAndResetLifetime()
+@@ -302,6 +305,14 @@
+         {"Unsupported devices and commands remain unhandled", unsupportedRoutesRemainUnhandled},
+         {"Deleted CDVD events fail until normal reset", deletedEventAndResetLifetime},
+         {"Authored IOP Devctl and SC imports share a live event", authoredImportsUseRealO32Arguments},
++        {"Registered Devctl preserves exact units, aliases and opaque buffers", iop_devctl_test::deviceNamesUnitsAliasesAndOpaqueBuffers},
++        {"Registered Devctl rejects unsupported operations without device aliases", iop_devctl_test::registeredUnsupportedAndExactRouting},
++        {"Malformed driver calls fail before callback or temporary allocation", iop_devctl_test::invalidDriverArgumentsFailBeforeExecution},
++        {"Temporary driver records survive recursive removal and unwind safely", iop_devctl_test::temporaryRecordCleanupAndRecursiveMutation},
++        {"Authored original drivers receive seven O32 arguments and retain returns", iop_devctl_test::authoredDriverReceivesSevenO32Arguments},
++        {"Nested authored driver calls preserve independent O32 stacks", iop_devctl_test::nestedAuthoredDriverCallsKeepIndependentStacks},
++        {"Compatible original IOMAN exports precede modeled pointer validation", iop_devctl_test::suppliedIomanExportRunsBeforeModeledValidation},
++        {"Original registered-driver instruction faults remain strict", iop_devctl_test::originalDriverFaultsRemainStrict},
+     };
+     return iop_test::run(tests);
+ }
+diff --git a/ps2xIOP/tests/iop_ioman_driver_fixtures.h b/ps2xIOP/tests/iop_ioman_driver_fixtures.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_ioman_driver_fixtures.h
+@@ -0,0 +1,496 @@
++#pragma once
++
++#include <limits>
++
++namespace iop_devctl_test
++{
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++
++    struct DriverCall
++    {
++        uint32_t address = 0u, gp = 0u;
++        std::array<uint32_t, 7u> arguments{};
++    };
++
++    class RecordingExecutor final : public IopGuestExecutor
++    {
++    public:
++        uint32_t executeGuestFunction(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override
++        {
++            throw std::runtime_error("unexpected four-argument driver call");
++        }
++
++        // Kept callable against the prior executor interface for the same
++        // authored test program's failing-baseline build.
++        virtual uint32_t executeGuestFunctionWithStackArguments(
++            uint32_t address, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
++            uint32_t gp, std::span<const uint32_t> tail)
++        {
++            require(tail.size() == 3u, "driver did not receive all three O32 stack arguments");
++            last = {address, gp, {a0, a1, a2, a3, tail[0], tail[1], tail[2]}};
++            ++calls;
++            return callback ? callback(last) : 0xFFFFFF85u;
++        }
++
++        DriverCall last;
++        size_t calls = 0u;
++        std::function<uint32_t(const DriverCall &)> callback;
++    };
++
++    struct RegisteredFixture
++    {
++        static constexpr uint32_t name = 0x13000u, device = 0x13100u, ops = 0x13200u;
++        static constexpr uint32_t function = 0x13300u, path = 0x14000u, stack = 0x15000u;
++        static constexpr uint32_t input = 0x16000u, output = 0x17000u, gp = 0x13572468u;
++        iop_test::Host host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopCdvd cdvd{host, memory, kernel};
++        IopIoman ioman{host, memory, cdvd};
++        RecordingExecutor executor;
++
++        RegisteredFixture()
++        {
++            text(name, "authored");
++            require(memory.zeroRam(device, 20u) && memory.zeroRam(ops, 96u), "driver metadata setup failed");
++            memory.write32(device, name);
++            memory.write32(device + 4u, 0x10000010u);
++            memory.write32(device + 16u, ops);
++            memory.write32(ops + 92u, function);
++            memory.write32(function, 0x03E00008u);
++            add();
++        }
++
++        void text(uint32_t address, std::string_view value)
++        {
++            require(memory.writeRam(address, value.data(), value.size()), "string setup failed");
++            memory.write8(address + static_cast<uint32_t>(value.size()), 0u);
++        }
++
++        void add()
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = device;
++            cpu.gpr[28] = gp;
++            require(ioman.dispatchImport(20u, cpu, executor) && cpu.gpr[2] == 0u, "authored driver registration failed");
++        }
++
++        IopCpuState arguments(std::string_view value = "authored12:MiXeD/opaque", uint32_t alias = 0u)
++        {
++            text(alias | path, value);
++            require(memory.zeroRam(stack, 24u) && memory.zeroRam(input, 20u) && memory.zeroRam(output, 12u),
++                    "driver argument setup failed");
++            memory.write32(stack + 16u, alias | output);
++            memory.write32(stack + 20u, 12u);
++            IopCpuState cpu{};
++            cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = alias | path;
++            cpu.gpr[5] = 0x4396u;
++            cpu.gpr[6] = alias | input;
++            cpu.gpr[7] = 20u;
++            cpu.gpr[28] = 0x24681357u;
++            cpu.gpr[29] = alias | stack;
++            return cpu;
++        }
++
++        void invoke(IopCpuState &cpu)
++        {
++            require(ioman.dispatchImport(31u, cpu, executor), "registered device devctl was unresolved");
++        }
++    };
++
++    void deviceNamesUnitsAliasesAndOpaqueBuffers()
++    {
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            for (const auto &[path, unit] : {std::pair{"authored:", 0u}, {"authored0003:MiXeD/opaque", 3u},
++                                            {"  authored12:MiXeD/opaque", 12u}})
++            {
++                RegisteredFixture f;
++                auto cpu = f.arguments(path, alias);
++                const auto before = cpu;
++                const uint32_t freeBefore = f.memory.totalFreeMemory();
++                f.executor.callback = [&](const DriverCall &call)
++                {
++                    const uint32_t file = call.arguments[0];
++                    require(f.memory.read32(file) == 0u && f.memory.read32(file + 4u) == unit &&
++                                f.memory.read32(file + 8u) == f.device && f.memory.read32(file + 12u) == 0u,
++                            "temporary IOMAN file record has incorrect fields");
++                    require(call.address == f.function && call.gp == f.gp &&
++                                call.arguments[1] == (alias | (f.path + std::string_view(path).find(':') + 1u)) &&
++                                call.arguments[2] == 0x4396u && call.arguments[3] == (alias | f.input) &&
++                                call.arguments[4] == 20u && call.arguments[5] == (alias | f.output) &&
++                                call.arguments[6] == 12u,
++                            "device dispatch normalized a name, alias or opaque argument");
++                    f.memory.write8(call.arguments[5] + 11u, 0x5Au);
++                    return static_cast<uint32_t>(-123);
++                };
++                f.invoke(cpu);
++                require(f.executor.calls == 1u && static_cast<int32_t>(cpu.gpr[2]) == -123 &&
++                            f.memory.read8(f.output + 11u) == 0x5Au &&
++                            f.memory.totalFreeMemory() == freeBefore &&
++                            !f.memory.allocationContaining(f.executor.last.arguments[0]) &&
++                            f.host.guestWrites == 0u,
++                        "driver return/output or temporary-record lifetime changed");
++                auto expected = before;
++                expected.gpr[2] = cpu.gpr[2];
++                require(cpu.gpr == expected.gpr, "device dispatch damaged caller registers");
++            }
++        }
++
++        RegisteredFixture f;
++        auto cpu = f.arguments();
++        cpu.gpr[6] = 0xFFFFFFFFu;
++        cpu.gpr[7] = 0u;
++        f.memory.write32(f.stack + 16u, 0xC0000001u);
++        f.memory.write32(f.stack + 20u, 0u);
++        f.invoke(cpu);
++        require(f.executor.last.arguments[3] == 0xFFFFFFFFu && f.executor.last.arguments[4] == 0u &&
++                    f.executor.last.arguments[5] == 0xC0000001u && f.executor.last.arguments[6] == 0u,
++                "zero-length opaque payload pointers were dereferenced or rewritten");
++
++        for (bool inputAtEnd : {false, true})
++        {
++            RegisteredFixture edge;
++            auto args = edge.arguments();
++            const uint32_t last = IopMemory::RamSize - 1u;
++            edge.memory.write8(last, 0xA5u);
++            if (inputAtEnd) { args.gpr[6] = 0xA0000000u | last; args.gpr[7] = 1u; }
++            else { edge.memory.write32(edge.stack + 16u, 0x80000000u | last); edge.memory.write32(edge.stack + 20u, 1u); }
++            edge.invoke(args);
++            require(edge.executor.calls == 1u && edge.memory.read8(last) == 0xA5u,
++                    "complete byte-aligned final-RAM payload was rejected or altered");
++        }
++    }
++
++    void registeredUnsupportedAndExactRouting()
++    {
++        for (std::string_view path : {"AUTHORED0:", "authored_extra0:", "authoredx0:", "other0:",
++                                     "authored", ":", "012:", "authored12345678901234567890123456:"})
++        {
++            RegisteredFixture f;
++            auto cpu = f.arguments(path);
++            require(!f.ioman.dispatchImport(31u, cpu, f.executor) && cpu.gpr[2] == 0xDEADBEEFu && f.executor.calls == 0u,
++                    "unregistered or malformed device path acquired an alias or response");
++        }
++        for (uint32_t type : {0u, 0x10u, 0x20000010u})
++        {
++            RegisteredFixture f;
++            auto cpu = f.arguments();
++            f.memory.write32(f.device + 4u, type);
++            f.memory.write32(f.device + 16u, 0xFFFFFFFFu);
++            cpu.gpr[29] = 0xFFFFFFFFu;
++            f.invoke(cpu);
++            require(static_cast<int32_t>(cpu.gpr[2]) == -48 && f.executor.calls == 0u,
++                    "legacy driver did not return EUNSUP before dereferencing extended data");
++        }
++        RegisteredFixture f;
++        auto cpu = f.arguments();
++        cpu.gpr[5] = 0xDEADC0DEu;
++        f.invoke(cpu);
++        require(f.executor.last.arguments[2] == 0xDEADC0DEu,
++                "generic device dispatch interpreted a command owned by the driver");
++        f.ioman.reset();
++        cpu.gpr[2] = 0xDEADBEEFu;
++        require(!f.ioman.dispatchImport(31u, cpu, f.executor) && f.executor.calls == 1u,
++                "reset retained a stale registered-device callback");
++    }
++
++    void invalidDriverArgumentsFailBeforeExecution()
++    {
++        using Alter = std::function<void(RegisteredFixture &, IopCpuState &)>;
++        const Alter examples[] = {
++            [](auto &, auto &cpu) { cpu.gpr[4] = 0u; },
++            [](auto &, auto &cpu) { cpu.gpr[4] = 0xC0014000u; },
++            [](auto &f, auto &) { f.text(f.path, "authored2147483648:"); },
++            [](auto &f, auto &) { f.memory.write32(f.device + 16u, 0u); },
++            [](auto &f, auto &) { f.memory.write32(f.device + 16u, 0x13201u); },
++            [](auto &f, auto &) { f.memory.write32(f.device + 16u, 0xA01FFFC0u); },
++            [](auto &f, auto &) { f.memory.write32(f.device + 16u, 0x8000u); },
++            [](auto &f, auto &) { f.memory.write32(f.ops + 92u, 0u); },
++            [](auto &f, auto &) { f.memory.write32(f.ops + 92u, 0x13301u); },
++            [](auto &f, auto &) { f.memory.write32(f.ops + 92u, 0xC0013300u); },
++            [](auto &f, auto &) { f.memory.write32(f.ops + 92u, 0x8000u); },
++            [](auto &, auto &cpu) { cpu.gpr[29] = 0u; },
++            [](auto &, auto &cpu) { cpu.gpr[29] = 0x15001u; },
++            [](auto &, auto &cpu) { cpu.gpr[29] = 0xA01FFFF0u; },
++            [](auto &, auto &cpu) { cpu.gpr[29] = 0xFFFFFFF0u; },
++            [](auto &, auto &cpu) { cpu.gpr[29] = 0x8000u; },
++            [](auto &, auto &cpu) { cpu.gpr[6] = 0u; },
++            [](auto &, auto &cpu) { cpu.gpr[6] = 0x8000u; },
++            [](auto &, auto &cpu) { cpu.gpr[6] = 0xC0016000u; },
++            [](auto &, auto &cpu) { cpu.gpr[6] = 0xA01FFFFCu; },
++            [](auto &, auto &cpu) { cpu.gpr[7] = 21u; },
++            [](auto &, auto &cpu) { cpu.gpr[7] = 0xFFFFFFFFu; },
++            [](auto &f, auto &) { f.memory.write32(f.stack + 16u, 0u); },
++            [](auto &f, auto &) { f.memory.write32(f.stack + 16u, 0x8000u); },
++            [](auto &f, auto &) { f.memory.write32(f.stack + 16u, 0xC0017000u); },
++            [](auto &f, auto &) { f.memory.write32(f.stack + 16u, 0xA01FFFFCu); },
++            [](auto &f, auto &) { f.memory.write32(f.stack + 20u, 13u); },
++            [](auto &f, auto &) { f.memory.write32(f.stack + 20u, 0xFFFFFFFFu); },
++        };
++        for (const auto &alter : examples)
++        {
++            RegisteredFixture f;
++            auto cpu = f.arguments();
++            alter(f, cpu);
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            const uint32_t freeBefore = f.memory.totalFreeMemory();
++            bool rejected = false;
++            try { f.invoke(cpu); }
++            catch (const std::runtime_error &error) { rejected = std::string_view(error.what()).find("IOP Devctl") != std::string_view::npos; }
++            require(rejected && f.executor.calls == 0u && cpu.gpr[2] == 0xDEADBEEFu &&
++                        f.memory.totalFreeMemory() == freeBefore &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "invalid registered Devctl reached callback, result write or allocation");
++        }
++    }
++
++    void temporaryRecordCleanupAndRecursiveMutation()
++    {
++        for (bool throwFromCallback : {false, true})
++        {
++            RegisteredFixture f;
++            auto cpu = f.arguments();
++            const uint32_t freeBefore = f.memory.totalFreeMemory();
++            f.executor.callback = [&](const DriverCall &) -> uint32_t
++            {
++                IopCpuState del{};
++                del.gpr[4] = f.name;
++                require(f.ioman.dispatchImport(21u, del, f.executor) && del.gpr[2] == 0u,
++                        "recursive driver deletion failed");
++                if (throwFromCallback)
++                    throw std::runtime_error("authored original driver failure");
++                return 0x5A1234u;
++            };
++            bool rejected = false;
++            try { f.invoke(cpu); }
++            catch (const std::runtime_error &error) { rejected = std::string_view(error.what()) == "authored original driver failure"; }
++            require(rejected == throwFromCallback && f.executor.calls == 1u &&
++                        cpu.gpr[2] == (throwFromCallback ? 0xDEADBEEFu : 0x5A1234u) &&
++                        f.memory.totalFreeMemory() == freeBefore,
++                    "callback return/exception lost or temporary descriptor leaked");
++            require(!f.ioman.dispatchImport(31u, cpu, f.executor), "deleted driver retained a callback");
++        }
++        RegisteredFixture f;
++        auto cpu = f.arguments();
++        uint32_t replacement = 0u;
++        uint64_t replacementIdentity = 0u;
++        f.executor.callback = [&](const DriverCall &call)
++        {
++            require(f.memory.freeAllocation(call.arguments[0]), "fixture could not release temporary record");
++            replacement = f.memory.allocate(16u);
++            require(replacement == call.arguments[0], "fixture did not reuse released address");
++            replacementIdentity = f.memory.allocationContaining(replacement)->identity;
++            f.memory.write32(replacement, 0x1234ABCDu);
++            return 7u;
++        };
++        f.invoke(cpu);
++        const auto live = f.memory.allocationContaining(replacement);
++        require(live && live->identity == replacementIdentity && f.memory.read32(replacement) == 0x1234ABCDu,
++                "temporary-record guard freed a newer guest allocation at the same address");
++    }
++
++    // These programs contain only authored MIPS instructions and data.
++    struct Program
++    {
++        iop_test::Irx &image;
++        uint32_t pc;
++        void emit(uint32_t word) { image.words(pc, {word}); pc += 4u; }
++        void li(uint32_t reg, uint32_t value)
++        { emit(0x3C000000u | (reg << 16u) | (value >> 16u)); emit(0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu)); }
++        void sw(uint32_t reg, uint32_t base, uint16_t offset)
++        { emit(0xAC000000u | (base << 21u) | (reg << 16u) | offset); }
++        void lw(uint32_t reg, uint32_t base, uint16_t offset)
++        { emit(0x8C000000u | (base << 21u) | (reg << 16u) | offset); emit(0u); }
++        void jal(uint32_t address) { emit(0x0C000000u | (address >> 2u)); emit(0u); }
++        void begin() { emit(0x27BDFFC0u); sw(31u, 29u, 60u); }
++        void end() { lw(31u, 29u, 60u); emit(0x27BD0040u); emit(0x03E00008u); emit(0u); }
++    };
++
++    inline void string(iop_test::Irx &image, uint32_t offset, std::string_view value)
++    {
++        require(0x100u + offset + value.size() < image.bytes.size(), "authored string outside image");
++        std::memcpy(image.bytes.data() + 0x100u + offset, value.data(), value.size());
++        image.bytes[0x100u + offset + value.size()] = 0u;
++    }
++
++    inline uint32_t readWord(IopEmulator &iop, uint32_t address)
++    {
++        uint32_t value = 0u;
++        require(iop.readMemory(address, &value, sizeof(value)), "authored observation outside RAM");
++        return value;
++    }
++
++    iop_test::Irx driverImage(bool nested, uint32_t result = 0x13579BDFu,
++                              std::string_view deviceName = "route", uint32_t command = 0x4396u)
++    {
++        constexpr uint32_t base = 0x10000u;
++        iop_test::Irx image(base, 0x1800u);
++        string(image, 0xD00u, deviceName);
++        string(image, 0xD20u, "inner");
++        string(image, 0xD40u, std::string(deviceName) + "12:tail");
++        string(image, 0xD80u, "inner0:child");
++        image.words(0xC00u, {base + 0xD00u, 0x10000010u, 1u, 0u, base + 0xC40u});
++        image.words(0xC20u, {base + 0xD20u, 0x10000010u, 1u, 0u, base + 0xCC0u});
++        image.words(0xC40u + 92u, {base + 0x500u});
++        image.words(0xCC0u + 92u, {base + 0x800u});
++        image.words(0xE00u, {80u, 5u, 0x12345678u, 5u, 0xA5B6C7D8u, 0xCAFEBABEu});
++        image.words(0xE40u, {0xCCCCCCCCu, 0xCCCCCCCCu, 0xCCCCCCCCu});
++        image.words(0xE80u, {0xDDDDDDDDu});
++        image.words(0xA00u, {0x41E00000u, 0u, 0x0104u, 0x616D6F69u, 0x0000006Eu,
++            0x03E00008u, 0x24000014u, 0x03E00008u, 0x24000015u,
++            0x03E00008u, 0x2400001Fu, 0u, 0u});
++        Program entry{image, 0u};
++        entry.begin();
++        entry.li(28u, 0x11223344u);
++        entry.li(4u, base + 0xC00u); entry.jal(base + 0xA14u);
++        if (nested) { entry.li(4u, base + 0xC20u); entry.jal(base + 0xA14u); }
++        entry.li(28u, 0x55667788u);
++        entry.li(8u, base + 0xF00u); entry.sw(29u, 8u, 0u);
++        entry.li(4u, base + 0xD40u); entry.li(5u, command);
++        entry.li(6u, base + 0xE00u); entry.li(7u, 20u);
++        entry.li(8u, base + 0xE40u); entry.sw(8u, 29u, 16u);
++        entry.li(8u, 4u); entry.sw(8u, 29u, 20u);
++        entry.li(8u, 0xCAFE1234u); entry.sw(8u, 29u, 24u);
++        entry.jal(base + 0xA24u);
++        entry.li(8u, base + 0xF00u); entry.sw(2u, 8u, 4u); entry.sw(28u, 8u, 8u);
++        entry.lw(9u, 29u, 24u); entry.sw(9u, 8u, 12u);
++        entry.li(2u, 0u); entry.end();
++
++        Program driver{image, 0x500u};
++        // Observe all arguments before allocating a normal guest frame.
++        driver.li(8u, base + 0xF20u);
++        for (uint32_t reg = 4u; reg <= 7u; ++reg) driver.sw(reg, 8u, static_cast<uint16_t>((reg - 4u) * 4u));
++        for (uint16_t offset : {16u, 20u, 24u}) { driver.lw(9u, 29u, offset); driver.sw(9u, 8u, offset); }
++        driver.sw(28u, 8u, 28u); driver.sw(29u, 8u, 32u);
++        for (uint16_t offset : {0u, 4u, 8u, 12u}) { driver.lw(9u, 4u, offset); driver.sw(9u, 8u, 36u + offset); }
++        driver.lw(9u, 7u, 16u); driver.lw(10u, 29u, 20u); driver.sw(9u, 10u, 0u);
++        driver.begin();
++        if (nested)
++        {
++            driver.li(4u, base + 0xD80u); driver.li(5u, 0x87654321u);
++            driver.li(6u, base + 0xE00u); driver.li(7u, 8u);
++            driver.li(8u, base + 0xE80u); driver.sw(8u, 29u, 16u);
++            driver.li(8u, 4u); driver.sw(8u, 29u, 20u);
++            driver.jal(base + 0xA24u);
++            driver.li(8u, base + 0xF60u); driver.sw(2u, 8u, 0u);
++            for (uint16_t offset : {16u, 20u, 24u})
++            { driver.lw(9u, 29u, 64u + offset); driver.sw(9u, 8u, offset - 12u); }
++        }
++        driver.li(2u, result); driver.end();
++
++        Program inner{image, 0x800u};
++        inner.li(8u, base + 0xFA0u); inner.sw(29u, 8u, 0u); inner.sw(28u, 8u, 4u);
++        inner.sw(6u, 8u, 8u); inner.lw(9u, 29u, 16u); inner.sw(9u, 8u, 12u);
++        inner.lw(10u, 29u, 20u); inner.sw(6u, 10u, 0u);
++        inner.li(2u, 0x123u); inner.emit(0x03E00008u); inner.emit(0u);
++        return image;
++    }
++
++    void authoredDriverReceivesSevenO32Arguments()
++    {
++        for (const auto &[name, command, result] : {
++            std::tuple{"route", 0x4396u, 0x13579BDFu}, std::tuple{"cdrom", 0x4391u, static_cast<uint32_t>(-123)}})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            const auto image = driverImage(false, result, name, command);
++            const auto loaded = iop.loadModuleImage("authored-driver", image.bytes, nullptr, 0u);
++            require(loaded.moduleId > 0 && loaded.startResult == 0 &&
++                        readWord(iop, 0x10F04u) == result && readWord(iop, 0x10F08u) == 0x55667788u &&
++                        readWord(iop, 0x10F0Cu) == 0xCAFE1234u,
++                    "authored driver result or caller GP/home area was replaced");
++            require(readWord(iop, 0x10F24u) == 0x10D40u + std::string_view(name).size() + 3u &&
++                        readWord(iop, 0x10F28u) == command && readWord(iop, 0x10F2Cu) == 0x10E00u &&
++                        readWord(iop, 0x10F30u) == 20u && readWord(iop, 0x10F34u) == 0x10E40u &&
++                        readWord(iop, 0x10F38u) == 4u && readWord(iop, 0x10F3Cu) == 0x11223344u &&
++                        readWord(iop, 0x10F44u) == 0u && readWord(iop, 0x10F48u) == 12u &&
++                        readWord(iop, 0x10F4Cu) == 0x10C00u && readWord(iop, 0x10F50u) == 0u,
++                    "actual guest driver did not see the declared seven-argument IOMAN ABI");
++            require(readWord(iop, 0x10F40u) < readWord(iop, 0x10F00u) &&
++                        readWord(iop, 0x10E40u) == 0xA5B6C7D8u && readWord(iop, 0x10E44u) == 0xCCCCCCCCu &&
++                        readWord(iop, 0x10E14u) == 0xCAFEBABEu && host.guestWrites == 0u,
++                    "driver bypassed its own instructions, used the caller stack or overran its opaque payload");
++        }
++    }
++
++    void nestedAuthoredDriverCallsKeepIndependentStacks()
++    {
++        iop_test::Host host;
++        IopEmulator iop(host);
++        const auto image = driverImage(true);
++        require(iop.loadModuleImage("authored-nested-driver", image.bytes, nullptr, 0u).moduleId > 0,
++                "nested authored driver failed");
++        require(readWord(iop, 0x10F04u) == 0x13579BDFu && readWord(iop, 0x10F60u) == 0x123u &&
++                    readWord(iop, 0x10F64u) == 20u && readWord(iop, 0x10F68u) == 0x10E40u &&
++                    readWord(iop, 0x10F6Cu) == 4u && readWord(iop, 0x10E80u) == 0x87654321u &&
++                    readWord(iop, 0x10FA0u) < readWord(iop, 0x10F40u) &&
++                    readWord(iop, 0x10FA4u) == 0x11223344u && readWord(iop, 0x10FA8u) == 0x87654321u &&
++                    readWord(iop, 0x10FACu) == 8u,
++                "nested real callbacks overwrote arguments, saved GP or the suspended caller frame");
++    }
++
++    iop_test::Irx suppliedIomanProvider(uint16_t providerVersion, uint16_t requestedVersion)
++    {
++        auto image = driverImage(false);
++        image.words(0xA00u + 8u, {requestedVersion});
++        image.words(0xA80u, {0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++            0x03E00008u, 0x24000006u, 0u, 0u});
++        image.words(0xB00u, {0x41C00000u, 0u, providerVersion, 0x616D6F69u, 0x0000006Eu});
++        for (uint32_t ordinal = 0u; ordinal <= 31u; ++ordinal) image.words(0xB14u + ordinal * 4u, {0x10900u});
++        Program entry{image, 0u};
++        entry.begin();
++        entry.li(4u, 0x10C00u); entry.jal(0x10A14u);
++        entry.li(4u, 0x10B00u); entry.jal(0x10A94u);
++        entry.li(4u, 0xFFFFFFFFu); entry.li(5u, 0x4391u); entry.li(6u, 0xDEADBEEFu); entry.li(7u, 0xFFFFFFFFu);
++        entry.jal(0x10A24u);
++        entry.li(8u, 0x10F00u); entry.sw(2u, 8u, 0u);
++        entry.li(2u, 0u); entry.end();
++        Program provider{image, 0x900u};
++        provider.li(8u, 0x10F80u); provider.sw(4u, 8u, 0u); provider.sw(5u, 8u, 4u);
++        provider.li(2u, 0x7B5u); provider.emit(0x03E00008u); provider.emit(0u);
++        return image;
++    }
++
++    void suppliedIomanExportRunsBeforeModeledValidation()
++    {
++        for (const auto &[provided, requested] : {std::pair<uint16_t, uint16_t>{0x0101u, 0x0104u},
++                                                 {0x0106u, 0x0104u}, {0x0201u, 0x0204u}})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            const auto image = suppliedIomanProvider(provided, requested);
++            require(iop.loadModuleImage("authored-ioman-provider", image.bytes, nullptr, 0u).moduleId > 0 &&
++                        readWord(iop, 0x10F00u) == 0x7B5u && readWord(iop, 0x10F80u) == 0xFFFFFFFFu &&
++                        readWord(iop, 0x10F84u) == 0x4391u && host.guestWrites == 0u,
++                    "modeled Devctl intercepted a compatible original export or validated its private pointers");
++        }
++        iop_test::Host host;
++        IopEmulator iop(host);
++        const auto image = suppliedIomanProvider(0x0101u, 0x0204u);
++        bool rejected = false;
++        try { (void)iop.loadModuleImage("authored-wrong-major", image.bytes, nullptr, 0u); }
++        catch (const std::runtime_error &error) { rejected = std::string_view(error.what()).find("missing import ioman:31") != std::string_view::npos; }
++        require(rejected, "incompatible IOMAN major acquired an export or modeled fallback");
++    }
++
++    void originalDriverFaultsRemainStrict()
++    {
++        for (uint32_t fault : {0xFFFFFFFFu, 0x0000000Du})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            auto image = driverImage(false);
++            image.words(0x500u, {fault});
++            bool rejected = false;
++            try { (void)iop.loadModuleImage("authored-faulting-driver", image.bytes, nullptr, 0u); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()).find("CPU instruction exception") != std::string_view::npos; }
++            require(rejected && readWord(iop, 0x10F04u) == 0u && readWord(iop, 0x10E40u) == 0xCCCCCCCCu &&
++                        host.guestWrites == 0u,
++                    "original driver fault became a fabricated return or output");
++        }
++    }
++}
