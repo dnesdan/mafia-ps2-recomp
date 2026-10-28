@@ -1,0 +1,315 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 08af674..042e385 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -651,6 +651,22 @@ namespace ps2x::iop::detail
+             return result.moduleId;
+         }
+ 
++        int32_t searchModuleByNameFromRam(uint32_t nameAddress) const
++        {
++            // Reuse the bounded, owned-RAM string reader without any path
++            // translation or normalization. PS2SDK MODLOAD compares exact
++            // names and selects the greatest matching loaded module ID.
++            // https://ps2dev.github.io/ps2sdk/modload_8c_source.html#l00583
++            const std::string name = modulePathFromRam(nameAddress);
++            int32_t found = -202; // KE_UNKNOWN_MODULE.
++            for (const auto &[id, module] : modules)
++                if (module.name == name && id > found)
++                    found = id;
++            // Strict IRXs store the declared IOPMOD name here. Metadata-less
++            // images retain the loader's existing ModuleInfo filename fallback.
++            return found;
++        }
++
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -745,6 +761,12 @@ namespace ps2x::iop::detail
+                 case 15u:
+                     setV0(mountedModulePath(modulePathFromRam(a0)).empty() ? 1u : 0u);
+                     return ImportDisposition::Handled;
++                case 22u: // SearchModuleByName(const char *name), MODLOAD 1.x.
++                    if ((call.version >> 8u) != 1u ||
++                        imports.resolve(call.library, call.ordinal, call.version) != 0u)
++                        break;
++                    setV0(static_cast<uint32_t>(searchModuleByNameFromRam(a0)));
++                    return ImportDisposition::Handled;
+                 default:
+                     break;
+                 }
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index 0a428c6..6525b6c 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -1368,6 +1368,255 @@ namespace
+                 "first guest export instruction observed a stale pending-load argument");
+     }
+ 
++    void addModuleName(Irx &image, uint32_t base, std::string_view name)
++    {
++        require(!name.empty() && name.size() <= 255u, "authored IOPMOD name is invalid");
++        const uint32_t metadata = static_cast<uint32_t>(image.bytes.size());
++        image.bytes.resize(metadata + 27u + name.size(), 0u);
++        put16(image.bytes, 44u, 2u);
++        put32(image.bytes, 84u, 0x70000080u);
++        put32(image.bytes, 88u, metadata);
++        put32(image.bytes, 100u, 27u + static_cast<uint32_t>(name.size()));
++        put32(image.bytes, metadata + 4u, base);
++        put32(image.bytes, metadata + 12u, metadata - 0x100u);
++        put16(image.bytes, metadata + 24u, 0x0201u);
++        std::copy(name.begin(), name.end(), image.bytes.begin() + metadata + 26u);
++    }
++
++    Irx namedModule(uint32_t base, std::string_view name, uint16_t disposition = 0u)
++    {
++        Irx image(base);
++        image.words(0u, {0x03E00008u, 0x24020000u | disposition});
++        addModuleName(image, base, name);
++        return image;
++    }
++
++    void installModuleSearch(IopEmulator &iop, uint32_t pointer = kModloadPath,
++                             uint16_t version = 0x0106u, uint16_t ordinal = 22u)
++    {
++        // Only a0 belongs to this ABI. Poison all leftover argument registers.
++        Irx client = modloadCallback(ordinal, "", 0xFFFFFFFFu, 0xDEAD1234u, 0xFFFFFFFFu, pointer);
++        put16(client.bytes, 0x208u, version);
++        require(iop.loadModuleImage("authored-search-client", client.bytes, nullptr, 0u).moduleId > 0,
++                "authored module-search RPC client did not start");
++    }
++
++    int32_t searchModule(IopEmulator &iop, std::string_view query, uint32_t pointer = kModloadPath)
++    {
++        std::vector<uint8_t> bytes(query.begin(), query.end());
++        bytes.push_back(0u);
++        require(iop.writeMemory(pointer, bytes.data(), bytes.size()), "authored query write failed");
++        const auto reply = invokeModload(iop);
++        require(reply.size() == 8u, "module-search reply was truncated");
++        require((uint32_t(reply[4]) | (uint32_t(reply[5]) << 8u) |
++                 (uint32_t(reply[6]) << 16u) | (uint32_t(reply[7]) << 24u)) == 0x13572468u,
++                "module search changed its caller GP");
++        std::vector<uint8_t> after(bytes.size());
++        require(iop.readMemory(pointer, after.data(), after.size()) && after == bytes,
++                "module search modified the input string");
++        return static_cast<int32_t>(uint32_t(reply[0]) | (uint32_t(reply[1]) << 8u) |
++                                    (uint32_t(reply[2]) << 16u) | (uint32_t(reply[3]) << 24u));
++    }
++
++    void moduleSearchMissingAndDeclaredNames()
++    {
++        ModuleHost host;
++        IopEmulator iop(host);
++        installModuleSearch(iop);
++        for (std::string_view query : {"absent", "", "modload", "cdvdman", "sysmem"})
++            require(searchModule(iop, query) == -202, "absent module was fabricated instead of KE_UNKNOWN_MODULE");
++        const Irx image = namedModule(0x20000u, "Declared_Driver");
++        const auto loaded = iop.loadModuleImage("cdrom0:\\MODULES\\FILENAME.IRX;1", image.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0 && searchModule(iop, "Declared_Driver") == loaded.moduleId,
++                "declared IOPMOD name did not select its actual loaded ID");
++        for (std::string_view query : {"declared_driver", "Declared", "Declared_Driver.extra", "FILENAME", "FILENAME.IRX;1"})
++            require(searchModule(iop, query) == -202, "module search normalized case, prefix or filename");
++        require(host.opened.empty() && host.translated.empty() && host.ee.guestReads == 0u && host.ee.guestWrites == 0u,
++                "name lookup touched host files or EE memory");
++        require(iop.loadedModuleCount() == 2u, "read-only module lookup changed registry membership");
++    }
++
++    void moduleSearchNewestAndLifecycle()
++    {
++        Host host;
++        IopEmulator iop(host);
++        installModuleSearch(iop);
++        const Irx firstImage = namedModule(0x20000u, "duplicate");
++        const auto first = iop.loadModuleImage("first.irx", firstImage.bytes, nullptr, 0u);
++        const Irx secondImage = namedModule(0x21000u, "duplicate", 2u);
++        const auto second = iop.loadModuleImage("second.irx", secondImage.bytes, nullptr, 0u);
++        require(second.moduleId > first.moduleId && searchModule(iop, "duplicate") == second.moduleId,
++                "duplicate module names must select the greatest loaded ID");
++        const Irx transient = namedModule(0x22000u, "duplicate", 1u);
++        require(iop.loadModuleImage("transient.irx", transient.bytes, nullptr, 0u).moduleId > second.moduleId,
++                "nonresident fixture did not execute");
++        require(searchModule(iop, "duplicate") == second.moduleId, "nonresident startup remained searchable");
++        const Irx failed = namedModule(0x23000u, "duplicate", 0xFFFFu);
++        require(iop.loadModuleImage("failed.irx", failed.bytes, nullptr, 0u).moduleId < 0,
++                "failed fixture startup unexpectedly succeeded");
++        require(searchModule(iop, "duplicate") == second.moduleId, "failed startup remained searchable");
++        require(iop.stopModule(second.moduleId, nullptr), "newest fixture could not be removed");
++        require(searchModule(iop, "duplicate") == first.moduleId, "retired newest ID hid an older loaded match");
++        require(iop.stopModule(first.moduleId, nullptr) && searchModule(iop, "duplicate") == -202,
++                "removed module remained searchable");
++        iop.reset();
++        installModuleSearch(iop);
++        require(searchModule(iop, "duplicate") == -202, "IOP reset retained a stale module name");
++    }
++
++    void moduleSearchStartingRecord()
++    {
++        Host host;
++        IopEmulator iop(host);
++        constexpr uint32_t base = 0x20000u;
++        Irx image(base);
++        image.words(0x200u, {0x41E00000u, 0u, 0x0106u, 0x6C646F6Du, 0x0064616Fu,
++                              0x03E00008u, 0x24000016u, 0u, 0u});
++        uint32_t pc = 0u;
++        emit(image, pc, 0x27BDFFE0u);
++        emit(image, pc, 0xAFBF001Cu);
++        emit(image, pc, 0x94F0000Cu); // lhu s0,ModuleInfo.id(a3)
++        constant(image, pc, 4u, base + 0x300u);
++        emit(image, pc, jal(base + 0x214u));
++        emit(image, pc, 0u);
++        constant(image, pc, 8u, base + 0x400u);
++        emit(image, pc, 0xAD020000u);
++        emit(image, pc, 0xAD100004u);
++        emit(image, pc, 0x8FBF001Cu);
++        emit(image, pc, 0x27BD0020u);
++        emit(image, pc, 0x03E00008u);
++        emit(image, pc, 0x00001021u);
++        constexpr char name[] = "starting-record";
++        std::copy(std::begin(name), std::end(name), image.bytes.begin() + 0x400u);
++        addModuleName(image, base, name);
++        const auto result = iop.loadModuleImage("different-startup-file.irx", image.bytes, nullptr, 0u);
++        require(result.moduleId > 0 && word(iop, base + 0x400u) == static_cast<uint32_t>(result.moduleId) &&
++                word(iop, base + 0x404u) == static_cast<uint32_t>(result.moduleId),
++                "the original entry could not find its reserved starting ModuleInfo ID");
++    }
++
++    void moduleSearchAliasesAndStringBoundaries()
++    {
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            const uint32_t pointer = alias | (kModloadPath + 1u);
++            installModuleSearch(iop, pointer);
++            const Irx image = namedModule(0x20000u, "byte-aligned");
++            const auto loaded = iop.loadModuleImage("named.irx", image.bytes, nullptr, 0u);
++            require(searchModule(iop, "byte-aligned", pointer) == loaded.moduleId,
++                    "legal IOP alias or byte-aligned name pointer failed");
++        }
++        {
++            Host host;
++            IopEmulator iop(host);
++            installModuleSearch(iop, 0x001FFFFFu);
++            require(searchModule(iop, "", 0x001FFFFFu) == -202,
++                    "last owned RAM byte cannot hold an empty query terminator");
++        }
++        {
++            Host host;
++            IopEmulator iop(host);
++            installModuleSearch(iop, 0xD0000u);
++            require(searchModule(iop, std::string(1024u, 'x'), 0xD0000u) == -202,
++                    "maximum bounded terminated query was rejected");
++        }
++    }
++
++    void moduleSearchStrictInputPreflight()
++    {
++        for (uint32_t pointer : {0u, 0x00200000u, 0x1F808260u, 0x20010800u, 0xC0010800u, 0xFFFFFFFFu, 0xD0000u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            installModuleSearch(iop, pointer);
++            const uint32_t sentinel = 0xA5A55A5Au;
++            require(iop.writeMemory(kModloadReply, &sentinel, 4u), "reply guard write failed");
++            const size_t count = iop.loadedModuleCount();
++            rejects([&] { (void)invokeModload(iop); }, "Modeled MODLOAD:");
++            require(word(iop, kModloadReply) == sentinel && iop.loadedModuleCount() == count,
++                    "invalid query reached result write or mutated the module registry");
++        }
++        for (bool overlong : {false, true})
++        {
++            Host host;
++            IopEmulator iop(host);
++            const uint32_t pointer = overlong ? 0xD0000u : 0x001FFFFCu;
++            installModuleSearch(iop, pointer);
++            const std::vector<uint8_t> bytes(overlong ? 1025u : 4u, 'x');
++            require(iop.writeMemory(pointer, bytes.data(), bytes.size()), "unterminated query write failed");
++            rejects([&] { (void)invokeModload(iop); }, overlong ? "bounded NUL-terminated" : "not terminated");
++            require(iop.loadedModuleCount() == 1u, "unterminated query changed the module registry");
++        }
++    }
++
++    Irx moduleSearchProvider(uint16_t version)
++    {
++        constexpr uint32_t base = 0x24000u;
++        Irx image(base);
++        image.words(0u, {0x27BDFFE0u, 0xAFBF001Cu, 0x3C040002u, 0x34844100u,
++            jal(base + 0x214u), 0u, 0x8FBF001Cu, 0x27BD0020u, 0x03E00008u, 0u});
++        image.words(0x80u, {0x3C080002u, 0x35084300u, 0xAD040000u,
++            0x8D090004u, 0u, 0x25290001u, 0xAD090004u, 0x03E00008u, 0x240207B5u});
++        image.words(0x100u, {0x41C00000u, 0u, version, 0x6C646F6Du, 0x0064616Fu});
++        for (uint32_t ordinal = 0u; ordinal <= 22u; ++ordinal)
++            image.words(0x114u + ordinal * 4u, {base + 0x80u});
++        image.words(0x200u, {0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++                              0x03E00008u, 0x24000006u, 0u, 0u});
++        return image;
++    }
++
++    void moduleSearchSuppliedExportPrecedence()
++    {
++        for (uint16_t version : {0x0101u, 0x0106u, 0x0201u})
++        {
++            Host host;
++            IopEmulator iop(host);
++            installModuleSearch(iop, 0xFFFFFFFFu, static_cast<uint16_t>((version & 0xFF00u) | 6u));
++            const Irx provider = moduleSearchProvider(version);
++            require(iop.loadModuleImage("provided-modload.irx", provider.bytes, nullptr, 0u).moduleId > 0,
++                    "authored MODLOAD export provider did not start");
++            const auto reply = invokeModload(iop);
++            require(reply[0] == 0xB5u && reply[1] == 7u && reply[2] == 0u && reply[3] == 0u &&
++                    word(iop, 0x24300u) == 0xFFFFFFFFu && word(iop, 0x24304u) == 1u,
++                    "modeled lookup intercepted the real compatible export or validated its private pointer");
++        }
++        Host host;
++        IopEmulator iop(host);
++        installModuleSearch(iop);
++        const Irx wrongMajor = moduleSearchProvider(0x0201u);
++        require(iop.loadModuleImage("wrong-major.irx", wrongMajor.bytes, nullptr, 0u).moduleId > 0,
++                "wrong-major provider fixture failed");
++        require(searchModule(iop, "absent") == -202 && word(iop, 0x24304u) == 0u,
++                "module lookup called an incompatible export major");
++    }
++
++    void moduleSearchUnsupportedContractsStayStrict()
++    {
++        for (const auto [ordinal, version] : {std::pair<uint16_t, uint16_t>{22u, 0x0206u}, {23u, 0x0106u}})
++        {
++            Host host;
++            IopEmulator iop(host);
++            installModuleSearch(iop, kModloadPath, version, ordinal);
++            rejects([&] { (void)invokeModload(iop); }, "missing import modload:");
++        }
++    }
++
++    void moduleSearchMetadataLessCompatibility()
++    {
++        Host host;
++        IopEmulator iop(host);
++        installModuleSearch(iop);
++        Irx image(0x20000u);
++        image.words(0u, {0x03E00008u, 0u});
++        const auto result = iop.loadModuleImage("host:/authored/fallback.irx", image.bytes, nullptr, 0u);
++        require(result.moduleId > 0 && searchModule(iop, "fallback.irx") == result.moduleId,
++                "lookup changed the existing metadata-less ModuleInfo fallback name");
++        require(searchModule(iop, "fallback") == -202 && searchModule(iop, "host:/authored/fallback.irx") == -202,
++                "fallback registry name was further rewritten as a stem or full path");
++    }
++
+     void returnDispositionAndCdvd()
+     {
+         for (uint16_t value : std::array<uint16_t, 5>{0u, 1u, 2u, 4u, 0xFFFFu})
+@@ -1444,6 +1693,14 @@ int main()
+         {"MODLOAD opens one bounded translated file and closes it on failure", modloadBoundedHostRead},
+         {"Nested startup reserves distinct IDs and protects the still-starting image", modloadStartingModuleReservation},
+         {"MODLOAD propagates child failure and preserves result allocation ownership", modloadCallbackFailureAndResultLifetime},
++        {"MODLOAD module-name lookup returns real IDs and exact missing-name errors", moduleSearchMissingAndDeclaredNames},
++        {"MODLOAD module-name lookup follows newest ID and actual registry lifetime", moduleSearchNewestAndLifecycle},
++        {"MODLOAD module-name lookup sees the original still-starting record", moduleSearchStartingRecord},
++        {"MODLOAD module-name lookup accepts owned aliases and byte string boundaries", moduleSearchAliasesAndStringBoundaries},
++        {"MODLOAD module-name lookup rejects unowned and unterminated input before effects", moduleSearchStrictInputPreflight},
++        {"Supplied MODLOAD search exports retain original execution precedence", moduleSearchSuppliedExportPrecedence},
++        {"Unmodeled MODLOAD ordinals and incompatible fallback majors remain strict", moduleSearchUnsupportedContractsStayStrict},
++        {"MODLOAD lookup preserves explicit metadata-less ModuleInfo compatibility names", moduleSearchMetadataLessCompatibility},
+     };
+     return run(tests);
+ }
