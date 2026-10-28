@@ -1,0 +1,669 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index e465911..bf51b15 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -225,6 +225,10 @@ namespace ps2x::iop::detail
+             virtualIsoValid = false;
+             completionCallback.reset();
+             ncmdDeadline.reset();
++            pendingRead.reset();
++            if (commandGeneration == std::numeric_limits<uint64_t>::max())
++                throw std::runtime_error("IOP CDVD command lifetime exhausted");
++            ++commandGeneration;
+             ncmdInterruptPending = false;
+             servicingNcmd = false;
+             nodes.clear();
+@@ -255,7 +259,7 @@ namespace ps2x::iop::detail
+ 
+         uint8_t driveStatus()
+         {
+-            if (readActive)
++            if (readActive || (ncmdDeadline && pendingRead))
+                 return static_cast<uint8_t>(kCdvdStatusRead);
+             return static_cast<uint8_t>(initialized && mediaAvailable() ? kCdvdStatusPause : kCdvdStatusStop);
+         }
+@@ -462,7 +466,7 @@ namespace ps2x::iop::detail
+             case 46: // sceCdNop: NCMD0 has no payload and no ordinary callback reason.
+                 if (streamFlag == 1u)
+                     return false; // Stream0 registration/delivery remains unsupported.
+-                cpu.gpr[2] = beginNop(currentCycle) ? 1u : 0u;
++                cpu.gpr[2] = beginCommand(currentCycle) ? 1u : 0u;
+                 return true;
+ 
+             case 47: // sceGetFsvRbuf(void)
+@@ -505,8 +509,8 @@ namespace ps2x::iop::detail
+                 case -9:
+                     cpu.gpr[2] = kCdvdmanVersion;
+                     return true;
+-                case -3: // Active read2 operation; synchronous reads clear it before returning.
+-                    cpu.gpr[2] = readActive ? 1u : 0u;
++                case -3: // Read2 remains active until its driver IRQ has run.
++                    cpu.gpr[2] = readActive || pendingRead ? 1u : 0u;
+                     return true;
+                 case -2:
+                     lastError = a1 != 0u ? memory.read8(a1) : kCdvdErrorNone;
+@@ -542,6 +546,35 @@ namespace ps2x::iop::detail
+                 cpu.gpr[2] = searchFile(a0, a1, 36u) ? 1u : 0u;
+                 return true;
+ 
++            case 114: // sceCdRE(lsn, sectors, buffer, sceCdRMode *)
++                // The original CDVDSTM owns the ring buffer and resubmission.
++                // Only its stream1, 2048-byte sector route is modeled here;
++                // Read0 chunk callbacks, stream0 and raw CD modes stay strict.
++                if (streamFlag != 2u || a1 == 0u || cpu.gpr[7] == 0u)
++                    return false;
++                if (readActive || ncmdBusy())
++                {
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
++                if (!ownedSearchSpan(cpu.gpr[7], 4u))
++                    throw std::runtime_error("IOP CDVD stream read mode is outside complete owned RAM");
++                if (memory.read8(cpu.gpr[7] + 2u) != 0u)
++                    return false; // SCECdSecS2048; no invented raw-sector header.
++                {
++                    const uint64_t bytes = uint64_t{a1} * kSectorSize;
++                    if (bytes > IopMemory::RamSize || uint64_t{a0} + a1 > (uint64_t{1u} << 32u))
++                        throw std::runtime_error("IOP CDVD stream read count exceeds its bounded address space");
++                    const PendingRead request{a0, a1, a2, readBufferOwner(a2, static_cast<size_t>(bytes))};
++                    // Arguments are now independent of the caller's CPU and
++                    // mode storage. No sector I/O or payload write occurs here.
++                    if (!beginCommand(currentCycle))
++                        throw std::logic_error("IOP CDVD stream command lost exclusive ownership");
++                    pendingRead = request;
++                    cpu.gpr[2] = 1u;
++                }
++                return true;
++
+             default:
+                 return false;
+             }
+@@ -561,8 +594,21 @@ namespace ps2x::iop::detail
+ 
+         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
+         {
++            if (readActive)
++                return; // A host I/O callback cannot recursively execute the same read.
+             if (ncmdDeadline && *ncmdDeadline <= currentCycle)
+             {
++                if (pendingRead)
++                {
++                    const PendingRead request = *pendingRead;
++                    const size_t bytes = static_cast<size_t>(request.sectors) * kSectorSize;
++                    if (readBufferOwner(request.destination, bytes) != request.owner)
++                        throw std::runtime_error("IOP CDVD stream read buffer lifetime has ended");
++                    // Device/DMA progress is independent of CPU interrupt masks.
++                    // Failed/short reads retain the old destination bytes and
++                    // deliver the existing read error, never a fabricated frame.
++                    (void)readSectors(request.lsn, request.sectors, request.destination, request.owner);
++                }
+                 ncmdDeadline.reset();
+                 ncmdInterruptPending = true;
+             }
+@@ -583,6 +629,9 @@ namespace ps2x::iop::detail
+                 explicit Scope(bool &value) : active(value) { active = true; }
+                 ~Scope() { active = false; }
+             } scope(servicingNcmd);
++            const bool completedRead = pendingRead.has_value();
++            const uint64_t generation = commandGeneration;
++            pendingRead.reset();
+             ncmdInterruptPending = false;
+             // The driver's wait flag/event are ready before its stream callback
+             // submits another command. Resolve the live slot/GP at delivery.
+@@ -591,6 +640,14 @@ namespace ps2x::iop::detail
+             const RegisteredCallback selected = streamFlag == 2u ? stream1Callback : RegisteredCallback{};
+             if (selected.address != 0u)
+                 (void)intrman.executeInterruptCallback(selected.address, 1u, selected.gp, executor);
++            // PS2SDK cdvdman_intr_cb invokes stream1 first, then the live user
++            // callback for a completed read. A reset inside stream1 retires the
++            // old command; do not deliver its user callback into the new device.
++            if (completedRead && commandGeneration == generation && callback.address != 0u)
++            {
++                const Callback user = callback;
++                (void)intrman.executeInterruptCallback(user.address, kCdvdCallbackRead, user.gp, executor);
++            }
+             // Private IRQ boundary only: do not additionally assert raw I_STAT.
+             // NCMD0 cmdfunc is zero, so it never creates a user37 completion.
+         }
+@@ -607,7 +664,32 @@ namespace ps2x::iop::detail
+             return ncmdDeadline.has_value() || ncmdInterruptPending;
+         }
+ 
+-        bool beginNop(uint64_t currentCycle)
++        // Primary ABI: PS2SDK cdvdman.c:sceCdRE/cdvdman_read/cdvdman_intr_cb
++        // and cdvdstm.c:ee_stream_intr_cb_normal. This service reads the mounted
++        // sector payload, not original firmware DMA3/retry micro-operations.
++        struct PendingRead
++        {
++            uint32_t lsn, sectors, destination;
++            uint64_t owner;
++        };
++
++        uint64_t readBufferOwner(uint32_t address, size_t bytes) const
++        {
++            if (!ownedSearchSpan(address, bytes))
++                throw std::runtime_error("IOP CDVD stream read buffer is outside complete owned RAM");
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            if (const auto allocation = memory.allocationContaining(physical))
++            {
++                if (bytes > allocation->size - (physical - allocation->address))
++                    throw std::runtime_error("IOP CDVD stream read buffer crosses a live allocation boundary");
++                return allocation->identity;
++            }
++            if (physical < IopMemory::HeapLimit && uint64_t{physical} + bytes > IopMemory::HeapBase)
++                throw std::runtime_error("IOP CDVD stream read buffer has no live heap allocation");
++            return 0u;
++        }
++
++        bool beginCommand(uint64_t currentCycle)
+         {
+             if (readActive || ncmdBusy())
+                 return false;
+@@ -1179,7 +1261,8 @@ namespace ps2x::iop::detail
+             return host.readHostFile(node->handle, offset, destination, wanted, bytesRead) && bytesRead == wanted;
+         }
+ 
+-        bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
++        bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination,
++                         std::optional<uint64_t> owner = {})
+         {
+             if (readActive)
+                 throw std::runtime_error("IOP CDVDMAN cannot start a nested synchronous sector read");
+@@ -1193,7 +1276,7 @@ namespace ps2x::iop::detail
+             controllerReadError = false;
+             try
+             {
+-                const bool completed = readSectorsImpl(lsn, sectors, destination);
++                const bool completed = readSectorsImpl(lsn, sectors, destination, owner);
+                 controllerReadError = !completed;
+                 return completed;
+             }
+@@ -1205,7 +1288,8 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
+-        bool readSectorsImpl(uint32_t lsn, uint32_t sectors, uint32_t destination)
++        bool readSectorsImpl(uint32_t lsn, uint32_t sectors, uint32_t destination,
++                             std::optional<uint64_t> owner)
+         {
+             if (sectors == 0u)
+             {
+@@ -1219,6 +1303,7 @@ namespace ps2x::iop::detail
+                 return false;
+             }
+             const size_t byteCount = static_cast<size_t>(byteCount64);
++            const uint64_t generation = commandGeneration;
+             std::vector<uint8_t> bytes(byteCount, 0u);
+ 
+             bool read = false;
+@@ -1252,6 +1337,12 @@ namespace ps2x::iop::detail
+                 }
+             }
+ 
++            // Host I/O is an external boundary: recheck before the sole commit
++            // so a released/reused destination cannot acquire stale read bytes.
++            if (owner && commandGeneration != generation)
++                throw std::runtime_error("IOP CDVD stream read command was reset during host I/O");
++            if (owner && readBufferOwner(destination, byteCount) != *owner)
++                throw std::runtime_error("IOP CDVD stream read buffer lifetime has ended");
+             if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
+             {
+                 lastError = kCdvdErrorRead;
+@@ -1269,6 +1360,8 @@ namespace ps2x::iop::detail
+         RegisteredCallback stream1Callback;
+         std::optional<CompletionCallback> completionCallback;
+         std::optional<uint64_t> ncmdDeadline;
++        std::optional<PendingRead> pendingRead;
++        uint64_t commandGeneration = 0u;
+         bool ncmdInterruptPending = false;
+         bool servicingNcmd = false;
+         bool initialized = false;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 468dcff..a67c9ee 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -685,7 +685,7 @@ namespace ps2x::iop::detail
+             // search/stream fallbacks are limited to the compatible 1.x ABI.
+             if (iequals(call.library, "cdvdman") &&
+                 ((call.ordinal != 14u && call.ordinal != 49u && call.ordinal != 10u && call.ordinal != 84u &&
+-                  call.ordinal != 46u) ||
++                  call.ordinal != 46u && call.ordinal != 114u) ||
+                     (imports.resolve(call.library, call.ordinal, call.version) == 0u &&
+                      (call.ordinal == 14u || (call.version >> 8u) == 1u))) &&
+                 cdvd.dispatchImport(call.ordinal, cpu, totalCycles))
+diff --git a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+index 34b3857..deeb5cc 100644
+--- a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
++++ b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <functional>
+ #include <limits>
++#include "iop_cdvd_stream_read_fixtures.h"
+ 
+ namespace
+ {
+@@ -467,6 +468,16 @@ namespace
+ int main()
+ {
+     const iop_test::Test tests[] = {
++        {"Stream reads publish real sectors before ordered IRQ callbacks", iop_stream_read_test::deferredBytesBeforeCallbacks},
++        {"Stream reads retain aliases and overlapping mode arguments", iop_stream_read_test::aliasesAndOverlappingMode},
++        {"Stream read preflight and busy refusal preserve state", iop_stream_read_test::invalidSpansAndCountsAreAtomic},
++        {"Deferred reads cannot write a replacement buffer allocation", iop_stream_read_test::bufferLeaseCannotWriteReplacement},
++        {"Failed stream media leaves payload untouched and delivers read errors", iop_stream_read_test::failedMediaNeverFabricatesPayload},
++        {"Masked reads copy once and resolve the current callback", iop_stream_read_test::maskedReadCopiesOnceAndUsesLiveSlot},
++        {"Stream reset and successor commands retain independent lifetimes", iop_stream_read_test::resetAndSuccessorRequestsKeepSeparateLifetimes},
++        {"Unsupported stream shapes remain strict", iop_stream_read_test::unsupportedContractsStayStrict},
++        {"Authored MIPS stream imports preserve data, GP and original exports", iop_stream_read_test::authoredMipsReadAndProviderPrecedence},
++        {"Authored stream reset and callback failures preserve strict lifetime boundaries", iop_stream_read_test::authoredResetAndCallbackFailureStayStrict},
+         {"Nop has no payload or user reason and completes only at a later IOP deadline", acceptanceHasNoPayloadAndCompletionIsDeferred},
+         {"Busy commands and unimplemented blocking waits preserve the pending command", busyAndBlockingQueriesCannotFabricateCompletion},
+         {"Completion resolves the current stream callback, GP and SC mode", completionUsesCurrentStreamSlotAndMode},
+@@ -474,13 +485,13 @@ int main()
+         {"Original stream callback can submit a successor without recursive completion", callbackCanSubmitNextCommandWithoutRecursiveDelivery},
+         {"Reset, per-device lifetime and callback exceptions preserve command ownership", resetAndCallbackExceptionsDoNotRetainOldCommands},
+         {"Raw IRQ replacement and deleted completion events fail before dispatch", rawIrqOwnerAndDeletedEventFailBeforeEitherCallback},
+-        {"Unsupported stream reads, stream0 and overflowing deadlines remain strict", unsupportedReadsAndClockOverflowRemainStrict},
++        {"Unsupported stream shapes, stream0 and overflowing deadlines remain strict", unsupportedReadsAndClockOverflowRemainStrict},
+         {"Authored original imports and callback observe asynchronous IRQ context", originalInstructionsObserveDeferredInterruptCompletion},
+         {"A running IOP thread receives Nop completion and resumes its own code", runningThreadReceivesNcmdAndKeepsItsContinuation},
+         {"Authored mask/resume and full IOP reset control the pending completion", realMaskResumeAndResetControlPendingNcmd},
+         {"Original stream callback cancels timeout and registers an interrupt alarm", streamCallbackCanUseTheRealAlarmService},
+         {"Supplied Nop exports retain compatible-provider and major-version precedence", suppliedNopExportsAndVersionRulesRemainAuthoritative},
+-        {"Original later stream read reaches its own sticky strict boundary", originalStreamReadFaultRemainsStickyAfterNop},
++        {"Original incomplete stream read reaches its sticky strict boundary", originalStreamReadFaultRemainsStickyAfterNop},
+     };
+     return iop_test::run(tests);
+ }
+diff --git a/ps2xIOP/tests/iop_cdvd_stream_read_fixtures.h b/ps2xIOP/tests/iop_cdvd_stream_read_fixtures.h
+new file mode 100644
+index 0000000..f4869f5
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_stream_read_fixtures.h
+@@ -0,0 +1,385 @@
++#pragma once
++
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/imports/iop_intrman.h"
++#include "emulator/services/iop_rpc.h"
++#include "iop_vblank_fixtures.h"
++
++#include <functional>
++#include <limits>
++
++namespace iop_stream_read_test
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++    constexpr uint32_t modeAddress = 0x2000u, bufferAddress = 0x4000u;
++
++    class DiscHost final : public IopHost
++    {
++    public:
++        std::vector<uint8_t> image = std::vector<uint8_t>(8u * 2048u);
++        bool failOpen = false, failRead = false, shortRead = false;
++        size_t reads = 0u, opens = 0u, closes = 0u, eeAccesses = 0u;
++        mutable size_t rootRequests = 0u;
++        std::function<void()> onRead;
++        DiscHost() { for (size_t i = 0; i < image.size(); ++i) image[i] = static_cast<uint8_t>(i * 13u + i / 2048u + 7u); }
++        bool readGuest(uint32_t, void *, size_t) const override { return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { ++eeAccesses; return false; }
++        bool zeroGuest(uint32_t, size_t) override { ++eeAccesses; return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind kind) const override
++        {
++            if (kind == HostPathKind::CdImage) return "authored-stream.iso";
++            if (kind == HostPathKind::CdRoot) ++rootRequests;
++            return {};
++        }
++        std::string translateGuestPath(std::string_view) const override { return {}; }
++        uint64_t openHostFile(std::string_view name) override
++        { ++opens; return !failOpen && name == "authored-stream.iso" ? 1u : 0u; }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override { size = image.size(); return handle == 1u; }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *out, size_t size, size_t &actual) override
++        {
++            ++reads; actual = 0u;
++            if (onRead) onRead();
++            if (failRead || handle != 1u || offset > image.size() || size > image.size() - offset) return false;
++            actual = shortRead && size ? size - 1u : size;
++            std::memcpy(out, image.data() + offset, actual);
++            return true;
++        }
++        void closeHostFile(uint64_t) override { ++closes; }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
++        void log(LogLevel, std::string_view) override {}
++    };
++
++    struct Call { uint32_t function, argument, gp; bool interrupt; };
++    struct Executor final : IopGuestExecutor
++    {
++        IopIntrman &intrman;
++        std::vector<Call> calls;
++        std::function<void(const Call &)> action;
++        explicit Executor(IopIntrman &value) : intrman(value) {}
++        uint32_t executeGuestFunction(uint32_t function, uint32_t a0, uint32_t, uint32_t, uint32_t, uint32_t gp) override
++        {
++            const Call call{function, a0, gp, intrman.inInterruptContext()};
++            calls.push_back(call);
++            if (action) action(call);
++            return 0u;
++        }
++    };
++    struct Fixture
++    {
++        DiscHost host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopIntrman intrman{memory};
++        IopCdvd cdvd{host, memory, kernel};
++        Executor executor{intrman};
++        uint64_t now = 100u;
++        Fixture()
++        {
++            memory.write32(modeAddress, 0u);
++            std::vector<uint8_t> bytes(4104u, 0xCCu);
++            require(memory.writeRam(bufferAddress - 4u, bytes.data(), bytes.size()), "buffer fixture failed");
++            require(call(49u, 0x3000u, 0u, 0u, 0u, 0x12345678u) == 0u && call(50u, 2u) == 2u, "stream fixture failed");
++        }
++        uint32_t call(uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u, uint32_t a2 = 0u,
++                      uint32_t a3 = 0u, uint32_t gp = 0u)
++        {
++            IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = a0; cpu.gpr[5] = a1; cpu.gpr[6] = a2; cpu.gpr[7] = a3; cpu.gpr[28] = gp;
++            require(cdvd.dispatchImport(ordinal, cpu, now), "stream read import unresolved");
++            return cpu.gpr[2];
++        }
++        uint32_t read(uint32_t lsn = 1u, uint32_t sectors = 2u, uint32_t buffer = bufferAddress, uint32_t mode = modeAddress)
++        { return call(114u, lsn, sectors, buffer, mode); }
++        uint64_t deadline()
++        {
++            const auto value = cdvd.nextEventCycle(UINT64_MAX);
++            require(value > now && value != UINT64_MAX, "read has no future device deadline");
++            return value;
++        }
++        void due(uint64_t time) { now = time; cdvd.serviceDue(time, executor, intrman); }
++        void matches(uint32_t lsn = 1u, uint32_t buffer = bufferAddress, size_t size = 4096u)
++        {
++            require(std::equal(host.image.begin() + lsn * 2048u, host.image.begin() + lsn * 2048u + size,
++                               memory.ram().begin() + IopMemory::physicalAddress(buffer)), "read bytes differ from actual selected sectors");
++        }
++    };
++    template <typename Body> void rejects(Body body)
++    {
++        try { body(); }
++        catch (const std::runtime_error &e)
++        {
++            require(std::string_view(e.what()).find("IOP CDVD stream read") != std::string_view::npos,
++                    "read failure lost concrete buffer/mode/count diagnosis");
++            return;
++        }
++        throw std::runtime_error("invalid stream read silently succeeded");
++    }
++
++    void deferredBytesBeforeCallbacks()
++    {
++        Fixture f;
++        require(f.call(37u, 0x3100u, 0u, 0u, 0u, 0xABCDEF01u) == 0u && f.read() == 1u, "read acceptance failed");
++        const auto deadline = f.deadline();
++        require(f.host.opens == 0u && f.host.reads == 0u && f.memory.read32(bufferAddress) == 0xCCCCCCCCu &&
++                    f.call(11u, 1u) == 1u && f.call(50u, uint32_t(-3)) == 1u &&
++                    (f.call(13u, 8u) & 0xC0u) == 0x80u, "read published data or completion during acceptance");
++        f.memory.write32(modeAddress, 0xFFFFFFFFu); // Accepted arguments no longer depend on caller storage.
++        f.host.onRead = [&] { f.due(deadline); }; // Must not recursively enter the in-flight host read.
++        f.due(deadline - 1u);
++        require(f.host.reads == 0u && f.executor.calls.empty(), "read completed before its deadline");
++        f.executor.action = [&](const Call &call)
++        {
++            f.matches();
++            require(call.interrupt && call.argument == 1u && f.call(11u, 1u) == 0u &&
++                        f.call(50u, uint32_t(-3)) == 0u, "callback ran before payload/driver completion");
++        };
++        f.due(deadline); f.due(deadline + 5000u);
++        require(f.executor.calls.size() == 2u && f.executor.calls[0].function == 0x3000u &&
++                    f.executor.calls[0].gp == 0x12345678u && f.executor.calls[1].function == 0x3100u &&
++                    f.executor.calls[1].gp == 0xABCDEF01u && f.host.reads == 1u && f.host.eeAccesses == 0u &&
++                    f.memory.read32(bufferAddress - 4u) == 0xCCCCCCCCu &&
++                    f.memory.read32(bufferAddress + 4096u) == 0xCCCCCCCCu && !f.cdvd.takeCompletionCallback(),
++                "stream/user ordering, exact bounds or single completion was lost");
++    }
++
++    void aliasesAndOverlappingMode()
++    {
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Fixture f; f.memory.write32(bufferAddress, 0u);
++            require(f.read(1u, 2u, alias | bufferAddress, alias | bufferAddress) == 1u,
++                    "legal alias or overlapping mode/buffer rejected");
++            f.due(f.deadline()); f.matches();
++            require(f.executor.calls.size() == 1u, "alias acquired extra completion");
++        }
++    }
++
++    void invalidSpansAndCountsAreAtomic()
++    {
++        for (unsigned variant = 0u; variant < 10u; ++variant)
++        {
++            Fixture f; uint32_t destination = bufferAddress, mode = modeAddress, sectors = 2u, lsn = 1u;
++            switch (variant)
++            {
++            case 0: destination = 0u; break;
++            case 1: destination = 0x20004000u; break;
++            case 2: destination = 0x1F402005u; break;
++            case 3: destination = 0x1FFFF0u; break;
++            case 4: destination = 0x8000u; break;
++            case 5: mode = 0x1F402005u; break;
++            case 6: mode = 0x20002000u; break;
++            case 7: mode = 0x2FFDu; f.memory.write16(mode, 0u); break;
++            case 8: sectors = UINT32_MAX; break;
++            case 9: lsn = UINT32_MAX; break;
++            }
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            rejects([&] { (void)f.read(lsn, sectors, destination, mode); });
++            require(f.host.opens == 0u && f.host.reads == 0u && f.executor.calls.empty() &&
++                        f.cdvd.nextEventCycle(UINT64_MAX) == UINT64_MAX &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "invalid read mutated RAM, touched media or queued completion");
++        }
++        Fixture f;
++        require(f.read() == 1u && f.read(0u, 1u, 0xFFFFFFFFu, 0xFFFFFFFFu) == 0u,
++                "busy read dereferenced replacement arguments or replaced its accepted request");
++        f.due(f.deadline()); f.matches();
++    }
++
++    void bufferLeaseCannotWriteReplacement()
++    {
++        for (bool duringRead : {false, true})
++        {
++            Fixture f; const auto buffer = f.memory.allocate(4096u);
++            require(buffer != 0u && f.memory.zeroRam(buffer, 4096u) && f.read(1u, 2u, buffer) == 1u, "leased read setup failed");
++            const auto replace = [&]
++            {
++                require(f.memory.freeAllocation(buffer) && f.memory.allocate(4096u) == buffer, "lease replacement failed");
++                f.memory.write32(buffer, 0x12345678u);
++            };
++            if (duringRead) f.host.onRead = replace; else replace();
++            rejects([&] { f.due(f.deadline()); });
++            require(f.memory.read32(buffer) == 0x12345678u && f.executor.calls.empty() &&
++                        f.host.reads == (duringRead ? 1u : 0u), "deferred read wrote into a new allocation lifetime");
++        }
++        Fixture f;
++        const auto first = f.memory.allocate(2048u), second = f.memory.allocate(2048u);
++        require(second == first + 2048u && f.memory.zeroRam(first, 4096u), "adjacent allocation setup failed");
++        rejects([&] { (void)f.read(1u, 2u, first); });
++        require(f.host.reads == 0u, "read crossed allocation owners before failing");
++        Fixture reset;
++        require(reset.read() == 1u, "host-reset setup failed");
++        reset.host.onRead = [&] { reset.cdvd.reset(); };
++        rejects([&] { reset.due(reset.deadline()); });
++        require(reset.memory.read32(bufferAddress) == 0xCCCCCCCCu && reset.executor.calls.empty(),
++                "reset during host I/O allowed the retired command to publish bytes");
++    }
++
++    void failedMediaNeverFabricatesPayload()
++    {
++        for (unsigned failure = 0u; failure < 4u; ++failure)
++        {
++            Fixture f;
++            f.host.failOpen = failure == 0u; f.host.failRead = failure == 1u; f.host.shortRead = failure == 2u;
++            require(f.read(failure == 3u ? 8u : 1u) == 1u, "valid read request was not accepted");
++            f.executor.action = [&](const Call &) { require(f.call(8u) == 0x30u, "callback did not observe read error"); };
++            f.due(f.deadline());
++            require(f.memory.read32(bufferAddress) == 0xCCCCCCCCu &&
++                        f.memory.read32(bufferAddress + 4092u) == 0xCCCCCCCCu &&
++                        f.executor.calls.size() == 1u && f.host.rootRequests == 0u &&
++                        f.call(11u, 1u) == 0u && (f.call(13u, 8u) & 0x41u) == 0x41u,
++                    "failed/short image read invented data, fell back to another disc or lost completion");
++        }
++    }
++
++    void maskedReadCopiesOnceAndUsesLiveSlot()
++    {
++        Fixture f; f.memory.setInterruptControl(0u); f.memory.setInterruptMask(0u);
++        require(f.read() == 1u, "masked read acceptance failed");
++        const auto due = f.deadline(); f.due(due); f.matches(); f.due(due + 1000u);
++        require(f.host.reads == 1u && f.executor.calls.empty() && f.call(11u, 1u) == 1u &&
++                    f.call(50u, uint32_t(-3)) == 1u && (f.call(13u, 8u) & 0xC0u) == 0x40u &&
++                    f.cdvd.nextEventCycle(due + 2000u) == due + 2000u, "masked hardware and driver progress were conflated");
++        require(f.call(49u, 0x3300u, 0u, 0u, 0u, 0x55667788u) == 0u, "live replacement failed");
++        f.memory.setInterruptMask(4u); f.due(due + 1001u);
++        require(f.executor.calls.empty(), "mask bypassed CPU interrupt suspension");
++        f.memory.setInterruptControl(1u); f.due(due + 1002u); f.due(due + 1003u);
++        require(f.host.reads == 1u && f.executor.calls.size() == 1u && f.executor.calls[0].function == 0x3300u &&
++                    f.executor.calls[0].gp == 0x55667788u, "masked read reread media or retained a stale callback");
++    }
++
++    void resetAndSuccessorRequestsKeepSeparateLifetimes()
++    {
++        for (bool afterPayload : {false, true})
++        {
++            Fixture f; require(f.read() == 1u, "reset fixture failed");
++            const auto due = f.deadline(); f.memory.setInterruptMask(0u);
++            if (afterPayload) f.due(due);
++            f.cdvd.reset(); f.due(due + 1000u);
++            require(f.host.reads == (afterPayload ? 1u : 0u) && f.executor.calls.empty() &&
++                        f.call(50u, uint32_t(-3)) == 0u, "reset retained an old payload write or callback");
++        }
++        Fixture f; require(f.memory.zeroRam(0x8000u, 4096u) && f.read() == 1u, "successor setup failed");
++        uint64_t next = 0u;
++        f.executor.action = [&](const Call &)
++        {
++            if (f.executor.calls.size() == 1u)
++            {
++                require(f.read(3u, 2u, 0x8000u) == 1u, "completed read blocked its successor");
++                next = f.deadline(); f.due(next);
++                require(f.executor.calls.size() == 1u, "nested checkpoint recursively delivered the next callback");
++            }
++        };
++        f.due(f.deadline()); f.due(next + 1u);
++        f.matches(); f.matches(3u, 0x8000u);
++        require(f.host.reads == 2u && f.executor.calls.size() == 2u, "successor request was lost or overwritten");
++        Fixture reset;
++        require(reset.call(37u, 0x3100u) == 0u && reset.read() == 1u, "callback-reset setup failed");
++        reset.executor.action = [&](const Call &) { reset.cdvd.reset(); (void)reset.call(37u, 0x3500u); };
++        reset.due(reset.deadline());
++        require(reset.executor.calls.size() == 1u, "old read delivered its user callback after device reset");
++    }
++
++    void unsupportedContractsStayStrict()
++    {
++        for (unsigned variant = 0u; variant < 5u; ++variant)
++        {
++            Fixture f; IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = 1u; cpu.gpr[5] = 2u; cpu.gpr[6] = bufferAddress; cpu.gpr[7] = modeAddress;
++            if (variant < 2u) (void)f.call(50u, variant);
++            if (variant == 2u) f.memory.write8(modeAddress + 2u, 1u);
++            if (variant == 3u) cpu.gpr[7] = 0u;
++            if (variant == 4u) cpu.gpr[5] = 0u;
++            require(!f.cdvd.dispatchImport(114u, cpu, f.now) && cpu.gpr[2] == 0xDEADBEEFu &&
++                        f.host.reads == 0u && f.host.opens == 0u && f.executor.calls.empty(),
++                    "unsupported stream mode/shape acquired fabricated success");
++        }
++    }
++
++    iop_vblank_test::Program readProgram(uint16_t requested = 0x0101u, uint16_t provided = 0u)
++    {
++        using iop_vblank_test::Program;
++        Program p; p.imports(0x1000u, "cdvdman", {114u, 49u, 50u}); p.image.words(0x1008u, {requested});
++        p.image.words(0x2020u, {0u});
++        p.begin();
++        if (provided)
++        {
++            p.image.words(0x1800u, {0x41C00000u, 0u, provided, 0x64766463u, 0x006E616Du});
++            for (uint32_t i = 0u; i <= 114u; ++i) p.image.words(0x1814u + 4u * i, {p.base + 0x900u});
++            p.constant(4u, p.base + 0x1800u); p.call(p.stub(0x1500u));
++        }
++        else
++        {
++            p.constant(28u, 0x12345678u); p.constant(4u, p.base + 0x800u); p.call(p.stub(0x1000u, 1u));
++            p.constant(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1000u, 2u));
++        }
++        p.constant(28u, 0x55667788u); p.constant(4u, 1u); p.constant(5u, 2u);
++        p.constant(6u, provided ? 0x1F402005u : 0x30000u); p.constant(7u, provided ? 0xFFFFFFFFu : p.data(0x20u));
++        p.call(p.stub(0x1000u)); p.store(2u, p.data(0x40u)); p.store(28u, p.data(0x44u)); p.finish();
++        p.recordingHandler(0x800u, 0u);
++        p.begin(0x900u); p.constant(8u, 0xABCDEF01u); p.store(8u, p.data()); p.finish(0x5A3u);
++        return p;
++    }
++
++    void authoredMipsReadAndProviderPrecedence()
++    {
++        DiscHost host; IopEmulator iop(host); const auto p = readProgram();
++        std::vector<uint8_t> canary(4096u, 0xCCu);
++        require(iop.writeMemory(0x30000u, canary.data(), canary.size()), "authored MIPS buffer setup failed");
++        iop_vblank_test::start(iop, p); iop_vblank_test::advance(iop, 5000u);
++        std::vector<uint8_t> bytes(4096u);
++        require(iop.readMemory(0x30000u, bytes.data(), bytes.size()) &&
++                    std::equal(bytes.begin(), bytes.end(), host.image.begin() + 2048u) &&
++                    iop_vblank_test::word(iop, p.data(0x40u)) == 1u &&
++                    iop_vblank_test::word(iop, p.data(0x44u)) == 0x55667788u &&
++                    iop_vblank_test::word(iop, p.data()) == 1u &&
++                    iop_vblank_test::word(iop, p.data(0x100u)) == 1u &&
++                    iop_vblank_test::word(iop, p.data(0x104u)) == 0x12345678u &&
++                    iop_vblank_test::word(iop, p.data(0x108u)) == 1u && host.eeAccesses == 0u,
++                "real import/callback did not preserve payload, GP, IRQ context or original continuation");
++        for (const auto [provided, requested] : {std::pair<uint16_t, uint16_t>{0x0101u, 0x0101u},
++                                                {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++        {
++            DiscHost providerHost; IopEmulator provider(providerHost); const auto program = readProgram(requested, provided);
++            iop_vblank_test::start(provider, program);
++            require(iop_vblank_test::word(provider, program.data()) == 0xABCDEF01u &&
++                        iop_vblank_test::word(provider, program.data(0x40u)) == 0x5A3u && providerHost.reads == 0u,
++                    "modeled read prevalidated pointers or shadowed a compatible original export");
++        }
++        DiscHost missingHost; IopEmulator missing(missingHost); const auto unsupported = readProgram(0x0201u, 0x0101u);
++        iop_vblank_test::rejects([&] { iop_vblank_test::start(missing, unsupported); }, "missing import cdvdman:114");
++    }
++
++    void authoredResetAndCallbackFailureStayStrict()
++    {
++        DiscHost resetHost; IopEmulator reset(resetHost); const auto program = readProgram();
++        const std::vector<uint8_t> canary(4096u, 0xCCu);
++        require(reset.writeMemory(0x30000u, canary.data(), canary.size()), "reset buffer setup failed");
++        iop_vblank_test::start(reset, program);
++        require(resetHost.reads == 0u, "authored reset control did not stop before the read deadline");
++        reset.reset(); iop_vblank_test::advance(reset, 10000u);
++        require(resetHost.reads == 0u, "full IOP reset retained a deferred original read");
++
++        DiscHost host; IopEmulator iop(host); auto fault = readProgram();
++        fault.begin(0x800u); fault.call(fault.stub(0x1400u));
++        fault.constant(8u, 1u); fault.store(8u, fault.data()); fault.finish();
++        require(iop.writeMemory(0x30000u, canary.data(), canary.size()), "fault buffer setup failed");
++        iop_vblank_test::start(iop, fault);
++        iop_vblank_test::rejects([&] { iop_vblank_test::advance(iop, 10000u); }, "missing import absent:42");
++        const auto instructions = iop.instructions(); iop.runEeCycles(80000u);
++        iop_vblank_test::rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:42");
++        require(host.reads == 1u && iop.instructions() == instructions && iop_vblank_test::word(iop, fault.data()) == 0u,
++                "stream callback fault was swallowed or repeated its completed read");
++    }
++}
