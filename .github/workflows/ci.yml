@@ -44,6 +44,25 @@ jobs:
           brew install python cmake pkg-config ffmpeg
       - name: Build pinned analyzer and recompiler
         run: python3 tools/bootstrap.py --tools-only --jobs 2
+      - name: Package verified standalone IOP sources
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 tools/verify_upstream.py .deps/PS2Recomp > build/iop-source-provenance.json
+          # Explicit public-source allowlist: no .work, game data, generated
+          # game corpus, git credentials or native game executable are included.
+          tar -czf build/iop-sources.tar.gz \
+            -C "$GITHUB_WORKSPACE/.deps/PS2Recomp" ps2xIOP \
+            -C "$GITHUB_WORKSPACE" LICENSE dependencies.lock.json \
+            -C "$GITHUB_WORKSPACE/build" iop-source-provenance.json
+      - name: Retain reproducible IOP test sources
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iop-sources-${{ github.sha }}
+          path: build/iop-sources.tar.gz
+          if-no-files-found: error
+          retention-days: 7
       - name: Build and test runtime contracts without commercial inputs
         shell: bash
         run: |
@@ -81,7 +100,7 @@ jobs:
             ps2_iop_import_version_tests ps2_iop_sio2_tests
           # Upstream does not register ps2x_tests with CTest. Its enum-coverage
           # fixture reads instructions.h relative to the upstream source root.
-          cmake -E chdir .deps/PS2Recomp "$PWD/build/upstream-tests/ps2xTest/ps2x_tests"
+          cmake -E chdir .deps/PS2Recomp "$PWD/build/upstream-tests/ps2xTest/ps2x_tests" 2>&1 | tee build/upstream-runtime-tests.log
           ctest --test-dir build/upstream-tests/ps2xIOP --output-on-failure --no-tests=error --parallel 2
       - name: Generated integer operations under UBSan
         shell: bash
@@ -91,3 +110,14 @@ jobs:
             task_flags+=(--sse2neon .deps/sse2neon)
           fi
           python3 patches/tests/check_integer_codegen.py --source .deps/PS2Recomp --build build/upstream "${task_flags[@]}"
+      - name: Retain test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-test-logs-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            build/upstream-runtime-tests.log
+            build/runtime/Testing/Temporary/*.log
+            build/upstream-tests/ps2xIOP/Testing/Temporary/*.log
+          if-no-files-found: warn
+          retention-days: 7
