@@ -1,0 +1,964 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -53,6 +53,11 @@
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_cdvd_search_tests tests/iop_cdvd_search_tests.cpp)
++    target_link_libraries(ps2_iop_cdvd_search_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_cdvd_search_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_cdvd_search_tests COMMAND ps2_iop_cdvd_search_tests)
++
+     add_executable(ps2_iop_cdvd_callback_tests tests/iop_cdvd_callback_tests.cpp)
+     target_link_libraries(ps2_iop_cdvd_callback_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_cdvd_callback_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -93,6 +93,25 @@
+             writeBe32(destination + 4u, value);
+         }
+ 
++        uint32_t readLe32(const uint8_t *source)
++        {
++            return uint32_t(source[0]) | (uint32_t(source[1]) << 8u) |
++                   (uint32_t(source[2]) << 16u) | (uint32_t(source[3]) << 24u);
++        }
++
++        bool readBoth32(const uint8_t *source, uint32_t &value)
++        {
++            value = readLe32(source);
++            return value == ((uint32_t(source[4]) << 24u) | (uint32_t(source[5]) << 16u) |
++                             (uint32_t(source[6]) << 8u) | uint32_t(source[7]));
++        }
++
++        bool both16Equals(const uint8_t *source, uint16_t value)
++        {
++            return (uint16_t(source[0]) | (uint16_t(source[1]) << 8u)) == value &&
++                   ((uint16_t(source[2]) << 8u) | uint16_t(source[3])) == value;
++        }
++
+         std::string isoName(const std::filesystem::path &path, bool directory)
+         {
+             std::string name = path.filename().string();
+@@ -126,23 +145,6 @@
+                 cursor += recordSize;
+             }
+             return static_cast<uint32_t>(std::max<uint64_t>(kSectorSize, alignSectors(cursor) * kSectorSize));
+-        }
+-
+-        std::string normalizedIsoComponent(std::string_view value)
+-        {
+-            std::string result(value);
+-            const size_t semicolon = result.rfind(';');
+-            if (semicolon != std::string::npos && semicolon + 1u < result.size() &&
+-                std::all_of(result.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u), result.end(),
+-                            [](unsigned char ch)
+-                            { return std::isdigit(ch) != 0; }))
+-            {
+-                result.resize(semicolon);
+-            }
+-            std::transform(result.begin(), result.end(), result.begin(),
+-                           [](unsigned char ch)
+-                           { return static_cast<char>(std::toupper(ch)); });
+-            return result;
+         }
+ 
+         size_t writeDirectoryRecord(uint8_t *destination,
+@@ -374,7 +376,7 @@
+                 return true;
+ 
+             case 10: // sceCdSearchFile
+-                cpu.gpr[2] = searchFile(a0, a1) ? 1u : 0u;
++                cpu.gpr[2] = searchFile(a0, a1, 32u) ? 1u : 0u;
+                 return true;
+ 
+             case 11: // sceCdSync
+@@ -487,6 +489,14 @@
+                 cpu.gpr[2] = 1u;
+                 return true;
+ 
++            case 84: // sceCdLayerSearchFile
++                // A raw image/virtual disc exposes layer zero only. Do not
++                // guess another layer's base or reinterpret it as layer zero.
++                if (a2 != 0u)
++                    return false;
++                cpu.gpr[2] = searchFile(a0, a1, 36u) ? 1u : 0u;
++                return true;
++
+             default:
+                 return false;
+             }
+@@ -612,13 +622,22 @@
+                     imageHandle = host.openHostFile(imagePath);
+                 uint64_t size = 0u;
+                 std::array<uint8_t, 7u> header{};
+-                size_t bytesRead = 0u;
+-                if (imageHandle != 0u && host.hostFileSize(imageHandle, size) &&
+-                    size >= uint64_t(kPrimaryVolumeDescriptorLsn + 1u) * kSectorSize &&
+-                    host.readHostFile(imageHandle, uint64_t(kPrimaryVolumeDescriptorLsn) * kSectorSize,
+-                                      header.data(), header.size(), bytesRead) && bytesRead == header.size() &&
+-                    header[0u] == 1u && std::memcmp(header.data() + 1u, "CD001", 5u) == 0 && header[6u] == 1u)
+-                    return true;
++                if (imageHandle == 0u || !host.hostFileSize(imageHandle, size))
++                    return false;
++                for (uint32_t lsn = kPrimaryVolumeDescriptorLsn; lsn < kPrimaryVolumeDescriptorLsn + 32u; ++lsn)
++                {
++                    size_t bytesRead = 0u;
++                    if (size < uint64_t(lsn + 1u) * kSectorSize ||
++                        !host.readHostFile(imageHandle, uint64_t(lsn) * kSectorSize,
++                                           header.data(), header.size(), bytesRead) || bytesRead != header.size() ||
++                        std::memcmp(header.data() + 1u, "CD001", 5u) != 0 || header[6u] != 1u)
++                        return false;
++                    if (header[0u] == 1u)
++                        return true;
++                    if (header[0u] == 255u)
++                        return false;
++                }
++                return false;
+             }
+             return buildVirtualIso();
+         }
+@@ -796,60 +815,222 @@
+             return true;
+         }
+ 
+-        IsoNode *findVirtualIsoNode(std::string_view guestPath)
+-        {
+-            if (!buildVirtualIso())
+-                return nullptr;
+-
++        bool ownedSearchSpan(uint32_t address, size_t size) const
++        {
++            const uint32_t segment = address & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            return address != 0u &&
++                (segment == 0u || segment == 0x80000000u || segment == 0xA0000000u) &&
++                physical < IopMemory::RamSize && size <= IopMemory::RamSize - physical &&
++                memory.ownsRamRange(address, size);
++        }
++
++        std::string searchPath(uint32_t address) const
++        {
++            // Match the driver's bounded path workspace, but reject an
++            // unterminated/unowned input instead of reading adjacent memory.
++            constexpr size_t pathCapacity = 1024u;
++            if (!ownedSearchSpan(address, 1u))
++                throw std::runtime_error("IOP CDVD search path is outside complete owned RAM");
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            std::string path;
++            for (size_t offset = 0u; offset < pathCapacity; ++offset)
++            {
++                if (offset >= IopMemory::RamSize - physical ||
++                    !memory.ownsRamRange(address + static_cast<uint32_t>(offset), 1u))
++                    throw std::runtime_error("IOP CDVD search path is outside complete owned RAM");
++                const char byte = static_cast<char>(memory.read8(address + static_cast<uint32_t>(offset)));
++                if (byte == '\0')
++                    return path;
++                path += byte;
++            }
++            throw std::runtime_error("IOP CDVD search path is not terminated within 1024 bytes");
++        }
++
++        static std::string comparableSearchName(std::string_view identifier, bool legacy)
++        {
++            std::string result(identifier);
++            if (legacy)
++            {
++                const size_t semicolon = result.rfind(';');
++                if (semicolon != std::string::npos && semicolon + 1u < result.size() &&
++                    std::all_of(result.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u), result.end(),
++                                [](unsigned char byte) { return std::isdigit(byte) != 0; }))
++                    result.resize(semicolon);
++            }
++            std::transform(result.begin(), result.end(), result.begin(),
++                           [](unsigned char byte) { return static_cast<char>(std::toupper(byte)); });
++            return result;
++        }
++
++        static bool searchComponents(std::string_view guestPath, std::vector<std::string> &components, bool legacy)
++        {
+             const ParsedPs2Path parsed = parsePs2Path(guestPath);
+             if (!parsed || parsed.device != Ps2PathDevice::Cdrom)
+-                return nullptr;
+-
+-            size_t current = 0u;
++                return false;
++
++            // Keep the ISO version suffix: parsePs2Path strips it for host
++            // paths, whereas CDVD metadata names include the on-disc ;1.
++            const size_t colon = guestPath.find(':');
++            std::string path(guestPath.substr(colon == std::string_view::npos ? 0u : colon + 1u));
++            std::replace(path.begin(), path.end(), '\\', '/');
++
+             size_t begin = 0u;
+-            while (begin <= parsed.path.size())
+-            {
+-                const size_t end = parsed.path.find('/', begin);
+-                const size_t length = (end == std::string::npos) ? parsed.path.size() - begin : end - begin;
+-                const std::string_view component(parsed.path.data() + begin, length);
+-                begin = (end == std::string::npos) ? parsed.path.size() + 1u : end + 1u;
+-
++            while (begin <= path.size())
++            {
++                const size_t end = path.find('/', begin);
++                const size_t length = end == std::string::npos ? path.size() - begin : end - begin;
++                std::string component(path.data() + begin, length);
++                begin = end == std::string::npos ? path.size() + 1u : end + 1u;
+                 if (component.empty() || component == ".")
+                     continue;
+-                if (component == "..")
+-                    return nullptr;
+-
+-                const std::string wanted = normalizedIsoComponent(component);
+-                const auto child = std::find_if(nodes[current].children.begin(), nodes[current].children.end(),
+-                                                [&](size_t childIndex)
+-                                                {
+-                                                    return normalizedIsoComponent(nodes[childIndex].identifier) == wanted;
+-                                                });
+-                if (child == nodes[current].children.end())
+-                    return nullptr;
+-                current = *child;
+-            }
+-            return &nodes[current];
+-        }
+-
+-        bool searchFile(uint32_t resultAddress, uint32_t nameAddress)
+-        {
+-            if (resultAddress == 0u || nameAddress == 0u)
+-                return false;
+-
+-            const std::string guestPath = memory.readString(nameAddress, 1024u);
+-            IsoNode *node = findVirtualIsoNode(guestPath);
+-            if (!node)
+-                return false;
+-
+-            // sceCdlFILE: lsn, size, name[16], date/flags[8].
+-            std::array<uint8_t, 32u> result{};
+-            writeLe32(result.data(), node->lsn);
+-            writeLe32(result.data() + 4u, node->size);
+-            const std::string leaf = normalizedIsoComponent(node->identifier);
+-            std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
+-            result[24u] = node->directory ? 2u : 0u;
+-            return memory.writeRam(resultAddress, result.data(), result.size());
++                if (component == ".." || component.size() > 31u || components.size() == 8u)
++                    return false;
++                components.push_back(comparableSearchName(component, legacy));
++            }
++            return !components.empty();
++        }
++
++        struct SearchEntry
++        {
++            uint32_t lsn = 0u;
++            uint32_t size = 0u;
++            uint8_t flags = 0u;
++            std::array<uint8_t, 7u> date{};
++            std::string identifier;
++        };
++
++        static bool decodeSearchEntry(const uint8_t *record, size_t available,
++                                      uint32_t discSectors, SearchEntry &entry)
++        {
++            if (available < 34u || record[0] < 34u || record[0] > available ||
++                record[32] == 0u || size_t(record[32]) + 33u > record[0] ||
++                !readBoth32(record + 2u, entry.lsn) || !readBoth32(record + 10u, entry.size) ||
++                !both16Equals(record + 28u, 1u))
++                return false;
++            // Extended attributes, interleaving and multi-extent files need
++            // distinct address/size rules; never report a partial file as full.
++            if (record[1] != 0u || record[26] != 0u || record[27] != 0u || (record[25] & 0x80u) != 0u ||
++                uint64_t(entry.lsn) + alignSectors(entry.size) > discSectors)
++                return false;
++            entry.flags = record[25];
++            std::copy_n(record + 18u, entry.date.size(), entry.date.begin());
++            entry.identifier.assign(reinterpret_cast<const char *>(record + 33u), record[32]);
++            return true;
++        }
++
++        bool searchFile(uint32_t resultAddress, uint32_t nameAddress, size_t resultBytes)
++        {
++            if ((resultAddress & 3u) != 0u || !ownedSearchSpan(resultAddress, resultBytes))
++                throw std::runtime_error("IOP CDVD search result is outside aligned complete owned RAM");
++            const std::string guestPath = searchPath(nameAddress);
++            std::vector<std::string> components;
++            const bool legacy = resultBytes == 32u;
++            if (!searchComponents(guestPath, components, legacy))
++                return false;
++
++            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++            uint64_t mediaSectors = 0u;
++            if (!imagePath.empty())
++            {
++                if (imageHandle == 0u)
++                    imageHandle = host.openHostFile(imagePath);
++                uint64_t size = 0u;
++                if (imageHandle == 0u || !host.hostFileSize(imageHandle, size))
++                    return false;
++                mediaSectors = size / kSectorSize;
++            }
++            else
++            {
++                if (!buildVirtualIso())
++                    return false;
++                mediaSectors = volumeSectors;
++            }
++            const auto sector = [&](uint32_t lsn, std::array<uint8_t, kSectorSize> &bytes)
++            {
++                if (lsn >= mediaSectors)
++                    return false;
++                if (imagePath.empty())
++                    return readVirtualSector(lsn, bytes.data());
++                size_t actual = 0u;
++                return host.readHostFile(imageHandle, uint64_t(lsn) * kSectorSize,
++                                         bytes.data(), bytes.size(), actual) && actual == bytes.size();
++            };
++
++            // Read ISO9660 directory metadata from the same selected medium as
++            // sector reads. A configured image is authoritative even on error.
++            // Scan a bounded descriptor set so a boot descriptor may precede
++            // the PVD without trusting an unbounded/corrupt descriptor chain.
++            std::array<uint8_t, kSectorSize> bytes{};
++            uint32_t discSectors = 0u;
++            SearchEntry entry;
++            bool primaryFound = false;
++            for (uint32_t lsn = kPrimaryVolumeDescriptorLsn; lsn < kPrimaryVolumeDescriptorLsn + 32u; ++lsn)
++            {
++                if (!sector(lsn, bytes) || std::memcmp(bytes.data() + 1u, "CD001", 5u) != 0 || bytes[6] != 1u)
++                    return false;
++                if (bytes[0] == 255u)
++                    return false;
++                if (bytes[0] != 1u)
++                    continue;
++                if (!readBoth32(bytes.data() + 80u, discSectors) || discSectors == 0u ||
++                    discSectors > mediaSectors || !both16Equals(bytes.data() + 128u, kSectorSize) ||
++                    !decodeSearchEntry(bytes.data() + 156u, 34u, discSectors, entry) ||
++                    (entry.flags & 2u) == 0u || entry.identifier != std::string(1u, '\0'))
++                    return false;
++                primaryFound = true;
++                break;
++            }
++            if (!primaryFound)
++                return false;
++
++            uint32_t directorySectorsRead = 0u;
++            for (const std::string &wanted : components)
++            {
++                if ((entry.flags & 2u) == 0u || entry.size == 0u)
++                    return false;
++                const SearchEntry directory = entry;
++                bool found = false;
++                for (uint64_t offset = 0u; offset < directory.size && !found; offset += kSectorSize)
++                {
++                    if (++directorySectorsRead > 1024u)
++                        throw std::runtime_error("IOP CDVD search exceeds its bounded ISO directory scan");
++                    if (!sector(directory.lsn + static_cast<uint32_t>(offset / kSectorSize), bytes))
++                        return false;
++                    const size_t available = static_cast<size_t>(std::min<uint64_t>(kSectorSize, directory.size - offset));
++                    for (size_t cursor = 0u; cursor < available && bytes[cursor] != 0u; cursor += bytes[cursor])
++                    {
++                        SearchEntry child;
++                        if (!decodeSearchEntry(bytes.data() + cursor, available - cursor, discSectors, child))
++                            return false;
++                        if (comparableSearchName(child.identifier, legacy) == wanted)
++                        {
++                            entry = std::move(child);
++                            found = true;
++                            break;
++                        }
++                    }
++                }
++                if (!found)
++                    return false;
++            }
++            if (entry.identifier.size() > 16u)
++                return false;
++
++            // sceCdlFILE is 32 bytes. LayerSearch's firmware/FSV extension adds
++            // u32 ISO flags at +32. Preserve the modeled legacy call's 32-byte
++            // capacity; neither interface puts flags in the eight date bytes.
++            // PS2SDK cdvdman.c: cdvdman_filetbl_entry_t, CD_cachefile and
++            // CdSearchFileInner. Keep the ISO identifier (including ;1).
++            std::array<uint8_t, 36u> result{};
++            writeLe32(result.data(), entry.lsn);
++            writeLe32(result.data() + 4u, entry.size);
++            std::memcpy(result.data() + 8u, entry.identifier.data(), entry.identifier.size());
++            for (size_t index = 1u; index < 6u; ++index)
++                result[24u + index] = entry.date[6u - index];
++            writeLe16(result.data() + 30u, static_cast<uint16_t>(1900u + entry.date[0]));
++            writeLe32(result.data() + 32u, entry.flags);
++            return memory.writeRam(resultAddress, result.data(), resultBytes);
+         }
+ 
+         IsoNode *fileForSector(uint32_t lsn)
+@@ -949,7 +1130,7 @@
+                 }
+             }
+ 
+-            if (!read && buildVirtualIso())
++            if (imagePath.empty() && buildVirtualIso())
+             {
+                 read = true;
+                 for (uint32_t sector = 0u; sector < sectors; ++sector)
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -678,12 +678,12 @@
+             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 
+-            // Supplied TrayReq/stream1 exports own their device state. Only
+-            // use the modeled stream1 setter as a compatible 1.x fallback.
++            // Supplied query/setter exports own their device state. New
++            // search/stream fallbacks are limited to the compatible 1.x ABI.
+             if (iequals(call.library, "cdvdman") &&
+-                ((call.ordinal != 14u && call.ordinal != 49u) ||
++                ((call.ordinal != 14u && call.ordinal != 49u && call.ordinal != 10u && call.ordinal != 84u) ||
+                     (imports.resolve(call.library, call.ordinal, call.version) == 0u &&
+-                     (call.ordinal != 49u || (call.version >> 8u) == 1u))) &&
++                     (call.ordinal == 14u || (call.version >> 8u) == 1u))) &&
+                 cdvd.dispatchImport(call.ordinal, cpu))
+             {
+                 if (const auto callback = cdvd.takeCompletionCallback())
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -445,6 +445,7 @@
+         constexpr uint32_t pathAddress = 0x2480u;
+         const char path[] = "cdrom0:\\movie\\opening.pss;1";
+         (void)memory.writeRam(pathAddress, path, sizeof(path));
++        (void)memory.zeroRam(resultAddress, 32u);
+ 
+         IopCpuState cpu{};
+         cpu.gpr[4] = resultAddress;
+@@ -455,7 +456,7 @@
+             expect(cpu.gpr[2] == 1u, "sceCdSearchFile did not find a case-insensitive ISO path") &&
+             expect(memory.read32(resultAddress) >= 20u, "sceCdSearchFile returned an invalid LSN") &&
+             expect(memory.read32(resultAddress + 4u) == 4u, "sceCdSearchFile returned the wrong size") &&
+-            expect(memory.readString(resultAddress + 8u, 16u) == "OPENING.PSS",
++            expect(memory.readString(resultAddress + 8u, 16u) == "OPENING.PSS;1",
+                    "sceCdSearchFile returned the wrong file name");
+ 
+         std::filesystem::remove_all(root, error);
+diff --git a/ps2xIOP/tests/iop_cdvd_search_tests.cpp b/ps2xIOP/tests/iop_cdvd_search_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_search_tests.cpp
+@@ -0,0 +1,516 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/iop_emulator.h"
++#include "iop_compat_test_support.h"
++
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <map>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++    constexpr size_t sectorBytes = 2048u;
++    constexpr uint32_t output = 0x2000u, pathAddress = 0x2080u;
++    constexpr uint32_t fileLsn = 63u, fileSize = 3500u;
++
++    void le32(uint8_t *p, uint32_t value)
++    { for (size_t i = 0u; i < 4u; ++i) p[i] = static_cast<uint8_t>(value >> (8u * i)); }
++    void both32(uint8_t *p, uint32_t value)
++    {
++        le32(p, value);
++        for (size_t i = 0u; i < 4u; ++i) p[4u + i] = static_cast<uint8_t>(value >> (24u - 8u * i));
++    }
++    void both16(uint8_t *p, uint16_t value)
++    { p[0] = p[3] = static_cast<uint8_t>(value); p[1] = p[2] = static_cast<uint8_t>(value >> 8u); }
++    size_t record(uint8_t *p, uint32_t lsn, uint32_t bytes, uint8_t flags, std::string_view name, bool systemUse = false)
++    {
++        size_t length = 33u + name.size();
++        length += length & 1u;
++        if (systemUse) length += 14u;
++        std::memset(p, 0u, length);
++        p[0] = static_cast<uint8_t>(length);
++        both32(p + 2u, lsn); both32(p + 10u, bytes);
++        const uint8_t date[] = {124u, 2u, 29u, 17u, 43u, 51u, 0xE0u};
++        std::memcpy(p + 18u, date, sizeof(date));
++        p[25] = flags; both16(p + 28u, 1u); p[32] = static_cast<uint8_t>(name.size());
++        std::memcpy(p + 33u, name.data(), name.size());
++        if (systemUse) std::fill_n(p + length - 14u, 14u, 0xA5u);
++        return length;
++    }
++
++    std::vector<uint8_t> authoredIso()
++    {
++        std::vector<uint8_t> image(96u * sectorBytes, 0u);
++        uint8_t *pvd = image.data() + 16u * sectorBytes;
++        pvd[0] = 1u; std::memcpy(pvd + 1u, "CD001", 5u); pvd[6] = 1u;
++        both32(pvd + 80u, 96u); both16(pvd + 128u, sectorBytes);
++        record(pvd + 156u, 20u, 4096u, 2u, std::string_view("\0", 1u));
++        uint8_t *end = image.data() + 17u * sectorBytes;
++        end[0] = 255u; std::memcpy(end + 1u, "CD001", 5u); end[6] = 1u;
++        uint8_t *root = image.data() + 20u * sectorBytes;
++        size_t cursor = record(root, 20u, 4096u, 2u, std::string_view("\0", 1u));
++        cursor += record(root + cursor, 20u, 4096u, 2u, std::string_view("\1", 1u));
++        record(root + cursor, 26u, 2048u, 2u, "CUTSCENES", true);
++        record(image.data() + 21u * sectorBytes, 75u, 47u, 1u, "EXTRA.BIN;1", true);
++        uint8_t *directory = image.data() + 26u * sectorBytes;
++        cursor = record(directory, 26u, 2048u, 2u, std::string_view("\0", 1u));
++        cursor += record(directory + cursor, 20u, 4096u, 2u, std::string_view("\1", 1u));
++        record(directory + cursor, fileLsn, fileSize, 0u, "OPENING.PSS;1", true);
++        for (size_t i = 0u; i < 4096u; ++i) image[fileLsn * sectorBytes + i] = static_cast<uint8_t>(i * 13u + 7u);
++        for (size_t i = 0u; i < 47u; ++i) image[75u * sectorBytes + i] = static_cast<uint8_t>(i ^ 0xA5u);
++        return image;
++    }
++
++    struct TempRoot
++    {
++        std::filesystem::path path;
++        TempRoot()
++        {
++            static size_t counter = 0u;
++            path = std::filesystem::temp_directory_path() /
++                ("ps2x-search-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
++                 "-" + std::to_string(++counter));
++            std::filesystem::create_directories(path / "CUTSCENES");
++            std::ofstream file(path / "CUTSCENES/OPENING.PSS", std::ios::binary);
++            file.write("authored virtual payload", 24u);
++            require(bool(file), "could not create authored virtual file");
++        }
++        ~TempRoot() { std::error_code error; std::filesystem::remove_all(path, error); }
++    };
++
++    class DiscHost final : public IopHost
++    {
++    public:
++        std::vector<uint8_t> image = authoredIso();
++        std::string root;
++        bool configuredImage = true, failOpen = false;
++        uint64_t failOffset = UINT64_MAX, shortOffset = UINT64_MAX;
++        mutable size_t fileAccesses = 0u, eeAccesses = 0u;
++        size_t closes = 0u, imageReads = 0u, virtualReads = 0u;
++        std::map<uint64_t, std::filesystem::path> files;
++        uint64_t nextFile = 2u;
++
++        bool readGuest(uint32_t, void *, size_t) const override { ++eeAccesses; return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { ++eeAccesses; return false; }
++        bool zeroGuest(uint32_t, size_t) override { ++eeAccesses; return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind kind) const override
++        {
++            ++fileAccesses;
++            if (kind == HostPathKind::CdImage) return configuredImage ? "authored-search.iso" : std::string{};
++            return kind == HostPathKind::CdRoot ? root : std::string{};
++        }
++        std::string translateGuestPath(std::string_view) const override { ++fileAccesses; return {}; }
++        uint64_t openHostFile(std::string_view path) override
++        {
++            ++fileAccesses;
++            if (path == "authored-search.iso") return failOpen ? 0u : 1u;
++            const std::filesystem::path value(path);
++            if (!std::filesystem::is_regular_file(value)) return 0u;
++            const uint64_t handle = nextFile++; files.emplace(handle, value); return handle;
++        }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        {
++            ++fileAccesses;
++            if (handle == 1u) { size = image.size(); return true; }
++            const auto found = files.find(handle);
++            if (found == files.end()) return false;
++            size = std::filesystem::file_size(found->second); return true;
++        }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &actual) override
++        {
++            ++fileAccesses; actual = 0u;
++            if (handle == 1u)
++            {
++                ++imageReads;
++                if (offset == failOffset || offset > image.size() || size > image.size() - offset) return false;
++                actual = offset == shortOffset && size != 0u ? size - 1u : size;
++                std::memcpy(destination, image.data() + offset, actual); return true;
++            }
++            const auto found = files.find(handle);
++            if (found == files.end()) return false;
++            ++virtualReads;
++            std::ifstream file(found->second, std::ios::binary); file.seekg(static_cast<std::streamoff>(offset));
++            file.read(static_cast<char *>(destination), static_cast<std::streamsize>(size));
++            actual = static_cast<size_t>(file.gcount()); return !file.bad();
++        }
++        void closeHostFile(uint64_t handle) override { ++fileAccesses; ++closes; files.erase(handle); }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        { return false; }
++        void log(LogLevel, std::string_view) override {}
++    };
++
++    struct Fixture
++    {
++        DiscHost host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopCdvd cdvd{host, memory, kernel};
++        Fixture()
++        {
++            std::array<uint8_t, 44u> canary; canary.fill(0xCCu);
++            require(memory.writeRam(output - 4u, canary.data(), canary.size()), "could not own output");
++            path("\\\\CUTSCENES\\OPENING.PSS;1");
++        }
++        void path(std::string_view value, uint32_t address = pathAddress)
++        {
++            std::string terminated(value); terminated += '\0';
++            require(memory.writeRam(address, terminated.data(), terminated.size()), "could not own path");
++        }
++        uint32_t call(uint16_t ordinal = 84u, uint32_t destination = output,
++                      uint32_t name = pathAddress, uint32_t layer = 0u)
++        {
++            IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = destination; cpu.gpr[5] = name; cpu.gpr[6] = layer;
++            require(cdvd.dispatchImport(ordinal, cpu), "authored CDVD search import unresolved");
++            return cpu.gpr[2];
++        }
++        std::array<uint8_t, 36u> result() const
++        {
++            std::array<uint8_t, 36u> bytes{};
++            require(memory.readRam(output, bytes.data(), bytes.size()), "could not inspect output"); return bytes;
++        }
++    };
++
++    std::array<uint8_t, 36u> expected(uint32_t lsn = fileLsn, uint32_t size = fileSize,
++                                    std::string_view name = "OPENING.PSS;1", uint8_t flags = 0u)
++    {
++        std::array<uint8_t, 36u> bytes{};
++        le32(bytes.data(), lsn); le32(bytes.data() + 4u, size);
++        std::memcpy(bytes.data() + 8u, name.data(), name.size());
++        const uint8_t date[] = {0u, 51u, 43u, 17u, 29u, 2u, 0xE8u, 0x07u};
++        std::memcpy(bytes.data() + 24u, date, sizeof(date)); le32(bytes.data() + 32u, flags);
++        return bytes;
++    }
++
++    void layerMetadataUsesActualImageAndSectorBytes()
++    {
++        TempRoot conflict;
++        Fixture f; f.host.root = conflict.path.string();
++        require(f.call() == 1u && f.result() == expected(), "layer search invented LSN, size, name, date or flags");
++        require(f.memory.read32(output - 4u) == 0xCCCCCCCCu && f.memory.read32(output + 36u) == 0xCCCCCCCCu,
++                "36-byte search overwrote adjacent data");
++        require(f.memory.zeroRam(0x3000u, 4096u), "could not own read buffer");
++        require(f.call(6u, f.memory.read32(output), 2u, 0x3000u) == 1u &&
++                    std::equal(f.host.image.begin() + fileLsn * sectorBytes,
++                               f.host.image.begin() + fileLsn * sectorBytes + 4096u,
++                               f.memory.ram().begin() + 0x3000u) && f.host.virtualReads == 0u,
++                "real image lookup did not address the same physical sector bytes");
++    }
++
++    void legacySearchUsesSameImageAndBounded32Bytes()
++    {
++        Fixture f; f.path("cdrom0:\\cutscenes\\opening.pss;1");
++        require(f.call(10u) == 1u, "legacy search no longer accepts its existing optical path form");
++        const auto result = f.result(), wanted = expected();
++        require(std::equal(result.begin(), result.begin() + 32u, wanted.begin()) &&
++                    f.memory.read32(output + 32u) == 0xCCCCCCCCu,
++                "legacy search used virtual LSNs, changed metadata or exceeded its32-byte capacity");
++        f.path("cdrom0:\\cutscenes\\opening.pss");
++        require(f.call(10u) == 1u && f.memory.read32(output) == fileLsn,
++                "legacy version-optional lookup compatibility changed");
++        Fixture small;
++        require(small.memory.zeroRam(0x2800u, 32u), "could not own legacy record");
++        require(small.call(10u, 0x2800u) == 1u && small.memory.read32(0x2800u) == fileLsn,
++                "legacy search incorrectly requires the layer-extension tail");
++    }
++
++    void directoryPaddingBootDescriptorsAndFlags()
++    {
++        Fixture f; f.path("\\EXTRA.BIN;1");
++        require(f.call() == 1u && f.result() == expected(75u, 47u, "EXTRA.BIN;1", 1u),
++                "zero sector padding stopped traversal or ISO flags polluted date bytes");
++        f.path("\\CUTSCENES");
++        require(f.call() == 1u && f.result() == expected(26u, 2048u, "CUTSCENES", 2u),
++                "directory metadata lost its independent flags field");
++        std::copy_n(f.host.image.data() + 16u * sectorBytes, sectorBytes,
++                    f.host.image.data() + 17u * sectorBytes);
++        f.host.image[16u * sectorBytes] = 0u;
++        require(f.call() == 1u && f.call(12u) == 0x14u && f.call(4u, 0u) == 1u && f.call(13u, 0u) == 2u,
++                "valid boot descriptor before primary volume blocked lookup or media readiness");
++    }
++
++    void aliasesAndOverlappingInputAreStaged()
++    {
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Fixture f;
++            require(f.call(84u, alias | output, alias | pathAddress) == 1u && f.result() == expected(),
++                    "legal IOP alias changed the query or physical output");
++            f.path("\\CUTSCENES\\OPENING.PSS;1", output);
++            require(f.call(84u, alias | output, alias | output) == 1u && f.result() == expected(),
++                    "output overwrite destroyed a still-live input path");
++        }
++    }
++
++    void invalidGuestSpansFailBeforeIoOrMutation()
++    {
++        for (unsigned variant = 0u; variant < 11u; ++variant)
++        {
++            Fixture f; uint32_t destination = output, name = pathAddress;
++            switch (variant)
++            {
++            case 0u: destination = 0u; break;
++            case 1u: destination = output + 1u; break;
++            case 2u: destination = 0x20002000u; break;
++            case 3u: destination = 0x2800u; require(f.memory.zeroRam(destination, 32u), "short output setup"); break;
++            case 4u: destination = IopMemory::RamSize - 32u; require(f.memory.zeroRam(destination, 32u), "end output setup"); break;
++            case 5u: name = 0u; break;
++            case 6u: name = 0x1F402005u; break;
++            case 7u: name = 0x20002080u; break;
++            case 8u: name = 0x2800u; break;
++            case 9u: name = IopMemory::RamSize - 2u; f.memory.write16(name, 0x4141u); break;
++            case 10u:
++            { std::array<uint8_t, 1024u> bytes; bytes.fill('A'); require(f.memory.writeRam(pathAddress, bytes.data(), bytes.size()), "unterminated setup"); break; }
++            }
++            const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++            bool rejected = false;
++            try { (void)f.call(84u, destination, name); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()).find("IOP CDVD search ") != std::string_view::npos; }
++            require(rejected && f.host.fileAccesses == 0u && f.host.eeAccesses == 0u &&
++                        std::equal(before.begin(), before.end(), f.memory.ram().begin()),
++                    "invalid guest span accessed host media, wrote RAM or lost strict diagnosis");
++        }
++    }
++
++    void unsupportedLayersRejectWithoutSideEffects()
++    {
++        Fixture f;
++        for (uint32_t layer : {1u, 2u, 0xFFFFFFFFu})
++        {
++            IopCpuState cpu{}; cpu.gpr.fill(0xDEADBEEFu);
++            cpu.gpr[4] = 0x1F402005u; cpu.gpr[5] = 0xFFFFFFFFu; cpu.gpr[6] = layer;
++            const auto before = cpu.gpr;
++            require(!f.cdvd.dispatchImport(84u, cpu) && cpu.gpr == before && f.host.fileAccesses == 0u &&
++                        f.host.eeAccesses == 0u && !f.cdvd.takeCompletionCallback(),
++                    "unsupported layer guessed a base, touched invalid pointers or modified state");
++        }
++    }
++
++    void missingPathsAndImageFailuresPreserveOutput()
++    {
++        for (std::string_view path : {"\\MISSING.BIN;1", "\\CUTSCENES\\OPENING.PSS;2",
++                                      "\\CUTSCENES\\..\\OPENING.PSS;1", "host0:OPENING.PSS;1", ""})
++        {
++            Fixture f; f.path(path); const auto before = f.result();
++            require(f.call() == 0u && f.result() == before, "missing/invalid path changed output or aliased another file");
++        }
++        TempRoot fallback;
++        for (unsigned variant = 0u; variant < 4u; ++variant)
++        {
++            Fixture f; f.host.root = fallback.path.string();
++            if (variant == 0u) f.host.failOpen = true;
++            if (variant == 1u) f.host.image[16u * sectorBytes + 1u] = 'X';
++            if (variant == 2u) f.host.shortOffset = 16u * sectorBytes;
++            if (variant == 3u) f.host.failOffset = 26u * sectorBytes;
++            const auto before = f.result();
++            require(f.call() == 0u && f.result() == before && f.host.virtualReads == 0u,
++                    "failed mounted-image search silently used extracted files or partially wrote metadata");
++        }
++    }
++
++    void malformedAndUnsupportedIsoRecordsFailClosed()
++    {
++        for (unsigned variant = 0u; variant < 13u; ++variant)
++        {
++            Fixture f;
++            uint8_t *pvd = f.host.image.data() + 16u * sectorBytes;
++            uint8_t *entry = f.host.image.data() + 26u * sectorBytes + 68u;
++            switch (variant)
++            {
++            case 0u: pvd[84u] ^= 1u; break;
++            case 1u: both16(pvd + 128u, 512u); break;
++            case 2u: both32(pvd + 80u, 97u); break;
++            case 3u: both32(pvd + 158u, 0xFFFFFFFFu); break;
++            case 4u: entry[0u] = 33u; break;
++            case 5u: entry[32u] = entry[0u]; break;
++            case 6u: entry[6u] ^= 1u; break;
++            case 7u: entry[1u] = 1u; break;
++            case 8u: entry[26u] = 1u; break;
++            case 9u: entry[27u] = 1u; break;
++            case 10u: entry[25u] = 0x80u; break;
++            case 11u: both32(entry + 10u, 0xFFFFFFFFu); break;
++            case 12u: pvd[189u] = 1u; break;
++            }
++            const auto before = f.result();
++            require(f.call() == 0u && f.result() == before && f.host.imageReads <= 5u,
++                    "malformed or unsupported ISO metadata escaped bounded validation");
++        }
++    }
++
++    void configuredImageNeverFallsBackForReadinessOrData()
++    {
++        TempRoot fallback;
++        Fixture f; f.host.root = fallback.path.string();
++        // Learn a virtual file LSN from a distinct virtual-only device, so a
++        // failed image read at that LSN would definitely trigger the old bug.
++        Fixture virtualDisc; virtualDisc.host.configuredImage = false; virtualDisc.host.root = fallback.path.string();
++        require(virtualDisc.call(10u) == 1u, "virtual control lookup failed");
++        const uint32_t virtualLsn = virtualDisc.memory.read32(output);
++        require(f.memory.zeroRam(0x3000u, sectorBytes), "read canary setup failed");
++        f.memory.write32(0x3000u, 0xCAFEBABEu);
++        f.host.failOffset = uint64_t(virtualLsn) * sectorBytes;
++        require(f.call(6u, virtualLsn, 1u, 0x3000u) == 0u && f.memory.read32(0x3000u) == 0xCAFEBABEu &&
++                    f.host.virtualReads == 0u, "short/failed image read fell back to another disc namespace");
++        f.host.failOffset = UINT64_MAX; f.host.image[16u * sectorBytes + 1u] = 'X';
++        require(f.call(4u, 0u) == 1u && f.call(12u) == 0u && f.call(13u, 0u) == 6u && f.call(28u) == 0u,
++                "readiness/status reported virtual media after configured image failure");
++    }
++
++    void virtualOnlyLookupMatchesItsOwnSectorLayout()
++    {
++        TempRoot files;
++        Fixture f; f.host.configuredImage = false; f.host.root = files.path.string();
++        require(f.call() == 1u && f.memory.read32(output) >= 20u && f.memory.read32(output + 4u) == 24u &&
++                    f.memory.readString(output + 8u, 16u) == "OPENING.PSS;1" && f.memory.read32(output + 32u) == 0u,
++                "virtual-only metadata did not describe the actual extracted file");
++        require(f.memory.zeroRam(0x3000u, sectorBytes) && f.call(6u, f.memory.read32(output), 1u, 0x3000u) == 1u &&
++                    f.memory.readString(0x3000u, 24u) == "authored virtual payload" && f.host.imageReads == 0u,
++                "virtual lookup returned an LSN outside its own payload mapping");
++    }
++
++    void searchDoesNotCreateOrConsumeCallbacks()
++    {
++        Fixture f;
++        require(f.call(37u, 0x12000u) == 0u && f.call(7u, 7u) == 1u && f.call(49u, 0x13000u) == 0u,
++                "callback control setup failed");
++        require(f.call(50u, 2u, 0u) == 2u && f.call() == 1u && !f.memory.takeDmaStart() && f.host.eeAccesses == 0u,
++                "metadata search rejected a stream registration or emitted a payload/EE DMA");
++        const auto pending = f.cdvd.takeCompletionCallback();
++        require(pending && pending->address == 0x12000u && pending->reason == 4u &&
++                    !f.cdvd.takeCompletionCallback() && f.cdvd.registeredStream1Callback().address == 0x13000u,
++                "search consumed/replaced an existing ordinary completion or stream registration");
++    }
++
++    struct Program
++    {
++        iop_test::Irx &image; uint32_t pc = 0u;
++        void emit(uint32_t instruction) { image.words(pc, {instruction}); pc += 4u; }
++        void li(uint32_t reg, uint32_t value)
++        { emit(0x3C000000u | reg << 16u | value >> 16u); emit(0x34000000u | reg << 21u | reg << 16u | (value & 0xFFFFu)); }
++        void sw(uint32_t reg, uint32_t base, uint16_t offset)
++        { emit(0xAC000000u | base << 21u | reg << 16u | offset); }
++        void jal(uint32_t address) { emit(0x0C000000u | address >> 2u); emit(0u); }
++    };
++    iop_test::Irx searchProgram(uint16_t ordinal = 84u, uint16_t requested = 0x0101u,
++                                uint16_t supplied = 0u, uint32_t layer = 0u)
++    {
++        iop_test::Irx image(0x10000u, 0x1100u);
++        image.words(0x400u, {0x41E00000u, 0u, requested, 0x64766463u, 0x006E616Du,
++                           0x03E00008u, 0x24000000u | ordinal, 0u, 0u});
++        image.words(0x480u, {0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++                           0x03E00008u, 0x24000006u, 0u, 0u});
++        Program p{image}; p.emit(0x27BDFFE0u); p.sw(31u, 29u, 28u);
++        if (supplied != 0u)
++        {
++            image.words(0x600u, {0x41C00000u, 0u, supplied, 0x64766463u, 0x006E616Du});
++            for (uint32_t i = 0u; i <= 84u; ++i) image.words(0x614u + 4u * i, {0x10800u});
++            p.li(4u, 0x10600u); p.jal(0x10494u);
++        }
++        p.li(28u, 0x1234AABBu);
++        p.li(4u, supplied ? 0x1F402005u : 0x10A00u); p.li(5u, supplied ? 0xFFFFFFFFu : 0x10A24u);
++        p.li(6u, supplied ? 7u : layer); p.jal(0x10414u);
++        p.li(8u, 0x10B00u); p.sw(2u, 8u, 0u); p.sw(28u, 8u, 4u);
++        p.emit(0x8FBF001Cu); p.emit(0u); p.emit(0x27BD0020u); p.emit(0x03E00008u); p.emit(0x00001021u);
++        image.words(0x800u, {0x3C080001u, 0x35080B10u, 0x8D090000u, 0u, 0x25290001u,
++                            0xAD090000u, 0x03E00008u, 0x240205A3u});
++        std::fill_n(image.bytes.data() + 0x100u + 0xA00u, 36u, 0xCCu);
++        const char query[] = "\\\\CUTSCENES\\OPENING.PSS;1";
++        std::memcpy(image.bytes.data() + 0x100u + 0xA24u, query, sizeof(query));
++        image.words(0xB00u, {0xDEADBEEFu, 0xDEADBEEFu});
++        return image;
++    }
++    uint32_t word(IopEmulator &iop, uint32_t address)
++    { uint32_t value = 0u; require(iop.readMemory(address, &value, 4u), "authored observation failed"); return value; }
++
++    void realMipsImportsReceiveMetadataAndKeepGp()
++    {
++        for (uint16_t ordinal : {10u, 84u})
++        {
++            DiscHost host; IopEmulator iop(host); const auto image = searchProgram(ordinal);
++            require(iop.loadModuleImage("authored-iso-query", image.bytes, nullptr, 0u).moduleId > 0 &&
++                        word(iop, 0x10B00u) == 1u && word(iop, 0x10B04u) == 0x1234AABBu,
++                    "real import did not run layer search or corrupted caller GP");
++            std::array<uint8_t, 36u> result{};
++            require(iop.readMemory(0x10A00u, result.data(), result.size()), "authored metadata read failed");
++            auto wanted = expected(); if (ordinal == 10u) std::fill(wanted.begin() + 32u, wanted.end(), 0xCCu);
++            require(result == wanted && host.eeAccesses == 0u, "real import returned incomplete/wrong metadata or injected an EE reply");
++        }
++        DiscHost host; IopEmulator iop(host); const auto image = searchProgram(84u, 0x0101u, 0u, 1u);
++        bool rejected = false;
++        try { (void)iop.loadModuleImage("authored-unsupported-layer", image.bytes, nullptr, 0u); }
++        catch (const std::runtime_error &error)
++        { rejected = std::string_view(error.what()).find("missing import cdvdman:84") != std::string_view::npos; }
++        require(rejected && word(iop, 0x10B00u) == 0xDEADBEEFu && host.imageReads == 0u,
++                "real unsupported layer import falsely succeeded");
++    }
++
++    void suppliedExportsOwnCallsBeforePointerValidation()
++    {
++        for (uint16_t ordinal : {10u, 84u})
++        {
++            for (const auto [provided, requested] : {std::pair<uint16_t, uint16_t>{0x0101u, 0x0101u},
++                                                    {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++            {
++                DiscHost host; IopEmulator iop(host); const auto image = searchProgram(ordinal, requested, provided);
++                require(iop.loadModuleImage("authored-search-provider", image.bytes, nullptr, 0u).moduleId > 0 &&
++                            word(iop, 0x10B00u) == 0x5A3u && word(iop, 0x10B10u) == 1u && host.imageReads == 0u,
++                        "modeled search shadowed a compatible provider or pre-read its pointers");
++            }
++            for (uint16_t provided : {uint16_t{0u}, uint16_t{0x0101u}})
++            {
++                DiscHost host; IopEmulator iop(host); const auto image = searchProgram(ordinal, 0x0201u, provided);
++                bool rejected = false;
++                try { (void)iop.loadModuleImage("authored-search-incompatible", image.bytes, nullptr, 0u); }
++                catch (const std::runtime_error &error)
++                { rejected = std::string_view(error.what()).find("missing import cdvdman:" + std::to_string(ordinal)) != std::string_view::npos; }
++                require(rejected && word(iop, 0x10B00u) == 0xDEADBEEFu && host.imageReads == 0u,
++                        "incompatible search major gained a modeled or wrong-provider implementation");
++            }
++        }
++    }
++
++    void resetClosesTheSelectedMediaAndRetainsNoMetadataCache()
++    {
++        Fixture f;
++        require(f.call() == 1u, "initial search failed");
++        f.cdvd.reset(); require(f.host.closes == 1u, "device reset leaked the image handle");
++        uint8_t *entry = f.host.image.data() + 26u * sectorBytes + 68u;
++        both32(entry + 2u, 70u); both32(entry + 10u, 19u);
++        require(f.call() == 1u && f.result() == expected(70u, 19u), "reset retained stale image metadata");
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Layer search returns exact mounted-image metadata and matching payload sectors", layerMetadataUsesActualImageAndSectorBytes},
++        {"Legacy search uses real-image metadata within its32-byte output", legacySearchUsesSameImageAndBounded32Bytes},
++        {"Directory padding, boot descriptors and flags preserve metadata fields", directoryPaddingBootDescriptorsAndFlags},
++        {"Legal aliases and overlapping query/output use staged metadata", aliasesAndOverlappingInputAreStaged},
++        {"Invalid owned spans fail before media access or RAM mutation", invalidGuestSpansFailBeforeIoOrMutation},
++        {"Unsupported layers remain strict before all side effects", unsupportedLayersRejectWithoutSideEffects},
++        {"Missing paths and mounted-image failures leave output untouched", missingPathsAndImageFailuresPreserveOutput},
++        {"Malformed and unsupported ISO records fail closed within bounded reads", malformedAndUnsupportedIsoRecordsFailClosed},
++        {"Configured images never fall back for readiness or sector reads", configuredImageNeverFallsBackForReadinessOrData},
++        {"Virtual-only search and reads share their own real payload mapping", virtualOnlyLookupMatchesItsOwnSectorLayout},
++        {"Search leaves stream state and pending ordinary callbacks independent", searchDoesNotCreateOrConsumeCallbacks},
++        {"Authored MIPS imports return metadata with preserved GP and strict layer failure", realMipsImportsReceiveMetadataAndKeepGp},
++        {"Supplied search exports win before pointer checks and majors stay strict", suppliedExportsOwnCallsBeforePointerValidation},
++        {"Reset closes media and cannot return stale directory metadata", resetClosesTheSelectedMediaAndRetainsNoMetadataCache},
++    };
++    return iop_test::run(tests);
++}
