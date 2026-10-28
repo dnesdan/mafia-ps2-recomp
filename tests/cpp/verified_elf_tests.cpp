@@ -5,6 +5,7 @@
 #include <vector>
 
 void test_frame_capture();
+void test_controller_input();
 
 namespace {
 void require(bool condition, const char *message) { if (!condition) throw std::runtime_error(message); }
@@ -128,7 +129,8 @@ int main() {
         require(mafia::json_string("a\n\"\\") == "\"a\\u000a\\\"\\\\\"","JSON escaping");
         test_symbols();
         test_frame_capture();
-        std::cout<<"Host verification tests passed (synthetic ELF and capture bytes; no game execution).\n";
+        test_controller_input();
+        std::cout<<"Host verification tests passed (synthetic ELF, capture bytes and controller events; no game execution).\n";
         return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<'\n';return 1;}
 }
