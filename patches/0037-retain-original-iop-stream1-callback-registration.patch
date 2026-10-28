@@ -1,0 +1,519 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -53,6 +53,11 @@
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_cdvd_callback_tests tests/iop_cdvd_callback_tests.cpp)
++    target_link_libraries(ps2_iop_cdvd_callback_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_cdvd_callback_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_cdvd_callback_tests COMMAND ps2_iop_cdvd_callback_tests)
++
+     add_executable(ps2_iop_sio2_tests tests/iop_sio2_tests.cpp)
+     target_link_libraries(ps2_iop_sio2_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_sio2_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -25,6 +25,12 @@
+         // so deterministic device tests do not alter the public host interface.
+         using ClockSource = std::function<std::optional<std::chrono::sys_seconds>()>;
+ 
++        struct RegisteredCallback
++        {
++            uint32_t address = 0u;
++            uint32_t gp = 0u;
++        };
++
+         struct CompletionCallback
+         {
+             uint32_t address = 0u;
+@@ -48,6 +54,10 @@
+         [[nodiscard]] int interruptEventFlag();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
++        // A live registration, not a completion event. Future stream IRQ
++        // delivery must resolve this slot then, so replacement/null/reset do
++        // not leave a captured stale function in the ordinary callback queue.
++        [[nodiscard]] RegisteredCallback registeredStream1Callback() const noexcept;
+ 
+     private:
+         class Impl;
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -203,6 +203,7 @@
+             closeFiles();
+             releaseFsvReadBuffer();
+             callback = {};
++            stream1Callback = {};
+             initialized = false;
+             trayChangePending = true;
+             readActive = false;
+@@ -327,6 +328,12 @@
+                 return true;
+ 
+             case 6: // sceCdRead
++                // A stream-mode completion must invoke the selected live
++                // stream callback in interrupt context. That delivery is not
++                // modeled yet; reject before I/O or ordinary completion state.
++                // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html (cdvdman_intr_cb)
++                if (streamFlag != 0u)
++                    return false;
+                 if (readSectors(a0, a1, a2))
+                 {
+                     signalCommandComplete();
+@@ -345,6 +352,8 @@
+                 return true;
+ 
+             case 7: // sceCdSeek
++                if (streamFlag != 0u)
++                    return false;
+                 currentLsn = a0;
+                 lastError = kCdvdErrorNone;
+                 controllerReadError = false;
+@@ -411,6 +420,17 @@
+ 
+             case 47: // sceGetFsvRbuf(void)
+                 cpu.gpr[2] = getFsvReadBuffer();
++                return true;
++
++            case 49: // sceCdstm1Cb(void (*callback)(int))
++                // This setter only replaces a persistent stream1 slot. It
++                // returns zero even when replacing a previous callback and
++                // never dereferences/invokes the supplied address. User37 and
++                // stream0 registration are independent. Ordinary sceCdInit
++                // does not clear this slot; full modeled IOP reset does.
++                // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html (sceCdstm1Cb)
++                stream1Callback = {a0, a0 != 0u ? cpu.gpr[28] : 0u};
++                cpu.gpr[2] = 0u;
+                 return true;
+ 
+             case 50: // sceCdSC
+@@ -479,6 +499,11 @@
+             return result;
+         }
+ 
++        RegisteredCallback registeredStream1Callback() const noexcept
++        {
++            return stream1Callback;
++        }
++
+     private:
+         void checkTrayChange(uint32_t destination)
+         {
+@@ -951,6 +976,7 @@
+         IopKernel &kernel;
+         ClockSource clockSource;
+         Callback callback;
++        RegisteredCallback stream1Callback;
+         std::optional<CompletionCallback> completionCallback;
+         bool initialized = false;
+         bool trayChangePending = true;
+@@ -1004,4 +1030,9 @@
+     {
+         return m_impl->takeCompletionCallback();
+     }
++
++    IopCdvd::RegisteredCallback IopCdvd::registeredStream1Callback() const noexcept
++    {
++        return m_impl->registeredStream1Callback();
++    }
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -678,10 +678,12 @@
+             if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 
+-            // A supplied TrayReq export owns its own media-change observer and
+-            // hardware behavior. The new modeled query is only its fallback.
++            // Supplied TrayReq/stream1 exports own their device state. Only
++            // use the modeled stream1 setter as a compatible 1.x fallback.
+             if (iequals(call.library, "cdvdman") &&
+-                (call.ordinal != 14u || imports.resolve(call.library, call.ordinal, call.version) == 0u) &&
++                ((call.ordinal != 14u && call.ordinal != 49u) ||
++                    (imports.resolve(call.library, call.ordinal, call.version) == 0u &&
++                     (call.ordinal != 49u || (call.version >> 8u) == 1u))) &&
+                 cdvd.dispatchImport(call.ordinal, cpu))
+             {
+                 if (const auto callback = cdvd.takeCompletionCallback())
+diff --git a/ps2xIOP/tests/iop_cdvd_callback_tests.cpp b/ps2xIOP/tests/iop_cdvd_callback_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_callback_tests.cpp
+@@ -0,0 +1,372 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/iop_emulator.h"
++#include "iop_compat_test_support.h"
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++
++    class DiscHost final : public IopHost
++    {
++    public:
++        DiscHost()
++        {
++            for (size_t i = 0u; i < sectors.size(); ++i)
++                sectors[i] = static_cast<uint8_t>((i * 7u + 3u) & 0xFFu);
++        }
++        bool readGuest(uint32_t, void *, size_t) const override { ++eeAccesses; return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { ++eeAccesses; return false; }
++        bool zeroGuest(uint32_t, size_t) override { ++eeAccesses; return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
++        void freeGuest(uint32_t) override {}
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override {}
++        std::string hostPath(HostPathKind kind) const override
++        { ++fileAccesses; return kind == HostPathKind::CdImage ? "authored-callback.iso" : std::string{}; }
++        std::string translateGuestPath(std::string_view) const override { ++fileAccesses; return {}; }
++        uint64_t openHostFile(std::string_view path) override
++        { ++fileAccesses; return path == "authored-callback.iso" ? 1u : 0u; }
++        bool hostFileSize(uint64_t handle, uint64_t &size) const override
++        { ++fileAccesses; size = sectors.size(); return handle == 1u; }
++        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size, size_t &actual) override
++        {
++            ++fileAccesses;
++            actual = 0u;
++            if (handle != 1u || offset > sectors.size() || size > sectors.size() - offset)
++                return false;
++            std::memcpy(destination, sectors.data() + offset, size);
++            actual = size;
++            return true;
++        }
++        void closeHostFile(uint64_t) override { ++fileAccesses; }
++        int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
++        bool hasGuestFunction(uint32_t) const override { return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        { return false; }
++        void log(LogLevel, std::string_view) override {}
++
++        std::array<uint8_t, 4096u> sectors{};
++        mutable size_t fileAccesses = 0u, eeAccesses = 0u;
++    };
++
++    // This adapter also compiles the same negative-control fixtures against
++    // the preceding source, which did not expose or implement the live slot.
++    template <typename Device> std::array<uint32_t, 2u> slot(const Device &device)
++    {
++        if constexpr (requires { device.registeredStream1Callback(); })
++        {
++            const auto value = device.registeredStream1Callback();
++            return {value.address, value.gp};
++        }
++        else
++            return {};
++    }
++
++    struct Fixture
++    {
++        DiscHost host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopCdvd cdvd{host, memory, kernel};
++
++        uint32_t call(uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u,
++                      uint32_t a2 = 0u, uint32_t gp = 0u)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            cpu.gpr[6] = a2;
++            cpu.gpr[7] = 0xFFFFFFFFu;
++            cpu.gpr[28] = gp;
++            require(cdvd.dispatchImport(ordinal, cpu), "authored CDVD callback import unresolved");
++            return cpu.gpr[2];
++        }
++    };
++
++    void registrationReplacementNullAndLiveQuery()
++    {
++        Fixture f;
++        require(slot(f.cdvd) == std::array<uint32_t, 2u>{}, "new CDVD device already had a stream registration");
++        for (const auto [address, gp] : {std::pair{0x12340u, 0xAABBCCDDu}, {0xA0014560u, 0x24681357u},
++                                       {0x80016780u, 0x10203040u}, {0xFFFFFFFFu, 0x55667788u}})
++        {
++            require(f.call(49u, address, 0xFFFFFFFFu, 0x1F808260u, gp) == 0u,
++                    "stream setter returned an old pointer or dereferenced unused arguments");
++            const std::array<uint32_t, 2u> expected{address, gp};
++            require(slot(f.cdvd) == expected && slot(f.cdvd) == expected && !f.cdvd.takeCompletionCallback(),
++                    "registration did not preserve the live pointer/GP or its query consumed/queued a callback");
++        }
++        require(f.call(49u, 0u, 0u, 0u, 0xBAD0BAD0u) == 0u &&
++                    slot(f.cdvd) == std::array<uint32_t, 2u>{} && !f.cdvd.takeCompletionCallback(),
++                "null registration retained a target or generated completion");
++        require(f.host.fileAccesses == 0u && f.host.eeAccesses == 0u,
++                "registration or slot query accessed a disc or EE memory");
++    }
++
++    void registrationPreservesMemoryEventsAndController()
++    {
++        Fixture f;
++        require(f.memory.zeroRam(0x10000u, 32u), "could not set RAM canaries");
++        f.memory.write32(0x10000u, 0xCAFEBABEu);
++        const int event = f.cdvd.interruptEventFlag();
++        IopCpuState clear{};
++        clear.gpr[4] = static_cast<uint32_t>(event);
++        require(f.kernel.dispatchEventImport(8u, clear), "could not clear actual CDVD event");
++        const uint32_t freeBefore = f.memory.totalFreeMemory();
++        const std::vector<uint8_t> before(f.memory.ram().begin(), f.memory.ram().end());
++        uint8_t readyBefore = 0u, readyAfter = 0u;
++        require(f.cdvd.readRegisterByte(0x1F402005u, readyBefore), "READY register unavailable");
++        const uint32_t errorBefore = f.call(8u);
++        const int marker = f.kernel.createInternalEventFlag(0u, 0u, 0u);
++        require(f.call(49u, 0x10000u, 0u, 0u, 0xAABBCCDDu) == 0u &&
++                    f.cdvd.readRegisterByte(0x1F402005u, readyAfter), "stream setter or READY read failed");
++        const int afterMarker = f.kernel.createInternalEventFlag(0u, 0u, 0u);
++        IopCpuState poll{};
++        poll.gpr[4] = static_cast<uint32_t>(event);
++        poll.gpr[5] = 0x29u;
++        require(f.kernel.dispatchEventImport(11u, poll) && static_cast<int32_t>(poll.gpr[2]) == -418 &&
++                    afterMarker == marker + 1 && f.call(8u) == errorBefore && readyBefore == readyAfter &&
++                    f.memory.totalFreeMemory() == freeBefore &&
++                    std::equal(before.begin(), before.end(), f.memory.ram().begin()) &&
++                    !f.memory.takeDmaStart() && f.memory.interruptStatus() == 0u && !f.cdvd.takeCompletionCallback(),
++                "setter signaled completion, acquired an event, changed controller state or wrote RAM");
++        require(f.host.fileAccesses == 0u && f.host.eeAccesses == 0u, "setter touched host I/O");
++    }
++
++    void userCallbackAndPendingCompletionStayIndependent()
++    {
++        Fixture f;
++        require(f.call(37u, 0x12000u, 0u, 0u, 0x11111111u) == 0u && f.call(7u, 5u) == 1u,
++                "ordinary user completion fixture failed");
++        require(f.call(49u, 0x13000u, 0u, 0u, 0x22222222u) == 0u &&
++                    f.call(37u, 0x14000u, 0u, 0u, 0x33333333u) == 0x12000u &&
++                    slot(f.cdvd) == std::array<uint32_t, 2u>{0x13000u, 0x22222222u},
++                "stream and ordinary user registrations shared a slot or return contract");
++        IopCpuState stream0{};
++        stream0.gpr[2] = 0xDEADBEEFu;
++        stream0.gpr[4] = 0x15000u;
++        require(!f.cdvd.dispatchImport(48u, stream0) && stream0.gpr[2] == 0xDEADBEEFu &&
++                    slot(f.cdvd) == std::array<uint32_t, 2u>{0x13000u, 0x22222222u},
++                "unmodeled stream0 registration aliased or overwrote stream1");
++        require(f.call(49u, 0u) == 0u, "stream unregister failed");
++        const auto queued = f.cdvd.takeCompletionCallback();
++        require(queued && queued->address == 0x12000u && queued->gp == 0x11111111u && queued->reason == 4u &&
++                    !f.cdvd.takeCompletionCallback() && f.call(37u, 0u) == 0x14000u,
++                "stream changes destroyed/replaced an already pending ordinary user completion");
++    }
++
++    void resetAndOrdinaryInitHaveDistinctLifetimes()
++    {
++        Fixture first, second;
++        require(first.call(49u, 0x12000u, 0u, 0u, 0xAABBCCDDu) == 0u &&
++                    second.call(49u, 0x16000u, 0u, 0u, 0x11223344u) == 0u,
++                "per-instance registration failed");
++        for (uint32_t initMode : {0u, 1u, 5u})
++        {
++            require(first.call(4u, initMode) == 1u &&
++                        slot(first.cdvd) == std::array<uint32_t, 2u>{0x12000u, 0xAABBCCDDu},
++                    "ordinary sceCdInit/exit cleared a persistent stream1 registration");
++        }
++        first.cdvd.reset();
++        require(slot(first.cdvd) == std::array<uint32_t, 2u>{} && !first.cdvd.takeCompletionCallback() &&
++                    slot(second.cdvd) == std::array<uint32_t, 2u>{0x16000u, 0x11223344u},
++                "full device reset retained a stream target or affected another IOP instance");
++        require(first.call(49u, 0x17000u, 0u, 0u, 0x778899AAu) == 0u &&
++                    slot(first.cdvd) == std::array<uint32_t, 2u>{0x17000u, 0x778899AAu},
++                "registration after reset reused a stale slot lifetime");
++    }
++
++    void unmodeledStreamCommandsFailBeforeSideEffects()
++    {
++        Fixture f;
++        const uint32_t destination = f.memory.allocate(2048u);
++        require(destination != 0u && f.memory.zeroRam(destination, 2048u), "read destination setup failed");
++        require(f.call(49u, 0x12340u, 0u, 0u, 0x98765432u) == 0u, "stream setter unavailable");
++        for (uint32_t mode : {1u, 2u})
++        {
++            require(f.call(50u, mode) == mode, "stream mode selection failed");
++            for (uint16_t ordinal : {6u, 7u, 48u, 62u, 63u, 114u})
++            {
++                IopCpuState cpu{};
++                cpu.gpr[2] = 0xDEADBEEFu;
++                cpu.gpr[4] = 0u;
++                cpu.gpr[5] = 1u;
++                cpu.gpr[6] = destination;
++                const auto before = cpu;
++                const auto callbackBefore = slot(f.cdvd);
++                const uint32_t freeBefore = f.memory.totalFreeMemory();
++                const size_t accesses = f.host.fileAccesses;
++                const std::vector<uint8_t> ram(f.memory.ram().begin(), f.memory.ram().end());
++                const int marker = f.kernel.createInternalEventFlag(0u, 0u, 0u);
++                require(!f.cdvd.dispatchImport(ordinal, cpu) && cpu.gpr == before.gpr &&
++                            slot(f.cdvd) == callbackBefore && !f.cdvd.takeCompletionCallback() &&
++                            f.memory.totalFreeMemory() == freeBefore && f.host.fileAccesses == accesses &&
++                            std::equal(ram.begin(), ram.end(), f.memory.ram().begin()) &&
++                            f.kernel.createInternalEventFlag(0u, 0u, 0u) == marker + 1,
++                        "unmodeled stream operation performed I/O, signaled completion or lost registration");
++            }
++        }
++        require(f.call(50u, 0u) == 0u && f.call(37u, 0x18000u, 0u, 0u, 0x12345678u) == 0u &&
++                    f.call(6u, 0u, 1u, destination) == 1u,
++                "normal mode-zero sector read stopped working after stream registration");
++        std::array<uint8_t, 2048u> bytes{};
++        require(f.memory.readRam(destination, bytes.data(), bytes.size()) &&
++                    std::equal(bytes.begin(), bytes.end(), f.host.sectors.begin()), "normal read fabricated sector bytes");
++        const auto read = f.cdvd.takeCompletionCallback();
++        require(read && read->address == 0x18000u && read->gp == 0x12345678u && read->reason == 1u &&
++                    slot(f.cdvd) == std::array<uint32_t, 2u>{0x12340u, 0x98765432u} && f.call(7u, 1u) == 1u,
++                "normal completion replaced the persistent stream slot or user callback");
++        require(f.call(50u, 2u) == 2u, "could not select unsupported streaming mode");
++        for (uint16_t ordinal : {6u, 7u})
++        {
++            IopCpuState rejected{};
++            rejected.gpr[2] = 0xDEADBEEFu;
++            require(!f.cdvd.dispatchImport(ordinal, rejected) && rejected.gpr[2] == 0xDEADBEEFu,
++                    "unsupported streaming command replaced an ordinary pending result");
++        }
++        const auto seek = f.cdvd.takeCompletionCallback();
++        require(seek && seek->address == 0x18000u && seek->reason == 4u && f.host.eeAccesses == 0u,
++                "mode-zero seek lost its existing ordinary callback behavior");
++    }
++
++    struct Program
++    {
++        iop_test::Irx &image;
++        uint32_t pc;
++        void emit(uint32_t word) { image.words(pc, {word}); pc += 4u; }
++        void li(uint32_t reg, uint32_t value)
++        { emit(0x3C000000u | (reg << 16u) | (value >> 16u)); emit(0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu)); }
++        void sw(uint32_t reg, uint32_t base, uint16_t offset)
++        { emit(0xAC000000u | (base << 21u) | (reg << 16u) | offset); }
++        void jal(uint32_t address) { emit(0x0C000000u | (address >> 2u)); emit(0u); }
++    };
++
++    uint32_t word(IopEmulator &iop, uint32_t address)
++    {
++        uint32_t value = 0u;
++        require(iop.readMemory(address, &value, 4u), "authored observation outside RAM");
++        return value;
++    }
++
++    iop_test::Irx authoredSetter(uint32_t callback = 0x10300u, uint16_t requestedVersion = 0x0101u,
++                                 uint16_t providerVersion = 0u, uint16_t laterOrdinal = 0u)
++    {
++        iop_test::Irx image(0x10000u, 0x900u);
++        image.words(0x400u, {0x41E00000u, 0u, requestedVersion, 0x64766463u, 0x006E616Du,
++            0x03E00008u, 0x24000031u, 0x03E00008u, 0x24000000u | laterOrdinal, 0u, 0u});
++        image.words(0x480u, {0x41E00000u, 0u, 0x0101u, 0x64616F6Cu, 0x65726F63u,
++            0x03E00008u, 0x24000006u, 0u, 0u});
++        Program entry{image, 0u};
++        entry.emit(0x27BDFFE0u); entry.sw(31u, 29u, 28u);
++        if (providerVersion != 0u)
++        {
++            image.words(0x500u, {0x41C00000u, 0u, providerVersion, 0x64766463u, 0x006E616Du});
++            for (uint32_t ordinal = 0u; ordinal <= 49u; ++ordinal)
++                image.words(0x514u + ordinal * 4u, {0x10680u});
++            entry.li(4u, 0x10500u); entry.jal(0x10494u);
++        }
++        entry.li(28u, 0x11223344u);
++        entry.li(4u, callback); entry.li(5u, 0xFFFFFFFFu); entry.li(6u, 0x1F808260u); entry.li(7u, 0xFFFFFFFFu);
++        entry.jal(0x10414u);
++        entry.li(8u, 0x10700u); entry.sw(2u, 8u, 4u);
++        if (laterOrdinal != 0u)
++        {
++            entry.li(4u, 0u); entry.li(5u, 0u); entry.li(6u, 0u); entry.li(7u, 0u);
++            entry.jal(0x1041Cu);
++        }
++        entry.li(8u, 300u);
++        entry.emit(0x2508FFFFu); entry.emit(0x1500FFFEu); entry.emit(0u);
++        entry.li(4u, 0u); entry.jal(0x10414u);
++        entry.li(8u, 0x10700u); entry.sw(2u, 8u, 8u);
++        entry.emit(0x8FBF001Cu); entry.emit(0u); entry.emit(0x27BD0020u);
++        entry.emit(0x03E00008u); entry.emit(0x00001021u);
++        image.words(0x300u, {0x3C080001u, 0x35080700u, 0x8D090000u, 0u, 0x25290001u,
++                             0xAD090000u, 0x03E00008u, 0u});
++        image.words(0x680u, {0x3C080001u, 0x35080710u, 0x8D090000u, 0u, 0x25290001u,
++                             0xAD090000u, 0x03E00008u, 0x240207B5u});
++        image.words(0x704u, {0xDEADBEEFu, 0xDEADBEEFu});
++        return image;
++    }
++
++    void authoredRegistrationDoesNotExecuteCallback()
++    {
++        for (uint32_t callback : {0x10300u, 0xA0010300u, 0xFFFFFFFFu})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            const auto image = authoredSetter(callback);
++            const auto loaded = iop.loadModuleImage("authored-stream-setter", image.bytes, nullptr, 0u);
++            require(loaded.moduleId > 0 && loaded.startResult == 0 && word(iop, 0x10700u) == 0u &&
++                        word(iop, 0x10704u) == 0u && word(iop, 0x10708u) == 0u && host.guestWrites == 0u,
++                    "real stream-setter import invoked/dereferenced its target or returned a previous callback");
++            iop.runEeCycles(8000u);
++            require(word(iop, 0x10700u) == 0u, "stream registration queued a deferred callback without a read");
++        }
++    }
++
++    void suppliedExportsKeepPrecedenceAndVersionRules()
++    {
++        for (const auto [provided, requested] : {std::pair<uint16_t, uint16_t>{0x0101u, 0x0101u},
++                                                {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            const auto image = authoredSetter(0xFFFFFFFFu, requested, provided);
++            require(iop.loadModuleImage("authored-cdvd-provider", image.bytes, nullptr, 0u).moduleId > 0 &&
++                        word(iop, 0x10704u) == 0x7B5u && word(iop, 0x10708u) == 0x7B5u &&
++                        word(iop, 0x10710u) == 2u,
++                    "modeled stream setter shadowed a compatible supplied export");
++        }
++        for (uint16_t provided : {uint16_t{0u}, uint16_t{0x0101u}})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            const auto image = authoredSetter(0x10300u, 0x0201u, provided);
++            bool rejected = false;
++            try { (void)iop.loadModuleImage("authored-incompatible-cdvd", image.bytes, nullptr, 0u); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()).find("missing import cdvdman:49") != std::string_view::npos; }
++            require(rejected && word(iop, 0x10704u) == 0xDEADBEEFu,
++                    "unsupported CDVD major gained a modeled setter or incompatible provider");
++        }
++    }
++
++    void laterStreamReadsRemainStrictAfterRegistration()
++    {
++        for (uint16_t ordinal : {48u, 62u, 63u, 114u})
++        {
++            iop_test::Host host;
++            IopEmulator iop(host);
++            const auto image = authoredSetter(0x10300u, 0x0101u, 0u, ordinal);
++            bool rejected = false;
++            try { (void)iop.loadModuleImage("authored-stream-boundary", image.bytes, nullptr, 0u); }
++            catch (const std::runtime_error &error)
++            { rejected = std::string_view(error.what()).find("missing import cdvdman:" + std::to_string(ordinal)) != std::string_view::npos; }
++            require(rejected && word(iop, 0x10704u) == 0u && word(iop, 0x10708u) == 0xDEADBEEFu &&
++                        word(iop, 0x10700u) == 0u && host.guestWrites == 0u,
++                    "setter did not advance to the distinct unsupported stream operation or fabricated a callback");
++        }
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Stream1 registration preserves and replaces a live pointer/GP slot", registrationReplacementNullAndLiveQuery},
++        {"Stream registration leaves RAM, events, controller state and host I/O untouched", registrationPreservesMemoryEventsAndController},
++        {"User callbacks, pending user completions and stream0 remain independent", userCallbackAndPendingCompletionStayIndependent},
++        {"Ordinary CDVD init preserves registration while per-instance reset clears it", resetAndOrdinaryInitHaveDistinctLifetimes},
++        {"Unmodeled stream commands reject before I/O and mode-zero reads remain real", unmodeledStreamCommandsFailBeforeSideEffects},
++        {"Authored stream-setter imports never invoke callbacks at registration", authoredRegistrationDoesNotExecuteCallback},
++        {"Supplied original stream-setter exports retain precedence and major matching", suppliedExportsKeepPrecedenceAndVersionRules},
++        {"Authored stream calls reach their own strict boundary after registration", laterStreamReadsRemainStrictAfterRegistration},
++    };
++    return iop_test::run(tests);
++}
