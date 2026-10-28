@@ -1,0 +1,14 @@
+diff --git a/ps2xIOP/tests/iop_sio2_tests.cpp b/ps2xIOP/tests/iop_sio2_tests.cpp
+--- a/ps2xIOP/tests/iop_sio2_tests.cpp
++++ b/ps2xIOP/tests/iop_sio2_tests.cpp
+@@ -461,7 +461,9 @@
+         ControllerState a; a.connected=true; a.buttons=0xFFF7u; a.rightX=0x11u; a.pressures.fill(0x22u);
+         ControllerState b=a; b.buttons=0xBFFFu; b.rightX=0x33u; b.pressures.fill(0x44u);
+         std::atomic<bool> stop=false;
+-        std::jthread writer([&] { while (!stop.load()) { f.device.setControllerState(0u,a); f.device.setControllerState(0u,b); } });
++        // Apple libc++ in the supported Xcode toolchain lacks jthread. Both
++        // normal and exceptional paths below already stop and join this worker.
++        std::thread writer([&] { while (!stop.load()) { f.device.setControllerState(0u,a); f.device.setControllerState(0u,b); } });
+         try
+         {
+             const std::array<uint8_t,21u> bytes{1u,0x42u};
