@@ -1,0 +1,613 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index b7be3344194e937365b443148eefb22e24f38bcb..c41d595e6ddf6303d478d7c5b7b37358362f9ea8 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -723,6 +723,23 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    void IopKernel::waitCurrentEvent(IopCpuState &cpu, int eventId, uint32_t bits)
++    {
++        if (!isCurrentThreadCpu(cpu) || m_currentThread->state != IopThreadState::Running)
++            throw std::runtime_error("IOP event wait requires the current managed CPU");
++        const auto event = m_eventFlags.find(eventId);
++        if (event == m_eventFlags.end() || bits == 0u)
++            throw std::runtime_error("IOP event wait requires a live event and nonzero bits");
++        if (eventSatisfied(event->second, bits, 0u))
++            return;
++        m_currentThread->state = IopThreadState::EventFlag;
++        m_currentThread->waitId = eventId;
++        m_currentThread->waitBits = bits;
++        m_currentThread->waitMode = 0u; // WEF_AND, no clear.
++        m_currentThread->waitResultAddress = 0u;
++        cpu.yielded = true;
++    }
++
+     void IopKernel::sleepCurrent(IopCpuState &cpu)
+     {
+         if (m_currentThread == nullptr)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 23ddc88b4181e030812287fb66fb739acb452003..971919e32c2c83daa0a45c66c56f15079d42c317 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -64,6 +64,13 @@ namespace ps2x::iop::detail
+         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
+         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
+ 
++        [[nodiscard]] bool hasCurrentThread() const noexcept { return m_currentThread != nullptr; }
++        [[nodiscard]] bool isCurrentThreadCpu(const IopCpuState &cpu) const noexcept
++        { return m_currentThread != nullptr && &m_currentThread->cpu == &cpu; }
++        // Wait without borrowing the guest's argument registers or a temporary
++        // CPU. The importer retries its condition after this event wakes it.
++        void waitCurrentEvent(IopCpuState &cpu, int eventId, uint32_t bits);
++
+         void sleepCurrent(IopCpuState &cpu);
+         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+ 
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index 6dfe63de9bcb781250a876c7d25b9c52b155ffae..a26a80185b38c95778ab3a2ed70e29cae1b44998 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -605,6 +605,25 @@ namespace ps2x::iop::detail
+             return stream1Callback;
+         }
+ 
++        std::optional<SyncWait> pendingSyncWait(uint32_t mode)
++        {
++            if ((mode != 0u && mode != 5u) || !ncmdBusy())
++                return std::nullopt;
++            if (readActive)
++                throw std::runtime_error("IOP CDVD sync cannot reenter host sector I/O");
++            return SyncWait{ensureInterruptEventFlag(), commandGeneration};
++        }
++
++        bool syncWaitComplete(const SyncWait &wait)
++        {
++            if (wait.generation != commandGeneration || wait.eventId != interruptEventFlagId)
++                throw std::runtime_error("IOP CDVD sync wait belongs to a retired device lifetime");
++            (void)ensureInterruptEventFlag(); // A deleted event is not completion.
++            // The shared event is only a wakeup. A stream callback can submit
++            // another command before the waiting CPU gets to run again.
++            return !ncmdBusy();
++        }
++
+         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
+         {
+             if (readActive)
+@@ -1471,6 +1490,16 @@ namespace ps2x::iop::detail
+         return m_impl->dispatchImport(ordinal, cpu, currentCycle);
+     }
+ 
++    std::optional<IopCdvd::SyncWait> IopCdvd::pendingSyncWait(uint32_t mode)
++    {
++        return m_impl->pendingSyncWait(mode);
++    }
++
++    bool IopCdvd::syncWaitComplete(const SyncWait &wait)
++    {
++        return m_impl->syncWaitComplete(wait);
++    }
++
+     void IopCdvd::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
+     {
+         m_impl->serviceDue(currentCycle, executor, intrman);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+index 29d4f7245a148182bd329445b277bea15ec0430e..0f5d099cd8cf5d856ea641b31342f24ba85b8dc4 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -33,6 +33,12 @@ namespace ps2x::iop::detail
+             uint32_t gp = 0u;
+         };
+ 
++        struct SyncWait
++        {
++            int eventId = 0;
++            uint64_t generation = 0u;
++        };
++
+         struct CompletionCallback
+         {
+             uint32_t address = 0u;
+@@ -55,6 +61,10 @@ namespace ps2x::iop::detail
+         // does not signal power-off or alter an existing event's bits.
+         [[nodiscard]] int interruptEventFlag();
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle = 0u);
++        // Only untimed command waits (modes 0/5) are currently resumable.
++        // A device-only caller still cannot claim a pending wait has returned.
++        [[nodiscard]] std::optional<SyncWait> pendingSyncWait(uint32_t mode);
++        [[nodiscard]] bool syncWaitComplete(const SyncWait &wait);
+         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman);
+         [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index f5ec380d2732a8c24212b90642265186ed9620e8..1c0e8f577f665d1e7df978b22ce3e681a8edc50f 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -394,6 +394,7 @@ namespace ps2x::iop::detail
+             totalInstructions = 0;
+             eeCycleCarry = 0;
+             activeCpu = nullptr;
++            activeInvocationBudget.reset();
+             lastError.clear();
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+@@ -544,9 +545,50 @@ namespace ps2x::iop::detail
+         {
+             Handled,
+             JumpToGuest,
++            RetryAfterWait,
+             Missing,
+         };
+ 
++        struct InvocationBudget
++        {
++            uint64_t instructionStart;
++            uint64_t cycleLimit;
++            uint32_t instructions;
++        };
++
++        ImportDisposition waitForCdvdSync(CpuState &cpu, const IopCdvd::SyncWait &wait)
++        {
++            // Waiting inside an IRQ (or with CPU interrupts disabled) cannot
++            // run the completion IRQ. Keep that unsupported deadlock explicit.
++            if (intrman.inInterruptContext() || memory.interruptControl() == 0u)
++                executionFailure("blocking CDVD sync requires interruptible thread context", cpu);
++            if (kernel.isCurrentThreadCpu(cpu))
++            {
++                kernel.waitCurrentEvent(cpu, wait.eventId, 1u);
++                return ImportDisposition::RetryAfterWait;
++            }
++            // External startup/RPC calls own a separate CPU and native call
++            // stack. Do not park an unrelated managed caller on their behalf.
++            if (kernel.hasCurrentThread())
++                executionFailure("blocking CDVD sync in a nested managed-thread invocation is unsupported", cpu);
++            if (!activeInvocationBudget)
++                executionFailure("blocking CDVD sync has no owned invocation budget", cpu);
++            const InvocationBudget budget = *activeInvocationBudget;
++            while (!cdvd.syncWaitComplete(wait))
++            {
++                if (totalCycles >= budget.cycleLimit ||
++                    totalInstructions - budget.instructionStart >= budget.instructions)
++                    executionFailure("blocking CDVD sync exhausted its invocation budget", cpu);
++                // Preserve this invocation CPU/stack while normal IOP threads,
++                // alarms and device IRQs make progress. Idle cycles count too:
++                // a permanently masked IRQ cannot hang the host indefinitely.
++                runCycles(std::min<uint64_t>(kDefaultSlice, budget.cycleLimit - totalCycles));
++                checkExecutionFailure();
++            }
++            cpu.gpr[2] = 0u;
++            return ImportDisposition::Handled;
++        }
++
+         std::string modulePathFromRam(uint32_t address) const
+         {
+             if (address == 0u || !iopRamRange(address, 1u))
+@@ -685,7 +727,7 @@ namespace ps2x::iop::detail
+             // search/stream fallbacks are limited to the compatible 1.x ABI.
+             if (iequals(call.library, "cdvdman") &&
+                 ((call.ordinal != 14u && call.ordinal != 49u && call.ordinal != 10u && call.ordinal != 84u &&
+-                  call.ordinal != 46u && call.ordinal != 114u && call.ordinal != 39u) ||
++                  call.ordinal != 46u && call.ordinal != 114u && call.ordinal != 39u && call.ordinal != 11u) ||
+                     (imports.resolve(call.library, call.ordinal, call.version) == 0u &&
+                      (call.ordinal == 14u || (call.version >> 8u) == 1u))) &&
+                 cdvd.dispatchImport(call.ordinal, cpu, totalCycles))
+@@ -703,6 +745,13 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             }
+ 
++            if (iequals(call.library, "cdvdman") && call.ordinal == 11u &&
++                (call.version >> 8u) == 1u && imports.resolve(call.library, call.ordinal, call.version) == 0u)
++            {
++                if (const auto wait = cdvd.pendingSyncWait(a0))
++                    return waitForCdvdSync(cpu, *wait);
++            }
++
+             if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+ 
+@@ -888,7 +937,8 @@ namespace ps2x::iop::detail
+                            << " version=0x" << std::hex << import->version;
+                     executionFailure(reason.str(), cpu);
+                 }
+-                if (disposition == ImportDisposition::JumpToGuest)
++                if (disposition == ImportDisposition::JumpToGuest ||
++                    disposition == ImportDisposition::RetryAfterWait)
+                     return true;
+                 cpu.pc = cpu.gpr[31];
+                 cpu.branchPending = false;
+@@ -992,6 +1042,10 @@ namespace ps2x::iop::detail
+             for (size_t i = 0u; i < stackArguments.size(); ++i)
+                 memory.write32(cpu.gpr[29] + 16u + static_cast<uint32_t>(i) * 4u, stackArguments[i]);
+             cpu.gpr[31] = kCallReturnSentinel;
++            if (totalCycles > std::numeric_limits<uint64_t>::max() - budget)
++                executionFailure("invocation cycle budget overflow", cpu);
++            const RestoreValue budgetGuard(activeInvocationBudget,
++                std::optional{InvocationBudget{totalInstructions, totalCycles + budget, budget}});
+             runCpu(cpu, budget);
+             if (strictExecution && (cpu.pc != kCallReturnSentinel || cpu.branchPending || cpu.yielded))
+                 executionFailure(cpu.yielded ? "module call yielded without returning" :
+@@ -1525,6 +1579,7 @@ namespace ps2x::iop::detail
+         uint64_t totalInstructions = 0;
+         uint64_t eeCycleCarry = 0;
+         CpuState *activeCpu = nullptr;
++        std::optional<InvocationBudget> activeInvocationBudget;
+         std::string lastError;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+diff --git a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+index 6c894e6b6d0e9565a482a6ac5fbbb3e94cbf69c3..c3132e2228c3408f851fdc35f67e77427e241441 100644
+--- a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
++++ b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+@@ -9,6 +9,7 @@
+ #include <functional>
+ #include <limits>
+ #include "iop_cdvd_stream_read_fixtures.h"
++#include "iop_cdvd_sync_fixtures.h"
+ #include "iop_cdvd_break_fixtures.h"
+ 
+ namespace
+@@ -469,6 +470,22 @@ namespace
+ int main()
+ {
+     const iop_test::Test tests[] = {
++        {"External sync retains callback failures until a clean reset", iop_cdvd_sync_test::callbackFailureDuringExternalWaitStaysSticky},
++        {"A CPU-disabled sync wait cannot fabricate interrupt progress", iop_cdvd_sync_test::disabledCpuWaitCannotInventInterruptProgress},
++        {"Sync returns to the same authored caller after read/Nop/abort completion", iop_cdvd_sync_test::directWaitsPreserveTheCaller},
++        {"Managed sync waits yield to ready peers and obey masked IRQ delivery", iop_cdvd_sync_test::managedWaitYieldsToPeersAndRespectsMasks},
++        {"Sync rechecks command ownership after stream callbacks submit successors", iop_cdvd_sync_test::successorCommandsRequireAnotherCompletion},
++        {"External IOMAN Devctl can wait with its independent guest stack", iop_cdvd_sync_test::externalDriverWaitRetainsNestedStack},
++        {"External sync pumps the ready IOP thread that reenables its IRQ", iop_cdvd_sync_test::externalWaitRunsTheThreadThatReenablesItsIrq},
++        {"Tiny host budgets preserve managed sync continuations", iop_cdvd_sync_test::tinyHostBudgetsKeepTheSameWaitContinuation},
++        {"Deleting the shared event cannot fabricate completed sync", iop_cdvd_sync_test::deletionCannotMasqueradeAsCompletion},
++        {"Full IOP reset discards sleeping sync callers", iop_cdvd_sync_test::fullResetDiscardsSleepingSyncCallers},
++        {"Supplied sync exports and major versions remain authoritative", iop_cdvd_sync_test::suppliedExportsKeepTheirOwnSyncSemantics},
++        {"IRQ and nested managed blocking calls preserve explicit boundaries", iop_cdvd_sync_test::interruptAndNestedManagedWaitsStayExplicit},
++        {"Permanently masked external sync stops at its owned budget", iop_cdvd_sync_test::permanentlyMaskedExternalWaitIsBoundedAndSticky},
++        {"Unsupported timed and stream-wide waits remain strict", iop_cdvd_sync_test::unsupportedWaitModesAreNotPretendedComplete},
++        {"Completed read errors do not turn into successful sync payload", iop_cdvd_sync_test::mediaFailureCompletesWaitWithoutSuccessfulPayload},
++
+         {"Abort preserves raw IRQ ownership and rejects host-I/O reentry", iop_cdvd_break_test::rawOwnerAndHostReentryStayExplicit},
+         {"Idle abort preserves registration without inventing work", iop_cdvd_break_test::idleAbortDoesNotInventWork},
+         {"Abort cancels deferred payload and retires its buffer lease", iop_cdvd_break_test::abortBeforeDmaDropsTheBufferLease},
+diff --git a/ps2xIOP/tests/iop_cdvd_sync_fixtures.h b/ps2xIOP/tests/iop_cdvd_sync_fixtures.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf89a158edcfba5bcf8ddceca26e64403fe60a01
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_sync_fixtures.h
+@@ -0,0 +1,336 @@
++#pragma once
++
++#include "iop_cdvd_stream_read_fixtures.h"
++
++namespace iop_cdvd_sync_test
++{
++    using iop_test::require;
++    using namespace iop_vblank_test;
++    using iop_stream_read_test::DiscHost;
++    constexpr uint32_t buffer = 0x30000u;
++
++    // Authored MIPS only. These fixtures use the pre-existing emulator API and
++    // compile unchanged against patch 0044 for failing-baseline verification.
++    struct SyncProgram : Program
++    {
++        SyncProgram()
++        {
++            imports(0x1000u, "cdvdman", {46u, 49u, 50u, 11u, 114u, 39u, 8u});
++            imports(0x1300u, "thevent", {5u, 6u});
++            imports(0x1600u, "thbase", {33u, 22u});
++            imports(0x1700u, "ioman", {20u, 31u});
++            image.words(0x2020u, {0u});
++        }
++        void cd(uint32_t index, uint32_t a0 = 0u, uint32_t a1 = 0u,
++                uint32_t a2 = 0u, uint32_t a3 = 0u)
++        {
++            constant(4u, a0); constant(5u, a1); constant(6u, a2); constant(7u, a3);
++            call(stub(0x1000u, index));
++        }
++        void stream(uint32_t handler = 0xA00u)
++        {
++            constant(28u, 0x12345678u); cd(1u, base + handler); cd(2u, 2u);
++            constant(28u, 0x87654321u);
++        }
++        void read(uint32_t lsn = 1u, uint32_t destination = buffer)
++        { cd(4u, lsn, 2u, destination, data(0x20u)); }
++        void mark(uint32_t value, uint32_t offset)
++        { constant(8u, value); store(8u, data(offset)); }
++        void mask(bool enabled)
++        {
++            load(8u, 0xBF801074u);
++            constant(9u, enabled ? 4u : ~4u);
++            emit(enabled ? 0x01094025u : 0x01094024u);
++            store(8u, 0xBF801074u);
++        }
++        void thread(uint32_t code, uint32_t descriptor, uint32_t priority, uint32_t idOffset)
++        {
++            image.words(descriptor, {0x02000000u, 0u, base + code, 0x800u, priority});
++            constant(4u, base + descriptor); call(stub(0x1200u)); store(2u, data(idOffset));
++            move(4u, 2u); constant(5u, 0u); call(stub(0x1200u, 1u));
++        }
++        void sync(uint32_t mode = 0u)
++        {
++            store(29u, data(0x4Cu));
++            cd(3u, mode, 0xCAFEBABEu, 0xABCDEF01u, 0x12344321u);
++            store(2u, data(0x40u)); store(28u, data(0x44u)); store(29u, data(0x50u));
++            store(5u, data(0x54u)); store(6u, data(0x58u)); store(7u, data(0x5Cu));
++            load(8u, data()); store(8u, data(0x80u)); mark(1u, 0x84u);
++        }
++        void delay(uint32_t usec)
++        { constant(4u, usec); call(stub(0x1600u)); }
++        void driver()
++        {
++            const char name[] = "authored";
++            const char path[] = "authored0:";
++            std::memcpy(image.bytes.data() + 0x100u + 0x2300u, name, sizeof(name));
++            std::memcpy(image.bytes.data() + 0x100u + 0x2320u, path, sizeof(path));
++            image.words(0x2380u, {base + 0x2300u, 0x10000010u, 1u, 0u, base + 0x2400u});
++            image.words(0x2400u + 92u, {base + 0x600u});
++            constant(28u, 0x11223344u); constant(4u, base + 0x2380u); call(stub(0x1700u));
++            constant(28u, 0x55667788u);
++        }
++        void devctl()
++        {
++            constant(4u, base + 0x2320u); constant(5u, 0x4393u);
++            constant(6u, 0u); constant(7u, 0u);
++            emit(0xAFA00010u); emit(0xAFA00014u); // Empty O32 output/length.
++            call(stub(0x1700u, 1u));
++        }
++    };
++
++    void prepare(IopEmulator &iop)
++    {
++        const std::vector<uint8_t> canary(0x4000u, 0xCCu);
++        require(iop.writeMemory(buffer, canary.data(), canary.size()), "sync fixture buffer setup failed");
++    }
++    void matches(IopEmulator &iop, const DiscHost &host, uint32_t lsn = 1u, uint32_t address = buffer)
++    {
++        std::vector<uint8_t> bytes(4096u);
++        require(iop.readMemory(address, bytes.data(), bytes.size()) &&
++                    std::equal(bytes.begin(), bytes.end(), host.image.begin() + lsn * 2048u),
++                "sync returned without the actual selected sector payload");
++    }
++    void continued(IopEmulator &iop, const SyncProgram &p, uint32_t callbacks = 1u)
++    {
++        require(word(iop, p.data(0x84u)) == 1u && word(iop, p.data(0x40u)) == 0u &&
++                    word(iop, p.data(0x44u)) == 0x87654321u &&
++                    word(iop, p.data(0x4Cu)) == word(iop, p.data(0x50u)) &&
++                    word(iop, p.data(0x54u)) == 0xCAFEBABEu && word(iop, p.data(0x58u)) == 0xABCDEF01u &&
++                    word(iop, p.data(0x5Cu)) == 0x12344321u && word(iop, p.data(0x80u)) == callbacks,
++                "blocking sync lost its caller stack/GP/arguments or resumed before the callback");
++    }
++
++    void directWaitsPreserveTheCaller()
++    {
++        for (uint32_t mode : {0u, 5u})
++        for (unsigned command = 0u; command < 3u; ++command)
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin(); p.stream();
++            if (command == 0u) p.cd(0u); else p.read();
++            if (command == 2u) p.cd(5u);
++            p.sync(mode); p.finish(); p.recordingHandler(0xA00u, 0u);
++            prepare(iop); start(iop, p); continued(iop, p); advance(iop, 10000u);
++            require(host.reads == (command == 1u ? 1u : 0u) && word(iop, p.data()) == 1u,
++                    "sync replayed completion, fabricated a Nop payload or uncanceled a read");
++            if (command == 1u) matches(iop, host);
++        }
++    }
++
++    void managedWaitYieldsToPeersAndRespectsMasks()
++    {
++        for (uint32_t mode : {0u, 5u})
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin(); p.thread(0x400u, 0x2500u, 20u, 0x70u);
++            p.thread(0x800u, 0x2540u, 60u, 0x74u); p.finish();
++            p.begin(0x400u); p.stream(); p.mask(false); p.read(); p.sync(mode); p.finish();
++            p.begin(0x800u);
++            p.load(4u, p.data(0x70u)); p.constant(5u, p.data(0x600u)); p.call(p.stub(0x1600u, 1u));
++            p.mark(1u, 0x60u); p.delay(100u); p.load(8u, p.data(0x84u)); p.store(8u, p.data(0x64u));
++            p.mask(true); p.finish(); p.recordingHandler(0xA00u, 0u);
++            prepare(iop); start(iop, p); advance(iop, 10000u); continued(iop, p); matches(iop, host);
++            require(word(iop, p.data(0x60u)) == 1u && word(iop, p.data(0x64u)) == 0u &&
++                        word(iop, p.data(0x608u)) == 4u && word(iop, p.data(0x624u)) == 4u && host.reads == 1u,
++                    "Sync failed to park its managed caller on the event or bypassed the masked IRQ");
++        }
++    }
++
++    void successorCommandsRequireAnotherCompletion()
++    {
++        for (bool managed : {false, true})
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin();
++            if (managed) { p.thread(0x400u, 0x2500u, 20u, 0x70u); p.finish(); p.begin(0x400u); }
++            p.stream(); p.read(); p.sync(); p.finish();
++            p.begin(0xA00u); p.load(8u, p.data()); p.emit(0x25080001u); p.store(8u, p.data());
++            p.constant(9u, 1u);
++            const uint32_t branch = p.cursor; p.emit(0u); p.emit(0u);
++            p.read(3u, buffer + 0x2000u);
++            const uint32_t done = p.cursor;
++            p.image.words(branch, {0x15090000u | static_cast<uint16_t>((done - branch - 4u) / 4u)});
++            p.finish();
++            prepare(iop); start(iop, p); advance(iop, 10000u);
++            continued(iop, p, 2u); matches(iop, host); matches(iop, host, 3u, buffer + 0x2000u);
++            require(host.reads == 2u, "successor read was skipped or duplicated by a stale wakeup");
++        }
++    }
++
++    void externalDriverWaitRetainsNestedStack()
++    {
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.driver(); p.store(29u, p.data(0x90u)); p.devctl();
++        p.store(2u, p.data(0x94u)); p.store(28u, p.data(0x98u)); p.store(29u, p.data(0x9Cu)); p.finish();
++        p.begin(0x600u); p.store(29u, p.data(0xA0u)); p.store(28u, p.data(0xA4u));
++        p.stream(); p.read(); p.sync(); p.finish(0x456u); p.recordingHandler(0xA00u, 0u);
++        prepare(iop); start(iop, p); continued(iop, p); matches(iop, host);
++        require(word(iop, p.data(0x94u)) == 0x456u && word(iop, p.data(0x98u)) == 0x55667788u &&
++                    word(iop, p.data(0x90u)) == word(iop, p.data(0x9Cu)) &&
++                    word(iop, p.data(0xA0u)) < word(iop, p.data(0x90u)) &&
++                    word(iop, p.data(0xA4u)) == 0x11223344u && host.eeAccesses == 0u,
++                "external Devctl wait lost the original driver GP, return value or independent stack");
++    }
++
++    void externalWaitRunsTheThreadThatReenablesItsIrq()
++    {
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.thread(0x800u, 0x2500u, 40u, 0x70u);
++        p.stream(); p.mask(false); p.read(); p.sync(); p.finish();
++        p.begin(0x800u); p.mark(1u, 0x60u); p.delay(100u); p.mask(true); p.finish();
++        p.recordingHandler(0xA00u, 0u);
++        prepare(iop); start(iop, p); continued(iop, p); matches(iop, host);
++        require(word(iop, p.data(0x60u)) == 1u && host.reads == 1u,
++                "external synchronous invocation starved the ready IOP thread needed for progress");
++    }
++
++    void tinyHostBudgetsKeepTheSameWaitContinuation()
++    {
++        for (uint64_t chunk : {1u, 17u, 10000u})
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin(); p.thread(0x400u, 0x2500u, 40u, 0x70u); p.finish();
++            p.begin(0x400u); p.stream(); p.read(); p.sync(); p.finish(); p.recordingHandler(0xA00u, 0u);
++            prepare(iop); start(iop, p);
++            for (uint64_t elapsed = 0u; elapsed < 2000u; elapsed += chunk) advance(iop, chunk);
++            continued(iop, p); matches(iop, host);
++            require(host.reads == 1u && word(iop, p.data()) == 1u, "host slices replayed an import or lost its pending wait");
++        }
++    }
++
++    void deletionCannotMasqueradeAsCompletion()
++    {
++        for (bool managed : {false, true})
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin();
++            if (managed) p.thread(0x400u, 0x2500u, 20u, 0x70u);
++            p.thread(0x800u, 0x2540u, 60u, 0x74u);
++            if (managed) { p.finish(); p.begin(0x400u); }
++            p.stream(); p.mask(false); p.read(); p.sync(); p.finish();
++            p.begin(0x800u); p.delay(100u); p.cd(2u, uint32_t(-11));
++            p.move(4u, 2u); p.call(p.stub(0x1300u)); p.finish(); p.recordingHandler(0xA00u, 0u);
++            prepare(iop);
++            rejects([&] { start(iop, p); advance(iop, 10000u); }, "event flag was deleted");
++            require(word(iop, p.data(0x84u)) == 0u && word(iop, p.data()) == 0u,
++                    "deleted completion event resumed guest code or invoked a masked callback");
++        }
++    }
++
++    void fullResetDiscardsSleepingSyncCallers()
++    {
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.thread(0x400u, 0x2500u, 40u, 0x70u); p.finish();
++        p.begin(0x400u); p.stream(); p.mask(false); p.read(); p.sync(); p.finish(); p.recordingHandler(0xA00u, 0u);
++        prepare(iop); start(iop, p); advance(iop, 1000u);
++        require(word(iop, p.data(0x84u)) == 0u && host.reads == 1u, "reset control did not stop at a masked driver wait");
++        iop.reset(); SyncProgram clean; clean.begin(); clean.finish(); start(iop, clean); advance(iop, 10000u);
++        require(host.reads == 1u && word(iop, clean.data(0x84u)) == 0u && word(iop, clean.data()) == 0u,
++                "reset resurrected an old sync continuation or callback");
++    }
++
++    void suppliedExportsKeepTheirOwnSyncSemantics()
++    {
++        for (const auto [provided, requested] : {std::pair<uint16_t, uint16_t>{0x0101u, 0x0101u},
++                                                {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.image.words(0x1008u, {requested});
++            p.image.words(0x1800u, {0x41C00000u, 0u, provided, 0x64766463u, 0x006E616Du});
++            for (uint32_t slot = 0u; slot <= 11u; ++slot) p.image.words(0x1814u + slot * 4u, {p.base + 0x900u});
++            p.begin(); p.constant(4u, p.base + 0x1800u); p.call(p.stub(0x1500u));
++            p.cd(3u, 0xFFFFFFFFu); p.store(2u, p.data(0x40u)); p.finish();
++            p.begin(0x900u); p.store(4u, p.data(0x44u)); p.finish(0x5A3u);
++            start(iop, p);
++            require(word(iop, p.data(0x40u)) == 0x5A3u && word(iop, p.data(0x44u)) == 0xFFFFFFFFu,
++                    "modeled sync shadowed a compatible supplied export");
++        }
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.image.words(0x1008u, {0x0201u}); p.begin(); p.cd(3u, 0u); p.finish();
++        rejects([&] { start(iop, p); }, "missing import cdvdman:11");
++    }
++
++    void interruptAndNestedManagedWaitsStayExplicit()
++    {
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin(); p.stream(); p.cd(0u); p.finish();
++            p.begin(0xA00u); p.read(); p.sync(); p.finish(); prepare(iop); start(iop, p);
++            rejects([&] { advance(iop, 10000u); }, "blocking CDVD sync requires interruptible thread context");
++            require(word(iop, p.data(0x84u)) == 0u && host.reads == 0u, "IRQ wait ran beyond its strict boundary");
++        }
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin(); p.driver(); p.thread(0x400u, 0x2500u, 40u, 0x70u); p.finish();
++            p.begin(0x400u); p.devctl(); p.mark(1u, 0x88u); p.finish();
++            p.begin(0x600u); p.stream(); p.read(); p.sync(); p.finish(); p.recordingHandler(0xA00u, 0u);
++            prepare(iop); start(iop, p);
++            rejects([&] { advance(iop, 10000u); }, "nested managed-thread invocation is unsupported");
++            require(word(iop, p.data(0x88u)) == 0u && host.reads == 0u,
++                    "nested blocking invocation parked or resumed the wrong managed CPU");
++        }
++    }
++
++    void callbackFailureDuringExternalWaitStaysSticky()
++    {
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.stream(); p.read(); p.sync(); p.finish();
++        p.begin(0xA00u); p.call(p.stub(0x1400u)); p.mark(1u, 0u); p.finish();
++        prepare(iop);
++        rejects([&] { start(iop, p); }, "missing import absent:42");
++        const auto instructions = iop.instructions(); iop.runEeCycles(100000u);
++        rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:42");
++        require(host.reads == 1u && iop.instructions() == instructions &&
++                    word(iop, p.data(0x84u)) == 0u && word(iop, p.data()) == 0u,
++                "external wait swallowed a callback failure or resumed a failed caller");
++        iop.reset(); SyncProgram clean;
++        clean.begin(); clean.stream(); clean.read(); clean.sync(); clean.finish();
++        clean.recordingHandler(0xA00u, 0u); prepare(iop); start(iop, clean); continued(iop, clean);
++        require(host.reads == 2u, "post-failure reset retained a stale invocation budget or callback scope");
++    }
++
++    void disabledCpuWaitCannotInventInterruptProgress()
++    {
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.stream(); p.constant(4u, p.data(0xC0u)); p.call(p.stub(0x1100u));
++        p.read(); p.sync(); p.finish(); p.recordingHandler(0xA00u, 0u); prepare(iop);
++        rejects([&] { start(iop, p); }, "blocking CDVD sync requires interruptible thread context");
++        require(host.reads == 0u && word(iop, p.data(0x84u)) == 0u,
++                "disabled-CPU wait fabricated a device IRQ or executed beyond its strict stop");
++    }
++
++    void permanentlyMaskedExternalWaitIsBoundedAndSticky()
++    {
++        DiscHost host; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.stream(); p.mask(false); p.read(); p.sync(); p.finish(); p.recordingHandler(0xA00u, 0u);
++        prepare(iop);
++        rejects([&] { start(iop, p); }, "blocking CDVD sync exhausted its invocation budget");
++        const auto instructions = iop.instructions(); iop.runEeCycles(100000u);
++        rejects([&] { iop.checkExecutionFailure(); }, "blocking CDVD sync exhausted its invocation budget");
++        require(host.reads == 1u && word(iop, p.data(0x84u)) == 0u && word(iop, p.data()) == 0u &&
++                    iop.instructions() == instructions, "bounded sync fabricated completion or ran after its failure");
++    }
++
++    void unsupportedWaitModesAreNotPretendedComplete()
++    {
++        for (uint32_t mode : {3u, 4u, 6u, 16u, 32u})
++        {
++            DiscHost host; IopEmulator iop(host); SyncProgram p;
++            p.begin(); p.stream(); p.read(); p.cd(3u, mode); p.mark(1u, 0x84u); p.finish();
++            p.recordingHandler(0xA00u, 0u); prepare(iop);
++            rejects([&] { start(iop, p); }, "missing import cdvdman:11");
++            require(word(iop, p.data(0x84u)) == 0u && host.reads == 0u,
++                    "unsupported timed/stream-wide wait skipped its contract");
++        }
++    }
++
++    void mediaFailureCompletesWaitWithoutSuccessfulPayload()
++    {
++        DiscHost host; host.failRead = true; IopEmulator iop(host); SyncProgram p;
++        p.begin(); p.stream(); p.read(); p.sync(); p.cd(6u); p.store(2u, p.data(0x88u)); p.finish();
++        p.recordingHandler(0xA00u, 0u); prepare(iop); start(iop, p); continued(iop, p);
++        require(word(iop, p.data(0x88u)) == 0x30u && word(iop, buffer) == 0xCCCCCCCCu && host.reads == 1u,
++                "Sync confused completed error handling with a successful read");
++    }
++}
