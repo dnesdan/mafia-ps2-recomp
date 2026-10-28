@@ -2,11 +2,11 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original frontend graphics on Linux; main menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the original autosave caution screen. The corrected memory-card transport also reaches the original no-card dialog. The physical controller path now delivers Start and Cross through the original SIO2MAN and PADMAN modules; consuming that input in the complete game is the next integration check. Source, host and runtime regression tests also pass on ARM64 macOS through patch 0031; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for execution evidence and remaining work.
+**Status: original frontend graphics and input work in a Linux window; main menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the original autosave caution screen and no-card dialog. In fresh runs, keyboard input travels through the original SIO2MAN and PADMAN modules: Cross dismisses the caution, Up selects Yes, and Cross confirms continuation without a memory card. The program then reaches original movie initialization; the current stop is an unsupported request to the registered streaming driver. Source, host and runtime regression tests also pass on ARM64 macOS through patch 0031; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for execution evidence and remaining work.
 
-![Original Mafia autosave caution screen rendered by the translated game on Linux](docs/screenshots/mafia-linux-autosave.png)
+![Original Mafia no-card dialog with Yes selected through the original controller drivers on Linux](docs/screenshots/mafia-linux-no-card.png)
 
-Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This patch-0028, 120-second run reached the frontend screen without a strict execution failure. It documents the autosave screen; main-menu entry remains unverified. The capture path also works without a display server; the earlier Gathering splash is retained in the progress report.
+Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This patch-0035 window run reached the original no-card dialog, selected Yes through real keyboard input and closed cleanly after saving the frame. It documents the working dialog and selection; main-menu entry remains unverified. The earlier autosave and Gathering captures are retained in the progress report.
 
 ## Build from your own disc
 
