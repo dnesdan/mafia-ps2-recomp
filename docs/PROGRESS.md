@@ -1,6 +1,6 @@
 # Verified progress
 
-Evidence updated on **2026-10-28**. The original translated game renders its **autosave caution screen and no-memory-card dialog in a Linux x86-64 window and consumes real keyboard input through its original drivers**. Cross dismisses the caution, Up selects Yes, and Cross confirms continuation without a memory card. The original program advances into movie initialization, initializes CDVDSTM through its own registered driver and reaches the original file-search reply. Its current strict stop is the 36-byte secondary SIF DMA in that reply. Main-menu entry and gameplay remain unverified. The Linux compiler is GCC 13.3; Apple Silicon remains a supported build target with separate execution evidence.
+Evidence updated on **2026-10-28**. The original translated game renders its **autosave caution screen and no-memory-card dialog in a Linux x86-64 window and consumes real keyboard input through its original drivers**. Cross dismisses the caution, Up selects Yes, and Cross confirms continuation without a memory card. The original program advances into movie initialization, initializes CDVDSTM through its own registered driver, and receives the correct video-file location and size in EE memory. Its current strict stop is `cdvdman:46` (`sceCdNop`) during original stream start. Main-menu entry and gameplay remain unverified. The Linux compiler is GCC 13.3; Apple Silicon remains a supported build target with separate execution evidence.
 
 ## Execution status
 
@@ -12,11 +12,21 @@ Evidence updated on **2026-10-28**. The original translated game renders its **a
 | Render original startup/frontend graphics | Passed: both the Gathering publisher splash and the original autosave caution screen are captured from the actual GS presentation surface. |
 | Complete the original memory-card query | Passed with patch 0030: original MCSERV secondary DMA completes and the original no-card dialog is displayed. No memory card is emulated as present. |
 | Original controller transport | Passed: original-driver tests verify Start and Cross press/release in both original PADMAN DMA buffers. Fresh full-game window runs also consume Up and Cross, with mode 0x79 and no controller grace period. |
-| Enter original movie initialization | Passed: patches 0034–0038 resolve the original VSync poll, exact module-name lookup, original CDVDSTM startup/driver dispatch, stream callback registration and layer-zero file search. The next strict boundary is its partial-quadword secondary SIF DMA reply. |
+| Enter original movie initialization | Passed: patches 0034–0038 resolve the original VSync poll, exact module-name lookup, original CDVDSTM startup/driver dispatch, stream callback registration and layer-zero file search. Patch 0039 also delivers that reply correctly; the next strict boundary is the original stream-start command submission. |
 | Complete initialization and enter the main menu | Not yet verified. The current capture after movie initialization is black and is not treated as a menu image. |
 | Missions, player, vehicles, objectives, saves and all modes | Not verified. |
 
-All **7,791 translated game functions** were freshly compiled and linked after workspace recovery at `-O1 -g0`, using unity batches of 32, assertions and strict floating-point flags. The full original disc and all 281 extracted files are retained and verified. The initial fresh build took 1,443 seconds and passed all five native CTests. Updates through patch 0038 ran the real generator again, verified all 7,794 source/header files and their manifest were byte-identical, published only genuine new generation metadata, and rebuilt through ordinary CMake. The 245 generated game objects retained their hashes and modification times. Original EE and IRX instructions remain unchanged.
+All **7,791 translated game functions** were freshly compiled and linked after workspace recovery at `-O1 -g0`, using unity batches of 32, assertions and strict floating-point flags. The full original disc and all 281 extracted files are retained and verified. The initial fresh build took 1,443 seconds and passed all five native CTests. Updates through patch 0039 ran the real generator again, verified all 7,794 source/header files and their manifest were byte-identical, published only genuine new generation metadata, and rebuilt through ordinary CMake. The 245 generated game objects retained their hashes and modification times. Original EE and IRX instructions remain unchanged.
+
+### Latest original window execution: patch 0039
+
+Patch 0039 implements the original SIFMAN word count and EE quadword count, including the final FIFO words. All 42 packet-transport regression groups pass; the preceding implementation passes 35/42. The original 36-byte file-search reply now advances through the real transport into the EE program.
+
+The latest original window run lasted 90.861 seconds and recorded 644 presentations, 674 SIO2 transactions, 10,300,542 IOP instructions and 12 loaded modules. Its after-join EE stack contains the original `FileInfo` at `0x1FFF920`: trailer LSN 1,269,101 and size 68,435,972 bytes. Both equal the independent mounted-ISO oracle. Original instruction review confirms the game's `GetInfo` copied these fields from the search result and passed the location to stream start. The complete earlier 36-byte search buffer has been reused by later stack frames, so its full oracle hash is not claimed as a native capture.
+
+The new strict stop is `cdvdman:46`, version `0x0101`, at IOP PC `0x9D2B8`, return address `0x9C188`. These map exactly to the original CDVDSTM import stub and call at module-relative `0x1F80`, immediately after selection of stream1 mode. `sceCdNop` has no payload arguments. The run still ends with no active frontend menu and a black 640×448 GS capture; video playback and main-menu entry remain unverified.
+
+The executable SHA-256 is `457d2f9d80f5ad66c270a284b77e662490559d5f01bb080ffeba25167407bf92`; the report SHA-256 is `f54d53d8c13703917d4bb62020013cb0c939d078010fcb1831205716015b5d19`. Genuine regeneration and the ordinary incremental build took 86.763 seconds, preserved all 245 generated game objects and passed five native CTests. Patch 0040's independently reviewed alarm implementation has separate constructed-input evidence below; it was not part of this original-game run.
 
 ### Fresh original window execution: patches 0033–0038
 
@@ -41,7 +51,7 @@ The actual patch-0038 run returns from the layer-search call into original CDVDF
 | 0037 | `53ef6204b3fb69d786c4494bc394e69c8b5cbf0394724c38c183586721318bae` | Stream initialization advances; strict stop at layer-zero file search. |
 | 0038 | `72fa1dbcf93b2885ac4ade9dda97f7bbc0b9d4dcd95382c78fc8f088faaeb364` | Layer-search call returns; original 36-byte secondary SIF DMA reaches the strict transport boundary. |
 
-The latest 74.023-second patch-0038 run records 566 window presentations, 596 SIO2 transfers and 12 loaded guest modules. The after-join snapshot has no active frontend menu and its current 640×448 GS capture has zero nonblack pixels. These values do not establish video playback or menu entry. Its report SHA-256 is `a51f135b577fbdeb8ad0c4519b190c8294ba49f8f4a026b389eaa7e829ecb0ba`. A separate patch-0035 run was closed while the original no-card dialog remained visible, producing the GS screenshot below. Audio output was unavailable in the isolated environment and is not claimed as verified.
+The 74.023-second patch-0038 run records 566 window presentations, 596 SIO2 transfers and 12 loaded guest modules. The after-join snapshot has no active frontend menu and its current 640×448 GS capture has zero nonblack pixels. These values do not establish video playback or menu entry. Its report SHA-256 is `a51f135b577fbdeb8ad0c4519b190c8294ba49f8f4a026b389eaa7e829ecb0ba`. A separate patch-0035 run was closed while the original no-card dialog remained visible, producing the GS screenshot below. Audio output was unavailable in the isolated environment and is not claimed as verified.
 
 ### Current controller and scheduling corrections: patches 0032–0033
 
@@ -274,18 +284,20 @@ Function-table compaction preserved all 499,431 non-null slots, the 1,004,839-sl
 
 | Suite / check | Current observed result |
 | --- | --- |
-| Fresh upstream runtime, patches 0001–0034 | 535 passed, 0 failed; `-O2 -g0`, assertions enabled; all four new VBlank-status groups fail before patch 0034 |
+| Fresh upstream runtime, patches 0001–0039 | 542 passed, 0 failed; `-O2 -g0`, assertions enabled; exact preceding source passes 535/542, with all seven new SIF groups failing |
 | Focused EE callback ownership regressions | 18/18; all eight new cases fail against the previous runtime |
-| All rebuilt IOP CTest programs, patches 0001–0038 | 17 passed, 0 failed |
+| All rebuilt IOP CTest programs, patches 0001–0039 | 17 passed, 0 failed |
 | Periodic EE timer and interrupt regressions | 21/21; both new idle-deadline cases fail before patch 0029 |
 | CDVD tray-query cases, including original-provider precedence | 8/8; six behavior cases fail against the former implementation |
 | Strict-loader cases, including exact module-name lookup | 56/56; seven new behavior groups fail before patch 0035 and its unsupported-contract control already passes |
 | Original-driver Devctl dispatch cases | 14/14 after patch 0036; exact preceding implementation passes 5/14 |
 | Stream1 callback registration cases | 8/8 after patch 0037; exact preceding implementation passes 1/8 |
 | Selected-medium file-search cases | 14/14 after patch 0038; exact preceding implementation passes 1/14; separate original-ISO metadata and three payload samples verified |
+| Word-rounded secondary SIF DMA | 42/42 packet groups after patch 0039; exact preceding implementation passes 35/42 |
+| IOP kernel alarm candidate, isolated on patches 0001–0038 | 9/9 authored MIPS and 15/15 state groups, with all 19 IOP programs passing; unchanged MIPS fixture passes 0/9 on its baseline; no original-game alarm-delivery claim |
 | Physical SIO2 cases, including authored MIPS FIFO/IRQ integration | 22/22; both MIPS integration cases fail against patch 0031 |
 | IOMAN file cases, including optical flags and supplied-export priority | 17/17; the original-export regression caught a review finding |
-| Native host/runtime contracts, exact patches 0001–0038 | Five CTests passed |
+| Native host/runtime contracts, exact patches 0001–0039 | Five CTests passed |
 | Python disc/ELF/profile/generation/report suite | 118 passed, 0 failed |
 | Exact pinned source plus all reviewed patches | Passed; no extra source inputs |
 | Prior emitted integer arithmetic UBSan suite | 68 cases passed on Linux and ARM64 macOS |
@@ -295,7 +307,7 @@ Independent reviews covered transport framing and ordering, reset lifetime, stri
 
 The previous six-patch baseline passed all four Linux and ARM64 macOS jobs in [Actions run 5](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40526989706). That result does not establish macOS execution of the newer runtime changes or the original game.
 
-Review found that the old workflow omitted the upstream runtime and IOP suites. The updated workflow explicitly builds and runs the main runtime executable and all seventeen IOP test programs on both platforms, using a separate pinned build directory. The table above identifies which patch sets were actually tested locally. The enum-coverage test requires the upstream source working directory; CI now launches the suite there. All four jobs in [the checkpoint Actions run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40589657722) passed for patches 0001–0026; [the patch-0027 run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40591779769) also passed all four jobs. This includes the full upstream runtime and thirteen IOP programs, host contracts, Python tests and emitted integer UBSan checks on Linux x86-64 and ARM64 macOS. The updated fourteen-program [patch-0028 run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40592971268) also passed all four jobs. Original game execution on macOS remains unverified.
+Review found that the old workflow omitted the upstream runtime and IOP suites. The updated workflow explicitly builds and runs the main runtime executable and all nineteen IOP test programs on both platforms, using a separate pinned build directory. The table above identifies which patch sets were actually tested locally. The enum-coverage test requires the upstream source working directory; CI now launches the suite there. All four jobs in [the checkpoint Actions run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40589657722) passed for patches 0001–0026; [the patch-0027 run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40591779769) also passed all four jobs. This includes the full upstream runtime and thirteen IOP programs, host contracts, Python tests and emitted integer UBSan checks on Linux x86-64 and ARM64 macOS. The updated fourteen-program [patch-0028 run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40592971268) also passed all four jobs. Original game execution on macOS remains unverified.
 
 | Platform | Evidence and remaining limit |
 | --- | --- |
@@ -321,6 +333,6 @@ bash tools/run_linux.sh --elf .work/extracted/SLUS_206.71 \
 
 Use build_macos.sh and run_macos.sh on Apple Silicon. Capture requires a new destination path; it does not overwrite existing output. Each fresh run should retain its report, log, exact executable/source provenance and actual GS capture.
 
-All four Linux and ARM64 macOS jobs also passed in the [patch-0031 Actions run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40600119977). Local verification of patches 0032–0038 is recorded separately above; those changes have not yet received a new remote CI result.
+All four Linux and ARM64 macOS jobs also passed in the [patch-0031 Actions run](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40600119977). Local verification of patches 0032–0040 is recorded separately above; those changes have not yet received a new remote CI result.
 
-The immediate objective is to complete the original movie, title and profile flow and reach the main menu. Ordered complete-quadword secondary DMA, VBlank callbacks, hardware status and physical controller transport have regression and original-program evidence. Native Up/Cross consumption is verified. The next strict boundary is the partial-quadword SIF transfer returning the original file-search record. Subsequent streaming completion, actual video reads and kernel alarms still need original-program verification. After menu execution, verification must cover media, saves and gameplay, then deterministic comparisons against PCSX2. No FPS, mission completion or visual equivalence is inferred from compilation or unit tests.
+The immediate objective is to complete the original movie, title and profile flow and reach the main menu. Ordered secondary DMA, including the original partial-quadword file-search reply, VBlank callbacks, hardware status and physical controller transport have regression and original-program evidence. Native Up/Cross consumption is verified. The next strict boundary is `sceCdNop` during original stream start. Streaming completion, actual video reads and kernel alarm delivery still need original-program verification. After menu execution, verification must cover media, saves and gameplay, then deterministic comparisons against PCSX2. No FPS, mission completion or visual equivalence is inferred from compilation or unit tests.
