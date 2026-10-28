@@ -1,0 +1,337 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -167,6 +167,7 @@
+     {
+         constexpr uint32_t kMaxDescriptors = 32u; // SIFMAN's queued tag array
+         constexpr uint32_t kEeRamSize = 32u * 1024u * 1024u;
++        constexpr uint64_t kMaxEeTransferBytes = uint64_t{0xFFFFu} * 16u;
+         const auto fail = [](const char *cause)
+         {
+             throw std::runtime_error(std::string("Physical IOP packet RPC: callback SIF DMA ") + cause);
+@@ -190,13 +191,20 @@
+             if (!m_memory.readRam(descriptorAddress + index * 16u, descriptor.data(), sizeof(descriptor)))
+                 fail("could not read its validated descriptor");
+             const auto [source, destination, size, attributes] = descriptor;
+-            // PS2SDK iop/system/sifman/src/sifman.c:sif_dma_setup_tag rounds
+-            // source words and EE quadwords. Only complete plain-data qwords
+-            // are modeled here; do not invent bytes for partial hardware tags.
+-            if (attributes != 0u || size == 0u || (size & 15u) != 0u ||
++            if (attributes != 0u || size == 0u ||
+                 (source & 3u) != 0u || (destination & 15u) != 0u)
+-                fail("requires plain aligned complete-quadword data descriptors");
+-            if (size > IopMemory::RamSize || !ownedPacketRange(m_memory, source, size))
++                fail("requires plain word-aligned sources and quadword-aligned destinations");
++            // SIFMAN rounds the IOP count to words and the EE tag to quadwords.
++            // Widen before adding so an overflowing request cannot become a
++            // small valid transfer. EE QWC is 16 bits, independently of the
++            // aggregate callback queue's byte bound.
++            const uint64_t sourceBytes = (uint64_t{size} + 3u) & ~uint64_t{3u};
++            const uint64_t wireBytes = (sourceBytes + 15u) & ~uint64_t{15u};
++            if (wireBytes > kMaxEeTransferBytes)
++                fail("exceeds the EE DMA tag quadword count");
++            if (sourceBytes < 16u)
++                fail("partial first quadword requires unmodeled DMA tag history");
++            if (!ownedPacketRange(m_memory, source, static_cast<size_t>(sourceBytes)))
+                 fail("source is outside complete owned IOP RAM");
+             // SIFMAN masks the EE DMA destination with 0x1fffffff. Accept
+             // physical/KSEG0/KSEG1 and the uncached RAM mirror, never MMIO or
+@@ -205,14 +213,23 @@
+             const uint32_t physical = destination & 0x1FFFFFFFu;
+             if ((segment != 0u && segment != 0x20000000u &&
+                  segment != 0x80000000u && segment != 0xA0000000u) ||
+-                physical >= kEeRamSize || size > kEeRamSize - physical)
++                physical >= kEeRamSize || wireBytes > kEeRamSize - physical)
+                 fail("destination is outside complete EE RAM");
+-            if (size > IopMemory::RamSize - totalBytes)
++            if (wireBytes > IopMemory::RamSize - totalBytes)
+                 fail("exceeds the bounded ordered byte queue");
+-            totalBytes += size;
+-            SifEeTransfer transfer{physical, std::vector<uint8_t>(size)};
+-            if (!m_memory.readRam(source, transfer.data.data(), size))
++            totalBytes += static_cast<size_t>(wireBytes);
++            SifEeTransfer transfer{physical, std::vector<uint8_t>(static_cast<size_t>(wireBytes))};
++            if (!m_memory.readRam(source, transfer.data.data(), static_cast<size_t>(sourceBytes)))
+                 fail("could not snapshot its validated source");
++            // The SIF FIFO fills a partial last quadword with the same word
++            // positions from the preceding complete payload quadword. It does
++            // not read extra IOP bytes or zero-fill. A transfer shorter than a
++            // payload quadword would instead depend on tag history, rejected
++            // above. See PCSX2 Sif.h:sifFifo::writeJunk and Sif0.cpp.
++            if (wireBytes != sourceBytes)
++                std::memcpy(transfer.data.data() + sourceBytes,
++                            transfer.data.data() + sourceBytes - 16u,
++                            static_cast<size_t>(wireBytes - sourceBytes));
+             captured.push_back(std::move(transfer));
+         }
+         // No host EE access occurs here. Once captured, source ownership has
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -45,6 +45,14 @@
+         if (offset > bytes.size() || bytes.size() - offset < 4u)
+             throw std::runtime_error("synthetic test received a truncated reply word");
+         return word(bytes.data(), offset);
++    }
++
++    std::vector<uint8_t> wordsAsBytes(const std::vector<uint32_t> &words)
++    {
++        std::vector<uint8_t> bytes(words.size() * 4u);
++        for (size_t index = 0u; index < words.size(); ++index)
++            put(bytes, index * 4u, words[index]);
++        return bytes;
+     }
+ 
+     std::vector<uint8_t> packet(uint32_t command, uint32_t size = 64u, uint32_t option = 0u)
+@@ -977,6 +985,242 @@
+             t.IsTrue(receivedRpcResults.empty(), "rmode0 cannot fabricate an END callback");
+         });
+ 
++        tc.Run("word-aligned 36-byte callback DMA delivers the real FIFO tail before END", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            auto image = secondaryDmaServer(sid, {0x10428u, kSecondaryResult, 36u, 0u});
++            image.words(0x428u, {0x10111213u, 0x20212223u, 0x30313233u, 0x40414243u,
++                                 0x50515253u, 0x60616263u, 0x70717273u, 0x80818283u,
++                                 0x90919293u, 0xDEADBEEFu, 0xBAD0BAD1u, 0xBAD2BAD3u});
++            const auto expected = wordsAsBytes({0x10111213u, 0x20212223u, 0x30313233u, 0x40414243u,
++                                                0x50515253u, 0x60616263u, 0x70717273u, 0x80818283u,
++                                                0x90919293u, 0x60616263u, 0x70717273u, 0x80818283u});
++            t.IsTrue(env.iop().loadModuleImage("word-dma.irx", image.bytes).moduleId > 0,
++                     "register an authored producer with a source eight bytes into a quadword");
++            const auto server = env.bindService(sid);
++            const int semaphore = env.runtime.eeScheduler().createSemaphore(0, 1, 0u, 0u);
++            std::memcpy(env.rdram.data() + kClient + 8u, &semaphore, sizeof(semaphore));
++            std::fill(env.rdram.begin() + kSecondaryResult - 16u,
++                      env.rdram.begin() + kSecondaryResult + 64u, uint8_t{0xA5u});
++            env.submitRpc(server, 0u, {}, 4u);
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(env.iop().peekSifReply(reply) && reply.precedingTransfers.size() == 1u &&
++                         reply.precedingTransfers.front().data == expected,
++                     "36 source bytes produce 48 wire bytes, with the prior quadword's matching tail words");
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xA5A5A5A5u,
++                     "a queued rounded transfer cannot bypass the unarmed EE receiver");
++            const std::array<uint32_t, 3u> cleared{};
++            t.IsTrue(env.runtime.writeIopMemory(0x1043Cu, cleared.data(), sizeof(cleared)),
++                     "overwrite the prior source quadword after the actual SetDma returned");
++            env.installHandler();
++            env.arm();
++            t.IsTrue(std::equal(expected.begin(), expected.end(), env.rdram.begin() + kSecondaryResult),
++                     "both original bytes and FIFO tail retain their acceptance-time snapshot");
++            t.Equals(word(env.rdram.data(), kSecondaryResult - 4u), 0xA5A5A5A5u, "lower DMA canary survives");
++            t.Equals(word(env.rdram.data(), kSecondaryResult + 48u), 0xA5A5A5A5u, "wire-span upper canary survives");
++            t.IsTrue(receivedRpcResults.empty() && env.runtime.eeScheduler().pollSemaphore(semaphore) < 0,
++                     "DMA alone does not execute the guest END handler");
++            env.runtime.eeScheduler().run();
++            t.IsTrue(receivedSecondaryResults == std::vector<uint32_t>{0x10111213u} &&
++                         receivedRpcResults == std::vector<uint32_t>{0x76543210u},
++                     "the original END handler observes both completed data transfers");
++            t.Equals(env.runtime.eeScheduler().pollSemaphore(semaphore), semaphore, "END signals exactly one completion");
++        });
++
++        tc.Run("callback DMA rounds source bytes to words and repeats each FIFO tail position", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            // Explicit wire-word examples, independent of the implementation's
++            // byte arithmetic. A partial first source word still includes all
++            // four bytes fetched by the IOP DMA controller.
++            const std::array<std::pair<uint32_t, std::vector<uint32_t>>, 12u> cases{{
++                {13u, {1u, 2u, 3u, 4u}}, {15u, {1u, 2u, 3u, 4u}},
++                {16u, {1u, 2u, 3u, 4u}},
++                {17u, {1u, 2u, 3u, 4u, 5u, 2u, 3u, 4u}},
++                {21u, {1u, 2u, 3u, 4u, 5u, 6u, 3u, 4u}},
++                {25u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 4u}},
++                {29u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}},
++                {32u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}},
++                {33u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 6u, 7u, 8u}},
++                {40u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 7u, 8u}},
++                {44u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 8u}},
++                {48u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 12u}},
++            }};
++            for (const auto &[size, expectedWords] : cases)
++            {
++                PacketEnv env;
++                auto image = secondaryDmaServer(sid, {0xA0010428u, 0x20027000u, size, 0u},
++                                                1u, 1u, 0x80010600u);
++                for (uint32_t index = 0u; index < 16u; ++index)
++                    image.words(0x428u + index * 4u, {0xA1B2C300u | (index + 1u)});
++                auto expected = expectedWords;
++                for (auto &value : expected) value |= 0xA1B2C300u;
++                const auto expectedBytes = wordsAsBytes(expected);
++                t.IsTrue(env.iop().loadModuleImage("rounding-dma.irx", image.bytes).moduleId > 0, "register rounding producer");
++                const auto server = env.bindService(sid);
++                env.submitRpc(server, 0u, {}, 4u, 0u);
++                env.arm();
++                t.IsTrue(std::equal(expectedBytes.begin(), expectedBytes.end(), env.rdram.begin() + kSecondaryResult),
++                         "source-word rounding and each last-quadword remainder preserve actual nonzero byte values");
++                t.Equals(word(env.rdram.data(), kSecondaryResult + expectedBytes.size()), 0u,
++                         "the EE receives exactly the advertised whole quadwords");
++            }
++        });
++
++        tc.Run("rounded callback DMA validates only the complete source words and all of them", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (const uint32_t source : {0x001FFFDCu, 0x801FFFDCu, 0xA01FFFDCu})
++            {
++                PacketEnv env;
++                const auto image = secondaryDmaServer(sid, {source, 0x01FFFFD0u, 36u, 0u});
++                t.IsTrue(env.iop().loadModuleImage("end-source-dma.irx", image.bytes).moduleId > 0, "register boundary producer");
++                const auto bytes = wordsAsBytes({1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u});
++                t.IsTrue(env.runtime.writeIopMemory(source, bytes.data(), bytes.size()), "own exactly the last36 IOP bytes");
++                const auto server = env.bindService(sid);
++                env.submitRpc(server, 0u, {}, 4u, 0u);
++                env.arm();
++                const auto expected = wordsAsBytes({1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 6u, 7u, 8u});
++                t.IsTrue(std::equal(expected.begin(), expected.end(), env.rdram.begin() + 0x01FFFFD0u),
++                         "36 bytes ending at IOP RAM end can supply48 wire bytes ending at EE RAM end");
++            }
++            for (const auto [ownedBytes, requested, succeeds] : std::array<std::array<uint32_t, 3u>, 4u>{{
++                     {17u, 17u, 0u}, {19u, 17u, 0u}, {20u, 17u, 1u}, {36u, 36u, 1u}}})
++            {
++                PacketEnv env;
++                constexpr uint32_t source = 0x00030000u;
++                const auto image = secondaryDmaServer(sid, {source, kSecondaryResult, requested, 0u});
++                t.IsTrue(env.iop().loadModuleImage("owned-word-dma.irx", image.bytes).moduleId > 0, "register ownership producer");
++                const std::vector<uint8_t> bytes(ownedBytes, uint8_t{0xC7u});
++                t.IsTrue(env.runtime.writeIopMemory(source, bytes.data(), bytes.size()), "own only the authored byte span");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u, 0u); }
++                catch (const std::runtime_error &error)
++                { failed = std::string(error.what()).find("source is outside complete owned IOP RAM") != std::string::npos; }
++                t.Equals(failed, succeeds == 0u, "every byte of the last IOP source word must be owned, without demanding FIFO filler ownership");
++                if (succeeds != 0u)
++                {
++                    env.arm();
++                    t.Equals(word(env.rdram.data(), kSecondaryResult + (requested == 17u ? 28u : 44u)),
++                             0xC7C7C7C7u, "padding is derived from owned data rather than adjacent unowned memory");
++                }
++                else
++                    t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "missing source tail ownership cannot write EE");
++            }
++        });
++
++        tc.Run("callback DMA rejects counts not representable by the EE quadword tag", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (const uint32_t size : {0x000FFFF0u, 0x000FFFF1u, 0x00100000u, 0xFFFFFFFDu, 0xFFFFFFFFu})
++            {
++                PacketEnv env;
++                constexpr uint32_t source = 0x00020000u;
++                const auto image = secondaryDmaServer(sid, {source, kSecondaryResult, size, 0u});
++                t.IsTrue(env.iop().loadModuleImage("qwc-limit-dma.irx", image.bytes).moduleId > 0, "register tag-bound producer");
++                const std::vector<uint8_t> bytes(0x100000u, uint8_t{0x6Bu});
++                t.IsTrue(env.runtime.writeIopMemory(source, bytes.data(), bytes.size()), "provide a real complete source beyond the tag boundary");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u, 0u); }
++                catch (const std::runtime_error &error)
++                { failed = std::string(error.what()).find("EE DMA tag quadword count") != std::string::npos; }
++                t.Equals(failed, size != 0x000FFFF0u, "the16-bit QWC limit is checked after widened rounding");
++                if (size == 0x000FFFF0u)
++                {
++                    env.arm();
++                    t.Equals(word(env.rdram.data(), kSecondaryResult + size - 4u), 0x6B6B6B6Bu, "maximum representable QWC remains supported");
++                    t.Equals(word(env.rdram.data(), kSecondaryResult + size), 0u, "maximum accepted tag has a bounded end");
++                }
++                else
++                    t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "oversized or wrapping requests cannot publish bytes");
++            }
++        });
++
++        tc.Run("callback DMA queue budgets include FIFO filler bytes", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (const bool exceeds : {false, true})
++            {
++                PacketEnv env;
++                auto image = secondaryDmaServer(sid, {0x00030000u, kSecondaryResult, 0x7FFFCu, 0u}, exceeds ? 5u : 4u);
++                if (exceeds) image.words(0x640u, {0x10428u, kSecondaryResult, 13u, 0u});
++                t.IsTrue(env.iop().loadModuleImage("wire-budget-dma.irx", image.bytes).moduleId > 0, "register wire-budget producer");
++                std::vector<uint8_t> bytes(0x7FFFCu);
++                for (size_t index = 0u; index < bytes.size(); ++index) bytes[index] = static_cast<uint8_t>(index);
++                t.IsTrue(env.runtime.writeIopMemory(0x00030000u, bytes.data(), bytes.size()), "own four re-used word-count sources");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u, 0u); }
++                catch (const std::runtime_error &error)
++                { failed = std::string(error.what()).find("bounded ordered byte queue") != std::string::npos; }
++                t.Equals(failed, exceeds, "four rounded half-MiB transfers exactly fill the budget; another quadword cannot fit");
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "acceptance and later budget failure both leave unarmed EE memory untouched");
++                if (!exceeds)
++                {
++                    env.arm();
++                    t.Equals(word(env.rdram.data(), kSecondaryResult + 0x7FFFCu), 0xEFEEEDECu,
++                             "the counted final word is the earlier payload's FIFO word");
++                    t.Equals(word(env.rdram.data(), kSecondaryResult + 0x80000u), 0u, "the exact wire budget cannot extend a descriptor");
++                }
++            }
++        });
++
++        tc.Run("rounded callback DMA descriptors keep independent tails and issue order", [](TestCase &t)
++        {
++            PacketEnv env;
++            constexpr uint32_t sid = 0x80001234u;
++            auto image = secondaryDmaServer(sid, {0x10428u, kSecondaryResult, 36u, 0u}, 3u);
++            image.words(0x428u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u});
++            image.words(0x460u, {11u, 12u, 13u, 14u, 15u});
++            image.words(0x610u, {0x10460u, kSecondaryResult + 16u, 17u, 0u});
++            image.words(0x620u, {0x10428u, kResult, 36u, 0u});
++            t.IsTrue(env.iop().loadModuleImage("ordered-rounded-dma.irx", image.bytes).moduleId > 0, "register independent partial descriptors");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 4u, 0u);
++            env.arm();
++            const auto expected = wordsAsBytes({1u, 2u, 3u, 4u, 11u, 12u, 13u, 14u, 15u, 12u, 13u, 14u});
++            t.IsTrue(std::equal(expected.begin(), expected.end(), env.rdram.begin() + kSecondaryResult),
++                     "the second packet tail comes from its own preceding payload, overwriting the first packet in order");
++            t.Equals(word(env.rdram.data(), kResult), 0x76543210u, "ordinary RPC result is delivered after partial secondary data");
++            t.Equals(word(env.rdram.data(), kResult + 36u), 6u, "secondary FIFO tail beyond the ordinary result is retained");
++            t.Equals(word(env.rdram.data(), kResult + 48u), 0u, "issue ordering cannot extend the rounded span");
++        });
++
++        tc.Run("failed callbacks and reset discard already rounded snapshots", [](TestCase &t)
++        {
++            constexpr uint32_t sid = 0x80001234u;
++            for (const unsigned failure : {1u, 2u, 3u})
++            {
++                PacketEnv env;
++                auto image = secondaryDmaServer(sid, {0x10428u, kSecondaryResult, 36u, 0u},
++                                               failure == 3u ? 2u : 1u, 1u, 0x10600u, false,
++                                               failure == 3u ? 0u : failure);
++                if (failure == 3u) image.words(0x610u, {0x10428u, kSecondaryResult + 48u, 12u, 0u});
++                t.IsTrue(env.iop().loadModuleImage("failed-rounded-dma.irx", image.bytes).moduleId > 0, "register failing rounded producer");
++                const auto server = env.bindService(sid);
++                bool failed = false;
++                try { env.submitRpc(server, 0u, {}, 4u); }
++                catch (const std::runtime_error &) { failed = true; }
++                t.IsTrue(failed, "guest exception, invalid result, and tag-dependent short descriptor stay strict");
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "a later failure cannot publish an earlier rounded snapshot");
++                t.Equals(word(env.rdram.data(), kResult), 0u, "a failed callback cannot publish its ordinary result");
++                t.Equals(env.rdram[kReceive], uint8_t{0u}, "failure cannot fabricate an END packet");
++            }
++            PacketEnv env;
++            const auto image = secondaryDmaServer(sid, {0x10428u, kSecondaryResult, 36u, 0u});
++            t.IsTrue(env.iop().loadModuleImage("reset-rounded-dma.irx", image.bytes).moduleId > 0, "register reset control");
++            const auto server = env.bindService(sid);
++            env.submitRpc(server, 0u, {}, 4u, 0u);
++            PS2IopTransport::reset(&env.runtime);
++            env.arm();
++            t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "reset discards the entire rounded packet before delivery");
++            ps2x::iop::SifEeReply reply;
++            t.IsTrue(!env.iop().peekSifReply(reply), "reset cannot retain the rounded packet's completion");
++        });
++
+         tc.Run("physical callback DMA accepts RAM aliases with hardware destination normalization", [](TestCase &t)
+         {
+             constexpr uint32_t sid = 0x80001234u;
+@@ -1040,7 +1284,7 @@
+             const std::array<std::array<uint32_t, 4>, 14> invalid{{
+                 {0x10420u, kSecondaryResult, 16u, 4u},
+                 {0x10420u, kSecondaryResult, 16u, 0x40u},
+-                {0x10420u, kSecondaryResult, 17u, 0u},
++                {0x10420u, kSecondaryResult, 12u, 0u},
+                 {0x10420u, kSecondaryResult, 0u, 0u},
+                 {0x10422u, kSecondaryResult, 16u, 0u},
+                 {0x40010420u, kSecondaryResult, 16u, 0u},
