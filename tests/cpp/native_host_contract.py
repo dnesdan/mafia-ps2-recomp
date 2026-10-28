@@ -112,6 +112,8 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
               "A synthetic host test must never claim game verification")
         check(data["latest_sce_open_request"] is None and data["sce_open_request_snapshot_error"] == "",
               "Synthetic or rejected input acquired a game-specific sceOpen request")
+        check(data["frontend_snapshot"] is None and data["frontend_snapshot_error"] == "",
+              "Synthetic or rejected input acquired game-specific frontend globals")
         return result.returncode, data
 
     code, validation = run("validated-only", fixture, "--validate-only")

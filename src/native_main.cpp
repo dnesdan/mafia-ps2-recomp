@@ -173,6 +173,7 @@ struct Report {
     ps2x::iop::DebugSnapshot iop;
     std::string iop_error;
     std::string latest_sce_open_request = "null", sce_open_request_error;
+    std::string frontend_snapshot = "null", frontend_snapshot_error;
     std::string capture_status = "not-executed", capture_error, capture_sha256;
     std::uint64_t controller_samples = 0;
     mafia::GsFrameCapture capture;
@@ -336,6 +337,8 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"iop_snapshot_error\": " + mafia::json_string(report.iop_error) +
         ",\n  \"latest_sce_open_request\": " + report.latest_sce_open_request +
         ",\n  \"sce_open_request_snapshot_error\": " + mafia::json_string(report.sce_open_request_error) +
+        ",\n  \"frontend_snapshot\": " + report.frontend_snapshot +
+        ",\n  \"frontend_snapshot_error\": " + mafia::json_string(report.frontend_snapshot_error) +
         ",\n  \"frame_capture\": " + capture_json + "\n}\n";
     std::cout << json;
     if (!options.report.empty()) {
@@ -377,7 +380,14 @@ public:
         // an image when the guest has not produced a valid presentation surface.
         runtime.gs().latchHostPresentationFrame();
         std::uint32_t width = 0, height = 0;
-        if (!runtime.gs().copyLatchedHostPresentationFrame(pixels_, width, height)) return false;
+        if (!runtime.gs().copyLatchedHostPresentationFrame(pixels_, width, height)) {
+            // A guest GS reset can disable its display while entering a movie.
+            // Clear the host image instead of showing a stale menu indefinitely.
+            if (texture_.id) UnloadTexture(texture_);
+            texture_ = {};
+            have_frame_ = false;
+            return false;
+        }
         if (width == 0 || height == 0 || width > 4096 || height > 4096 ||
             std::uint64_t{width} * height * 4 != pixels_.size())
             throw std::runtime_error("GS presentation surface has invalid dimensions");
@@ -530,6 +540,90 @@ void collect_ee_context(PS2Runtime &runtime, const R5900Context &context, Report
     }
 }
 
+void collect_frontend_snapshot(PS2Runtime &runtime, Report &report) {
+    report.frontend_snapshot = "null";
+    report.frontend_snapshot_error.clear();
+    if (!report.elf_verified || !report.elf_loaded || !report.entered ||
+        std::string_view(mafia::build::elf_sha256) !=
+            "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f")
+        return;
+    try {
+        // Exact-ELF globals and class offsets verified against the original
+        // instructions. Read only after join; never follow pointers into MMIO.
+        const auto *ram = runtime.memory().getRDRAM();
+        if (!ram) throw std::runtime_error("EE RAM is unavailable for the frontend snapshot");
+        const auto span = [](std::uint32_t address, std::uint32_t size) {
+            const auto segment = address & 0xe0000000u;
+            const auto physical = address & 0x1fffffffu;
+            return (segment == 0u || segment == 0x80000000u || segment == 0xa0000000u) &&
+                (address & 3u) == 0u && physical < PS2_RAM_SIZE && size <= PS2_RAM_SIZE - physical;
+        };
+        const auto word = [&](std::uint32_t address) {
+            if (!span(address, 4)) throw std::runtime_error("Frontend word is outside aligned EE RAM");
+            const auto *p = ram + (address & 0x1fffffffu);
+            return std::uint32_t{p[0]} | (std::uint32_t{p[1]} << 8u) |
+                (std::uint32_t{p[2]} << 16u) | (std::uint32_t{p[3]} << 24u);
+        };
+        const auto kind = [](std::uint32_t vtable) -> const char * {
+            switch (vtable) {
+            case 0x004d8ac0u: return "autosave-caution";
+            case 0x004d8e80u: return "no-card";
+            case 0x004d85c0u: return "press-start";
+            case 0x004d94c0u: return "profile-select";
+            case 0x004d9470u: return "profile-create";
+            case 0x004d89d0u: return "main-menu";
+            default: return "unknown";
+            }
+        };
+        const auto active = word(0x004dc898u);
+        auto address = active;
+        std::array<std::uint32_t, 8> seen{};
+        std::size_t depth = 0;
+        std::string menus = "[", chain_status = "complete";
+        while (address) {
+            if (!span(address, 0x30u)) { chain_status = "invalid-pointer"; break; }
+            const auto physical = address & 0x1fffffffu;
+            if (std::find(seen.begin(), seen.begin() + depth, physical) != seen.begin() + depth) {
+                chain_status = "cycle"; break;
+            }
+            if (depth == seen.size()) { chain_status = "depth-limit"; break; }
+            seen[depth++] = physical;
+            const auto parent = word(address), focus = word(address + 8u);
+            const auto vtable = word(address + 0x28u);
+            const auto valid_focus = focus != 0u && span(focus, 4);
+            if (menus.size() != 1) menus += ", ";
+            menus += "{\"address\": " + std::to_string(address) +
+                ", \"vtable\": " + std::to_string(vtable) +
+                ", \"kind\": " + mafia::json_string(kind(vtable)) +
+                ", \"parent\": " + std::to_string(parent) +
+                ", \"focus\": " + std::to_string(focus) +
+                ", \"focus_id\": " + (valid_focus ? std::to_string(word(focus)) : "null") +
+                ", \"word_at_2c\": " + std::to_string(word(address + 0x2cu)) + "}";
+            address = parent;
+        }
+        constexpr std::uint32_t samples_address = 0x0054d280u, samples_size = 64u;
+        static_assert(samples_address < PS2_RAM_SIZE && samples_size <= PS2_RAM_SIZE - samples_address);
+        constexpr char hex[] = "0123456789abcdef";
+        std::string samples;
+        for (std::uint32_t i = 0; i < samples_size; ++i) {
+            const auto value = ram[samples_address + i];
+            samples += hex[value >> 4u]; samples += hex[value & 15u];
+        }
+        report.frontend_snapshot = "{\"source\": \"verified-elf-read-only-after-join\""
+            ", \"active_menu\": " + std::to_string(active) +
+            ", \"menu_result\": " + std::to_string(word(0x004dc89cu)) +
+            ", \"last_menu_key\": " + std::to_string(word(0x004dc8a4u) & 0xffu) +
+            ", \"game_ms\": " + std::to_string(word(0x004dca44u)) +
+            ", \"controller_settling\": " + std::to_string(word(0x004dc920u)) +
+            ", \"controller_grace\": " + std::to_string(word(0x004dc558u)) +
+            ", \"controller_samples_hex\": " + mafia::json_string(samples) +
+            ", \"menu_chain_status\": " + mafia::json_string(chain_status) +
+            ", \"menus\": " + menus + "]}";
+    } catch (const std::exception &error) {
+        report.frontend_snapshot_error = error.what();
+    }
+}
+
 void collect(PS2Runtime &runtime, Report &report) {
     report.metrics_available = true;
     report.entered = entry_executed.load(std::memory_order_acquire);
@@ -588,6 +682,7 @@ void collect(PS2Runtime &runtime, Report &report) {
         report.iop_error = error.what();
     }
     collect_sce_open_request(runtime, report);
+    collect_frontend_snapshot(runtime, report);
 }
 
 void sample_controller(PS2Runtime &runtime, const Options &options,
@@ -772,7 +867,7 @@ int main(int argc, char **argv) {
                 report.capture = mafia::capture_gs_frame(*runtime);
                 if (!report.capture.available) {
                     report.capture_status = "unavailable";
-                    report.capture_error = "The GS did not produce a valid presentation surface";
+                    report.capture_error = "The GS has no valid presentation surface at capture time";
                 } else {
                     const auto digest = mafia::sha256(report.capture.encoded.ppm);
                     mafia::save_frame_exclusive(options.capture_frame, report.capture.encoded.ppm);
