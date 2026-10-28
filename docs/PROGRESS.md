@@ -1,18 +1,20 @@
 # Verified progress
 
-Updated **2026-10-28**. **Main-menu entry, movie playback and gameplay remain unverified.** The last published original-game execution uses patches 0001–0039. The newer service implementations and constructed-input tests below do not change that historical run's result.
+Updated **2026-10-28**. **Main-menu entry, movie playback and gameplay remain unverified.** The last published original-game execution uses patches 0001–0039. Newer constructed-input tests do not change that historical run's result.
 
-The [patch-0043 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) retains its complete test, translation and screenshot provenance. Earlier per-patch execution traces remain in the [patch-0041 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md).
+The [patch-0044 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/4af8b23c05a78e40dec0e0c46321c0b28520fbab/docs/PROGRESS.md) retains cancellation tests and earlier execution identities. The [patch-0043 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) and [earlier detailed history](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md) preserve their complete test and screenshot provenance.
 
-## Latest source checkpoint: patch 0044
+## Latest source checkpoint: patch 0045
 
-[Commit 5ba829b](https://github.com/dnesdan/mafia-ps2-recomp/commit/5ba829bd5cb57bf6c824da3251a41b6d92fb3352) adds `sceCdBreak` (`cdvdman:39`) to the existing normal/stream1 command model. An accepted abort drops pending payload ownership before another checkpoint can touch media or a released/reused destination. Already-copied bytes remain copied. Completion is deferred, respects live interrupt masks and callback registration, and distinguishes the stream callback's argument 1 from the ordinary user's Break reason 8. Repeated aborts cannot postpone or duplicate completion.
+[Commit b945332](https://github.com/dnesdan/mafia-ps2-recomp/commit/b94533276b589fd217f95fc5f33c467461cd384e) implements pending `sceCdSync` (`cdvdman:11`) modes **0 and 5** for the existing command model. A managed IOP caller waits on the real shared completion event without losing its import PC, argument registers, GP, return address or stack. It retries the command condition after waking: a stream callback may have submitted another read before that thread runs again.
 
-Idle Break sets the aborted error and shared event without inventing a callback, except when the primary reported-timeout path requires abort recovery. Timeout retirement, reset, supplied-export precedence and major-version checks remain explicit. Blocking `sceCdSync` while a command is pending, stream0 and raw CDVD IRQ programming are **still unsupported**. This is not a claim that the whole original streaming-stop sequence now works.
+External startup/RPC invocations use a different path. They keep their own CPU and native call stack while bounded IOP scheduling advances device completion, alarms and ready threads. Authored MIPS tests exercise this through an actual registered IOMAN Devctl callback with independent driver and caller stacks. Idle cycles count against that invocation's budget, so a permanently masked completion cannot hang the host indefinitely. This budget is a diagnostic execution bound, not an implementation of the guest's timed Sync modes.
 
-Review also found a real defect in patch 0043: after the stream callback submitted another Read2 or Nop, the retired command could still deliver an early user completion. Patch 0044 suppresses that callback while the successor owns completion. The regression for this defect fails on the preceding implementation before it needs `sceCdBreak`.
+The importer gives compatible supplied `sceCdSync` exports precedence and restricts the modeled fallback to the compatible major version. Read errors remain read errors after synchronization. Deleted events, callback faults and retired device lifetimes cannot become successful completion; full reset discards sleeping callers.
 
-Behavior was checked against pinned PS2SDK [CDVDMAN](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdman/src/cdvdman.c), especially `sceCdBreak`, `cdvdman_intr_cb` and `sceCdSync`, and [CDVDSTM](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdstm/src/cdvdstm.c), including its stop/timeout flow. The existing 128-cycle asynchronous delay remains a bounded service model, not a physical-drive timing claim. Reentrant cancellation inside host file I/O is rejected rather than pretending that the synchronous host stack is a guest DMA operation.
+**Scope remains limited.** Pending timed/stream-wide waits, waits in IRQ or CPU-interrupt-disabled context, and blocking synchronous host invocations nested inside a running managed thread remain explicit unsupported boundaries. In particular, an external driver callback is not evidence that every nested managed-thread call is now resumable. Stream0 and raw CDVD IRQ programming also remain outside the implemented service model.
+
+The source reference is pinned PS2SDK [CDVDMAN `sceCdSync`](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdman/src/cdvdman.c) and the [CDVDSTM stop/start flow](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdstm/src/cdvdstm.c). This does not claim a PS2 firmware boot, cycle-exact drive timing or a verified complete movie-stop sequence.
 
 ### Executed checks
 
@@ -21,49 +23,47 @@ Behavior was checked against pinned PS2SDK [CDVDMAN](https://github.com/ps2dev/p
 | Complete IOP suite, GCC 14.2 Debug | 20/20 programs passed. |
 | Complete IOP suite, Clang 17, `-O2`, assertions and strict floating-point flags | 20/20 programs passed. |
 | Complete IOP suite, GCC ASan/UBSan with leak detection | 20/20 programs passed; no sanitizer findings. |
-| Corrected NCMD/stream/abort suite | 36/36 groups passed. |
-| Identical final tests on unchanged patch-0043 runtime | 24/36 passed; all twelve added regression groups failed. |
-| Local patch application and source parity | All 93 IOP files identical to the tested source. |
-| Published CI source archive compared to the local tested tree | All 93 IOP files identical; patch provenance hash also matches. |
-| Previous full Linux and ARM64 macOS CI, patch 0043 | All four jobs passed in [run 18](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40733776289). |
-| Full Linux and ARM64 macOS CI for patch 0044 | [Run 20](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40757496945); the latest confirmed checkpoint is recorded separately in `.recomp.json`. |
-| New original-game execution or screenshot | Not performed. |
+| NCMD/read/abort/sync suite | 51/51 groups passed. |
+| Identical final tests on unchanged patch-0044 runtime | 37/51 passed: fourteen new regression groups fail; the unsupported-mode control and all thirty-six preceding groups pass. |
+| Negative-control source check | Only the test runner and added fixture differ from the 93-file patch-0044 baseline; runtime source is unchanged. |
+| Fresh patch application | All 94 IOP files byte-identical to the tested source. |
+| Full Linux and ARM64 macOS CI, patch 0044 | All four jobs passed in [run 20](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40757496945). |
+| Full CI, patch 0045 | [Run 22](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40762352805); `.recomp.json` records the latest confirmed checkpoint without assuming a queued job passed. |
+| New original-game execution, BIOS comparison or screenshot | Not performed. |
 
-Review passes covered API and callback ordering, memory/reset lifetimes, and platform/regression coverage. Findings were corrected before publishing. These are self-review and executed-test results; no new independent reviewer or original-game test is claimed.
+Tests cover read/Nop/abort waits, low-priority peer progress, masked IRQs, successor commands, one-cycle host slices, event deletion, reset, external driver stacks, supplied exports, callback faults and unsuccessful media reads. Review passes covered continuation ownership, wakeup races, failure lifetime and platform/regression coverage. These are self-review and executed tests, not new independent reviewers or an original-game run.
 
-| Patch/source identity | SHA-256 |
+| Source identity | SHA-256 |
 | --- | --- |
-| Patch 0044 | `3c28eacf1a762e20ab69de7fdb7bea35cbc5b29c7029bd8e8dce188c9127d4b4` |
-| Downloaded patch-0044 CI source archive | `e1ba87010a970a434f5aaff408be77c342da4f8f1630005919e4ab75c97b4062` |
+| Patch 0045 | `b47c83411b5f7743a7198c4cb2ce4ee7ca8980524eb65e3b280e567c02889b30` |
+| Baseline patch-0044 CI source archive | `e1ba87010a970a434f5aaff408be77c342da4f8f1630005919e4ab75c97b4062` |
 
-The source archive was generated from commit `5ba829bd5cb57bf6c824da3251a41b6d92fb3352` and records upstream `e5636981a1c9de368f6b71e819c3dc188dfedbf4` plus patches 0001–0044. CI artifacts contain verified public IOP sources and test logs, not commercial data, generated game code, native game executables or Git metadata. They expire after seven days.
+The baseline archive records upstream `e5636981a1c9de368f6b71e819c3dc188dfedbf4` plus patches 0001–0044. CI archives contain verified public IOP sources and test logs, not commercial inputs, generated game code, game executables or Git metadata. They expire after seven days.
 
-### Preceding source changes
+### Preceding changes
 
-Patch 0042 replaced `std::jthread` in the SIO2 concurrency fixture with `std::thread`, preserving its existing stop/join paths and assertions. This fixed the observed Apple standard-library compilation failure; the complete Linux/macOS matrix passed in runs 16 and 17.
-
-Patch 0043 implements asynchronous stream1 `sceCdRE` reads of actual 2048-byte sectors from the selected medium. Payload writes occur at a later device checkpoint, before callback delivery. Failed/short reads do not partially overwrite destinations; allocation identities are checked before and after host I/O. Its original suite passed 24/24 groups, versus 15/24 on its predecessor. All twenty IOP programs passed under GCC, optimized Clang and sanitizers; the full Linux/macOS matrix subsequently passed in run 18. Patch 0044 adds the cancellation and callback-order correction described above.
+Patch 0042 fixed Apple standard-library test portability while retaining concurrent controller sampling/reset checks. Patch 0043 added owned asynchronous stream1 sector reads. Patch 0044 added cancellation and corrected premature user callbacks when a stream callback submits a successor. All four Linux/macOS jobs passed for patches 0043 and 0044. Their detailed controls remain in the linked checkpoints.
 
 ## Original-game execution status
 
-The original-data workspace is still unreachable. The current container has recovered public IOP sources, but not the original ISO, extracted files or generated game corpus. The supplied share was not successfully recovered here; no replacement game or BIOS was downloaded.
+The original-data workspace is still unreachable. Retried user-supplied shares and BIOS retrieval did not recover bytes in this environment; outbound downloads fail and the original machine's tunnel is inactive. The current workspace contains public IOP sources, not the original ISO, PC archive, extracted game files, BIOS or generated game corpus. No alternative commercial download was substituted. Private share links and passwords are not stored in this repository or its CI artifacts.
 
 | Milestone | Historical evidence and remaining limit |
 | --- | --- |
 | Original ELF and entry | Exact hash/headers verified; entry `0x00100008` and original main execute. |
 | Original IOP services | Supplied LOADFILE, CDVDFSV and FILEIO execute their entry functions and register services; later game modules also execute. Kernel/reset behavior is modeled, not a PS2 BIOS boot. |
 | Original frontend graphics | Gathering splash, autosave caution and no-card dialog captured from the actual GS surface on Linux x86-64. |
-| Original input | Up/Cross consumed through the original SIO2MAN/PADMAN route in full-game Xvfb/software-OpenGL runs. Separate original-driver tests verify Start/Cross press and release. Physical gamepads remain untested. |
-| Memory-card query | Original MCSERV reply completes and the no-card dialog appears. No present memory card or working save system is claimed. |
-| Movie initialization | Original CDVDSTM starts; stream initialization and layer-zero file search advance; correct trailer metadata reaches EE memory. |
+| Original input | Up/Cross consumed through original SIO2MAN/PADMAN in full-game Xvfb/software-OpenGL runs. Separate original-driver tests verify Start/Cross press and release. Physical gamepads remain untested. |
+| Memory-card query | Original MCSERV reply completes and the no-card dialog appears. No present card or working save system is claimed. |
+| Movie initialization | Original CDVDSTM starts; stream initialization and layer-zero search advance; correct trailer metadata reaches EE memory. |
 | Movie playback, main menu, missions and save/load | Not verified. |
-| Complete original game on macOS ARM64 or Linux ARM64 | Not verified. macOS CI uses constructed input, not the original game corpus. |
+| Complete original game on macOS ARM64 or Linux ARM64 | Not verified. macOS CI uses constructed input, not the game corpus. |
 
 ### Last recorded original run: patch 0039
 
 The Linux window run lasted 90.861 seconds and recorded 644 presentations, 674 SIO2 transfers, 10,300,542 IOP instructions and 12 loaded modules. Original `FileInfo` at EE address `0x1FFF920` contains trailer LSN **1,269,101** and size **68,435,972 bytes**, matching the independently checked original ISO.
 
-Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return address `0x9C188`: original CDVDSTM's `sceCdNop` call after selecting stream1. The final GS image was black, with no active frontend menu. Later patches implement this service and related operations, but no newer full-game trace is available here to establish the next actual stop.
+Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return address `0x9C188`: original CDVDSTM's `sceCdNop` after selecting stream1. The final GS image was black with no active frontend menu. Later patches implement this service and related operations, but no newer full-game trace is available here to establish the next actual stop.
 
 | Run identity | SHA-256 |
 | --- | --- |
@@ -74,7 +74,7 @@ Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return add
 
 ![Original no-card dialog with Yes selected through the original controller drivers](screenshots/mafia-linux-no-card.png)
 
-This is the actual **patch-0035** capture, not a patch-0044 image. Cross dismissed the caution, Up selected Yes, and the host closed after all keys were released. Capture occurred after joining the EE worker. The original no-card class and focus component were identified in the exact-ELF snapshot; both controller records had mode `0x79`, released buttons and zero grace/settling counters. The surface is **640×448**, VBlank 664, with 221,360 nonblack pixels. PNG encoding preserves its RGB bytes.
+This is the actual **patch-0035** capture, not a patch-0045 image. Cross dismissed the caution, Up selected Yes, and capture occurred after keys were released and the EE worker joined. The exact-ELF snapshot identified the original no-card class and selection, both controller records in mode `0x79`, and zero grace/settling counters. The surface is **640×448**, VBlank 664, with 221,360 nonblack pixels. PNG encoding preserves its RGB bytes.
 
 | Capture identity | SHA-256 |
 | --- | --- |
@@ -83,7 +83,7 @@ This is the actual **patch-0035** capture, not a patch-0044 image. Cross dismiss
 | Decoded RGB | `40187ea2cde72ecc6cd3a20a1ce05db18af41bca8db302fa759711be6e14f1bd` |
 | Runtime report | `30c90fe3b4215959f89eabcce2682b7fb9b01a3423ba5c08399c4a9cbc3edebe` |
 
-The earlier [autosave caution](screenshots/mafia-linux-autosave.png) and [Gathering splash](screenshots/mafia-linux-gathering.png) remain in the repository. Their complete provenance is in the linked historical report. None establishes main-menu entry or gameplay.
+Earlier [autosave caution](screenshots/mafia-linux-autosave.png) and [Gathering splash](screenshots/mafia-linux-gathering.png) captures remain in the repository with provenance in the historical report. None establishes main-menu entry or gameplay.
 
 ## Original input and translation
 
@@ -99,13 +99,13 @@ The historical complete disc is MAFIA, **SLUS-20671 / VER 1.01 / NTSC**, with 28
 | Explicit stubs / skipped functions / instruction patches | 0 / 0 / 0 |
 | Generated manifest SHA-256 | `ae9f147aedbf649ab7f0dc4b862269a9d3085dd960724c3ed6938dbaaa8056a9` |
 
-The original functions previously compiled into 245 Linux game objects with assertions and strict floating-point flags. Runtime-only updates through patch 0039 reran the actual generator and verified byte-identical generated sources. The later patches have not been relinked with that corpus here. The 2,506 indirect-control-flow warnings still require runtime/differential validation; compilation and unit tests do not establish complete game coverage.
+The original functions previously compiled into 245 Linux game objects with assertions and strict floating-point flags. Runtime-only updates through patch 0039 reran the actual generator and verified byte-identical generated sources. Later patches have not been relinked with that corpus here. The 2,506 indirect-control-flow warnings still require runtime/differential validation.
 
 ## Reproduce and continue
 
-Full original-game commands are in [README](../README.md). A new diagnostic run needs the matching ISO/extracted files, verified current dependencies and genuinely regenerated metadata. Retain a new report, log, executable hash and GS capture for each run.
+Full original-game commands are in [README](../README.md). A new diagnostic run needs the matching ISO/extracted files, verified current dependencies and genuinely regenerated metadata. Retain a new report, log, executable hash and actual GS capture for each run.
 
-To exercise the IOP suite without commercial input:
+To exercise IOP without commercial input:
 
 ```sh
 python3 tools/bootstrap.py --tools-only --jobs 2
@@ -116,6 +116,6 @@ cmake --build build/iop-only --parallel 2
 ctest --test-dir build/iop-only --output-on-failure --no-tests=error
 ```
 
-For sanitizer checks, configure a separate build with `-O1 -g1 -fsanitize=address,undefined -fno-omit-frame-pointer` in C++ flags and `-fsanitize=address,undefined` in executable linker flags. Run with `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1`. The reported sanitizer run is Linux GCC 14.2; availability depends on the host toolchain.
+The observed Linux GCC sanitizer build uses `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie` in C++ flags and `-fsanitize=address,undefined -no-pie` in executable linker flags, with `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1`. The non-PIE flags are Linux test configuration, not macOS build requirements.
 
-The next service gap is the original blocking CDVD synchronization path: suspend and resume the actual IOP continuation while the accepted command and interrupt progress, without pretending an incomplete wait succeeded. Then rebuild/run the complete current game corpus, repeat Up/Cross through the frontend and verify stream reads, cancellation, media output and the title/profile flow. Only mark main-menu entry after the original menu is visible and navigable. PCSX2 comparisons, saves, missions, audio and performance remain separate milestones.
+Next integration work is to recover the complete original-data workspace, rebuild the current patch set and repeat the real Up/Cross frontend flow through stream reads, cancellation and synchronization. Trace any remaining unsupported call before extending its contract. Only mark main-menu entry after the original menu is visible and navigable. Broader timed/nested synchronization, PCSX2 comparisons, saves, missions, audio and performance remain separate milestones.
