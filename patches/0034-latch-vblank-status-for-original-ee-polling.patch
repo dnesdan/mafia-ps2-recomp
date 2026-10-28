@@ -1,0 +1,262 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index d30ee9a..28fc19b 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1980,6 +1980,9 @@ void EeScheduler::processEvent(const EeEvent &event)
+         requestStop();
+         break;
+     case EeEventType::VBlankStart:
++        // The hardware request latches independently of handler delivery and
++        // masks. Guest code may clear INTC_STAT and poll for the next edge.
++        m_runtime.memory().m_ioRegisters[ps2_vif::IntcStat] |= 1u << 2u;
+         ++m_vsyncTick;
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+@@ -2019,6 +2022,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         completeExternalWait(event.id, event.value, KE_OK);
+         break;
+     case EeEventType::VBlankEnd:
++        m_runtime.memory().m_ioRegisters[ps2_vif::IntcStat] |= 1u << 3u;
+         dispatchIrq(false, 3u);
+         break;
+     case EeEventType::Dmac:
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index bdd2ba5..4e68bd5 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2_runtime.h"
+ #include "ps2_syscalls.h"
+ #include "runtime/ee_scheduler.h"
++#include "ps2_vblank_status_fixtures.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -1133,6 +1134,26 @@ void register_ps2_runtime_interrupt_tests()
+             checkPeriodicTimer1(t, true, true);
+         });
+ 
++        tc.Run("raw INTC clear and polling observes each next VBlank start edge", [](TestCase &t)
++        {
++            ee_vblank_status_tests::check(t, ee_vblank_status_tests::Mode::NextStart);
++        });
++
++        tc.Run("raw VBlank phases stay pending until their selective W1C acknowledgements", [](TestCase &t)
++        {
++            ee_vblank_status_tests::check(t, ee_vblank_status_tests::Mode::Phases);
++        });
++
++        tc.Run("masked VBlank delivery still publishes raw start and end status", [](TestCase &t)
++        {
++            ee_vblank_status_tests::check(t, ee_vblank_status_tests::Mode::Masked);
++        });
++
++        tc.Run("latched VBlank status preserves one existing callback per phase", [](TestCase &t)
++        {
++            ee_vblank_status_tests::check(t, ee_vblank_status_tests::Mode::Callbacks);
++        });
++
+         tc.Run("scheduler stop wakes an idle VSync wait without a timeout", [](TestCase &t)
+         {
+             TestEnv env;
+diff --git a/ps2xTest/src/ps2_vblank_status_fixtures.h b/ps2xTest/src/ps2_vblank_status_fixtures.h
+new file mode 100644
+index 0000000..55c24e9
+--- /dev/null
++++ b/ps2xTest/src/ps2_vblank_status_fixtures.h
+@@ -0,0 +1,195 @@
++#pragma once
++
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <exception>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace ee_vblank_status_tests
++{
++    constexpr uint32_t kPollPc = 0x001A1000u;
++    constexpr uint32_t kHandlerPc = 0x001A1100u;
++    constexpr uint32_t kIntcStat = 0x1000F000u;
++    constexpr uint32_t kIntcMask = 0x1000F010u;
++    constexpr uint32_t kStart = 1u << 2u;
++    constexpr uint32_t kEnd = 1u << 3u;
++    constexpr uint32_t kUnrelated = 1u << 14u;
++
++    enum class Mode { NextStart, Phases, Masked, Callbacks };
++
++    struct Observation
++    {
++        Mode mode = Mode::NextStart;
++        std::vector<uint64_t> edgeTicks;
++        std::array<uint32_t, 2u> callbacks{};
++        uint32_t expectedBit = kStart;
++        bool entered = false;
++        bool completed = false;
++        bool acknowledgementsCorrect = true;
++        bool stickyReadsCorrect = true;
++        bool unrelatedPreserved = true;
++        bool phaseOrderCorrect = true;
++        bool callbackStatusCorrect = true;
++        bool callbackAbiCorrect = true;
++        bool cpuStatePreserved = true;
++        uint32_t finalMask = 0u;
++        uint64_t finalTick = 0u;
++    };
++
++    // Only the executor accesses this state; assertions run after it is joined.
++    inline Observation observation;
++
++    inline void phaseHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint32_t cause = getRegU32(ctx, 4);
++        observation.callbackAbiCorrect &= (cause == 2u || cause == 3u) &&
++            getRegU32(ctx, 5) == 0x1122u && getRegU32(ctx, 28) == 0x3344u;
++        if (cause == 2u || cause == 3u)
++        {
++            ++observation.callbacks[cause - 2u];
++            observation.callbackStatusCorrect &=
++                (runtime->memory().read32(kIntcStat) & (1u << cause)) != 0u;
++        }
++        ctx->pc = 0u;
++    }
++
++    // Constructed guest-shaped clear/read/back-edge polling. It deliberately
++    // uses neither WaitVSync nor a replacement for an original game function.
++    inline void pollStatus(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        auto &memory = runtime->memory();
++        auto &scheduler = runtime->eeScheduler();
++        if (!observation.entered)
++        {
++            observation.entered = true;
++            memory.write32(kIntcStat, kStart | kEnd);
++            observation.acknowledgementsCorrect &= (memory.read32(kIntcStat) & (kStart | kEnd)) == 0u;
++        }
++        for (;;)
++        {
++            const uint32_t status = memory.read32(kIntcStat);
++            const uint64_t tick = scheduler.currentVSyncTick();
++            observation.unrelatedPreserved &= (status & kUnrelated) != 0u;
++            const uint32_t expectedCpu = observation.mode == Mode::Masked ? 0u : 0x10001u;
++            observation.cpuStatePreserved &= ctx->cop0_status == expectedCpu;
++            if ((status & observation.expectedBit) != 0u)
++            {
++                observation.edgeTicks.push_back(tick);
++                observation.stickyReadsCorrect &= memory.read32(kIntcStat) == status;
++                memory.write32(kIntcStat, 0u);
++                observation.stickyReadsCorrect &= memory.read32(kIntcStat) == status;
++                if (observation.mode == Mode::NextStart)
++                {
++                    memory.write32(kIntcStat, kStart);
++                    observation.acknowledgementsCorrect &= (memory.read32(kIntcStat) & kStart) == 0u;
++                    observation.completed = observation.edgeTicks.size() == 2u;
++                }
++                else if (observation.expectedBit == kStart)
++                {
++                    observation.phaseOrderCorrect &= (status & kEnd) == 0u;
++                    // Retain start until end so selective W1C is observable.
++                    observation.expectedBit = kEnd;
++                }
++                else
++                {
++                    observation.phaseOrderCorrect &= (status & (kStart | kEnd)) == (kStart | kEnd);
++                    memory.write32(kIntcStat, kStart);
++                    observation.acknowledgementsCorrect &=
++                        (memory.read32(kIntcStat) & (kStart | kEnd)) == kEnd;
++                    memory.write32(kIntcStat, kEnd);
++                    observation.acknowledgementsCorrect &=
++                        (memory.read32(kIntcStat) & (kStart | kEnd)) == 0u;
++                    observation.expectedBit = kStart;
++                    observation.completed = observation.edgeTicks.size() == 4u;
++                }
++            }
++            if (observation.completed || tick >= 4u)
++            {
++                observation.finalTick = tick;
++                observation.finalMask = memory.read32(kIntcMask);
++                ctx->pc = 0u;
++                runtime->requestStop();
++                return;
++            }
++            if (runtime->eeCheckpointDue(32u))
++                return;
++        }
++    }
++
++    inline void check(TestCase &t, Mode mode)
++    {
++        std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++        PS2Runtime runtime;
++        t.IsTrue(runtime.memory().initialize(), "runtime memory should initialize");
++        runtime.registerFunction(kPollPc, pollStatus);
++        runtime.registerFunction(kHandlerPc, phaseHandler);
++        observation = {};
++        observation.mode = mode;
++        std::atomic<bool> done{false};
++        std::string error;
++        std::thread executor([&]()
++        {
++            try
++            {
++                R5900Context initial{};
++                initial.pc = kPollPc;
++                initial.cop0_status = mode == Mode::Masked ? 0u : 0x10001u;
++                auto &scheduler = runtime.eeScheduler();
++                scheduler.reset(rdram.data(), initial);
++                // A separate device's pending status must survive VBlank/ack.
++                runtime.memory().m_ioRegisters[kIntcStat] = kUnrelated;
++                for (uint32_t cause : {2u, 3u})
++                {
++                    if (mode == Mode::Callbacks || mode == Mode::Masked)
++                        scheduler.addIrqHandler(false, cause, kHandlerPc, true, 0x1122u, 0x3344u, 0u);
++                    scheduler.setIrqCauseEnabled(false, cause, mode != Mode::Masked);
++                }
++                scheduler.run();
++            }
++            catch (const std::exception &failure)
++            {
++                error = failure.what();
++            }
++            catch (...)
++            {
++                error = "unknown executor exception";
++            }
++            done.store(true, std::memory_order_release);
++        });
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++        while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        const bool bounded = done.load(std::memory_order_acquire);
++        if (!bounded)
++            runtime.requestStop();
++        executor.join();
++
++        t.IsTrue(bounded, "raw VBlank polling must finish within its bounded watchdog");
++        t.IsTrue(error.empty(), "raw VBlank polling must not throw");
++        t.IsTrue(observation.completed, "hardware status must become visible without a VSync helper");
++        const std::vector<uint64_t> expected = mode == Mode::NextStart
++            ? std::vector<uint64_t>{1u, 2u} : std::vector<uint64_t>{1u, 1u, 2u, 2u};
++        t.IsTrue(observation.edgeTicks == expected,
++                 "acknowledged edges must rearm at the next real phase, with end following start");
++        t.IsTrue(observation.acknowledgementsCorrect, "W1C must acknowledge only requested status bits");
++        t.IsTrue(observation.stickyReadsCorrect, "reads and zero writes must preserve pending status");
++        t.IsTrue(observation.unrelatedPreserved, "VBlank events must preserve unrelated pending devices");
++        t.IsTrue(observation.phaseOrderCorrect, "start and end must latch at their separate deadlines");
++        t.IsTrue(observation.cpuStatePreserved, "publishing hardware status must not alter COP0 state");
++        const uint32_t expectedCallbacks = mode == Mode::Callbacks ? 2u : 0u;
++        t.Equals(observation.callbacks[0], expectedCallbacks, "each enabled start event invokes its existing handler once");
++        t.Equals(observation.callbacks[1], expectedCallbacks, "each enabled end event invokes its existing handler once");
++        t.IsTrue(observation.callbackStatusCorrect, "phase status must be visible before its handler runs");
++        t.IsTrue(observation.callbackAbiCorrect, "existing handler argument and GP must be preserved");
++        const uint32_t expectedMask = mode == Mode::Masked ? 0u : kStart | kEnd;
++        t.Equals(observation.finalMask & (kStart | kEnd), expectedMask, "hardware events must not change delivery masks");
++    }
++}
