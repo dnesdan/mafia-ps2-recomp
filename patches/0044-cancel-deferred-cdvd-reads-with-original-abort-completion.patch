@@ -1,0 +1,571 @@
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index bf51b15..6dfe63d 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -30,6 +30,7 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kFirstDirectoryLsn = 20u;
+         constexpr uint32_t kCdvdErrorNone = 0u;
+         constexpr uint32_t kCdvdErrorRead = 0x30u;
++        constexpr uint32_t kCdvdErrorAborted = 1u;
+         constexpr uint32_t kCdvdTypePs2Dvd = 0x14u;
+         constexpr uint32_t kCdvdReadyComplete = 2u;
+         constexpr uint8_t kControllerError = 0x01u;
+@@ -41,6 +42,7 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCdvdInitExit = 5u;
+         constexpr uint32_t kCdvdCallbackRead = 1u;
+         constexpr uint32_t kCdvdCallbackSeek = 4u;
++        constexpr uint32_t kCdvdCallbackBreak = 8u;
+         constexpr uint32_t kCdvdInterruptReadyBits = 0x29u;
+         constexpr uint32_t kEventFlagMulti = 2u;
+         constexpr uint32_t kCdvdStreamTimeout = 5000u;
+@@ -226,6 +228,8 @@ namespace ps2x::iop::detail
+             completionCallback.reset();
+             ncmdDeadline.reset();
+             pendingRead.reset();
++            ncmdCallbackReason = 0u;
++            read2Pending = false;
+             if (commandGeneration == std::numeric_limits<uint64_t>::max())
+                 throw std::runtime_error("IOP CDVD command lifetime exhausted");
+             ++commandGeneration;
+@@ -463,6 +467,13 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+ 
++            case 39: // sceCdBreak: cancel payload work, not the original stream driver.
++                if (streamFlag == 1u)
++                    return false; // Stream0 IRQ delivery is still outside this model.
++                breakCommand(currentCycle);
++                cpu.gpr[2] = 1u;
++                return true;
++
+             case 46: // sceCdNop: NCMD0 has no payload and no ordinary callback reason.
+                 if (streamFlag == 1u)
+                     return false; // Stream0 registration/delivery remains unsupported.
+@@ -510,7 +521,7 @@ namespace ps2x::iop::detail
+                     cpu.gpr[2] = kCdvdmanVersion;
+                     return true;
+                 case -3: // Read2 remains active until its driver IRQ has run.
+-                    cpu.gpr[2] = readActive || pendingRead ? 1u : 0u;
++                    cpu.gpr[2] = readActive || read2Pending ? 1u : 0u;
+                     return true;
+                 case -2:
+                     lastError = a1 != 0u ? memory.read8(a1) : kCdvdErrorNone;
+@@ -571,6 +582,8 @@ namespace ps2x::iop::detail
+                     if (!beginCommand(currentCycle))
+                         throw std::logic_error("IOP CDVD stream command lost exclusive ownership");
+                     pendingRead = request;
++                    read2Pending = true;
++                    ncmdCallbackReason = kCdvdCallbackRead;
+                     cpu.gpr[2] = 1u;
+                 }
+                 return true;
+@@ -629,7 +642,10 @@ namespace ps2x::iop::detail
+                 explicit Scope(bool &value) : active(value) { active = true; }
+                 ~Scope() { active = false; }
+             } scope(servicingNcmd);
+-            const bool completedRead = pendingRead.has_value();
++            const uint32_t completedReason = ncmdCallbackReason;
++            ncmdCallbackReason = 0u;
++            read2Pending = false;
++            lastReadTimeout = 0u;
+             const uint64_t generation = commandGeneration;
+             pendingRead.reset();
+             ncmdInterruptPending = false;
+@@ -643,10 +659,13 @@ namespace ps2x::iop::detail
+             // PS2SDK cdvdman_intr_cb invokes stream1 first, then the live user
+             // callback for a completed read. A reset inside stream1 retires the
+             // old command; do not deliver its user callback into the new device.
+-            if (completedRead && commandGeneration == generation && callback.address != 0u)
++            // A successor Read2 has its own pending completion; a successor Nop
++            // replaces the command reason with zero. Neither may receive an
++            // early user callback attributed to this retired command.
++            if (completedReason != 0u && commandGeneration == generation && !ncmdBusy() && callback.address != 0u)
+             {
+                 const Callback user = callback;
+-                (void)intrman.executeInterruptCallback(user.address, kCdvdCallbackRead, user.gp, executor);
++                (void)intrman.executeInterruptCallback(user.address, completedReason, user.gp, executor);
+             }
+             // Private IRQ boundary only: do not additionally assert raw I_STAT.
+             // NCMD0 cmdfunc is zero, so it never creates a user37 completion.
+@@ -701,11 +720,48 @@ namespace ps2x::iop::detail
+             if (!kernel.dispatchEventImport(8u, clear) || clear.gpr[2] != 0u)
+                 throw std::runtime_error("IOP CDVD NCMD could not clear its live completion event");
+             lastError = kCdvdErrorNone;
++            lastReadTimeout = 0u;
+             controllerReadError = false;
++            ncmdCallbackReason = 0u;
++            read2Pending = false;
+             ncmdDeadline = currentCycle + kNcmdCompletionCycles;
+             return true;
+         }
+ 
++        void breakCommand(uint64_t currentCycle)
++        {
++            // PS2SDK cdvdman.c:sceCdBreak sets ABRT and the shared event even
++            // when idle. Active commands or reported timeouts acquire a Break IRQ.
++            // Host I/O runs on the IOP executor; a reentrant host hook cannot
++            // cancel that same synchronous C++ stack as though it were a DMA.
++            if (readActive)
++                throw std::runtime_error("IOP CDVD break during host I/O is unsupported");
++            const bool outstanding = ncmdBusy();
++            const bool abortRequired = outstanding || lastReadTimeout != 0u;
++            const bool alreadyAborting = ncmdCallbackReason == kCdvdCallbackBreak;
++            const bool startAbort = !alreadyAborting && (ncmdDeadline || (!outstanding && abortRequired));
++            if (startAbort &&
++                currentCycle > std::numeric_limits<uint64_t>::max() - kNcmdCompletionCycles)
++                throw std::runtime_error("IOP CDVD abort deadline exceeds the execution clock");
++            const int event = ensureInterruptEventFlag();
++            if (!kernel.setInternalEventFlag(event, kCdvdInterruptReadyBits))
++                throw std::runtime_error("IOP CDVD abort lost its live completion event");
++            lastError = kCdvdErrorAborted;
++            if (lastReadTimeout != 0u)
++                read2Pending = false; // The primary timeout path retires Read2 early.
++            if (!abortRequired)
++                return; // No invented IRQ or callback for an idle drive.
++            // Removing this lease is the cancellation: no later checkpoint may
++            // read media, validate a freed buffer, or publish its former bytes.
++            pendingRead.reset();
++            ncmdCallbackReason = kCdvdCallbackBreak;
++            if (startAbort)
++                ncmdDeadline = currentCycle + kNcmdCompletionCycles;
++            // Already delivered bytes stay delivered. If only a masked IRQ was
++            // pending, replace its reason without redoing I/O or extending time.
++            // Repeated Break calls likewise cannot postpone or duplicate it.
++        }
++
+         void checkTrayChange(uint32_t destination)
+         {
+             const uint32_t segment = destination & 0xE0000000u;
+@@ -1361,6 +1417,8 @@ namespace ps2x::iop::detail
+         std::optional<CompletionCallback> completionCallback;
+         std::optional<uint64_t> ncmdDeadline;
+         std::optional<PendingRead> pendingRead;
++        uint32_t ncmdCallbackReason = 0u;
++        bool read2Pending = false;
+         uint64_t commandGeneration = 0u;
+         bool ncmdInterruptPending = false;
+         bool servicingNcmd = false;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index a67c9ee..f5ec380 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -685,7 +685,7 @@ namespace ps2x::iop::detail
+             // search/stream fallbacks are limited to the compatible 1.x ABI.
+             if (iequals(call.library, "cdvdman") &&
+                 ((call.ordinal != 14u && call.ordinal != 49u && call.ordinal != 10u && call.ordinal != 84u &&
+-                  call.ordinal != 46u && call.ordinal != 114u) ||
++                  call.ordinal != 46u && call.ordinal != 114u && call.ordinal != 39u) ||
+                     (imports.resolve(call.library, call.ordinal, call.version) == 0u &&
+                      (call.ordinal == 14u || (call.version >> 8u) == 1u))) &&
+                 cdvd.dispatchImport(call.ordinal, cpu, totalCycles))
+diff --git a/ps2xIOP/tests/iop_cdvd_break_fixtures.h b/ps2xIOP/tests/iop_cdvd_break_fixtures.h
+new file mode 100644
+index 0000000..fc05c15
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_break_fixtures.h
+@@ -0,0 +1,373 @@
++#pragma once
++
++#include "iop_cdvd_stream_read_fixtures.h"
++
++namespace iop_cdvd_break_test
++{
++    using namespace iop_stream_read_test;
++
++    int32_t poll(Fixture &f, uint32_t bits)
++    {
++        IopCpuState cpu{};
++        cpu.gpr[4] = static_cast<uint32_t>(f.cdvd.interruptEventFlag());
++        cpu.gpr[5] = bits;
++        require(f.kernel.dispatchEventImport(11u, cpu), "completion event poll unresolved");
++        return static_cast<int32_t>(cpu.gpr[2]);
++    }
++
++    void idleAbortDoesNotInventWork()
++    {
++        Fixture f;
++        require(f.call(37u, 0x3100u, 0u, 0u, 0u, 0xAABBCCDDu) == 0u, "user setup failed");
++        for (unsigned i = 0; i < 2; ++i)
++            require(f.call(39u, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX) == 1u &&
++                        f.call(8u) == 1u && poll(f, 0x29u) == 0 && f.call(11u, 1u) == 0u &&
++                        f.call(50u, uint32_t(-3)) == 0u && f.cdvd.nextEventCycle(UINT64_MAX) == UINT64_MAX,
++                    "idle Break did not set ABRT/event without inventing an active command");
++        f.due(10000u);
++        require(f.executor.calls.empty() && f.host.reads == 0u && f.host.opens == 0u &&
++                    !f.cdvd.takeCompletionCallback() && f.call(37u, 0u) == 0x3100u &&
++                    f.cdvd.registeredStream1Callback().address == 0x3000u && f.call(50u, uint32_t(-1)) == 2u,
++                "idle Break touched media, generated callbacks or stopped the original driver's stream mode");
++        require(f.call(46u) == 1u && f.call(8u) == 0u, "a new command did not clear the old abort error");
++        f.due(f.deadline());
++        require(f.executor.calls.size() == 1u && f.executor.calls[0].argument == 1u,
++                "idle cancellation damaged the next stream callback");
++    }
++
++    void abortBeforeDmaDropsTheBufferLease()
++    {
++        Fixture f;
++        require(f.call(37u, 0x3100u, 0u, 0u, 0u, 0xABCDu) == 0u, "user setup failed");
++        const uint32_t buffer = f.memory.allocate(4096u);
++        require(buffer && f.memory.zeroRam(buffer, 4096u) && f.read(1u, 2u, buffer) == 1u, "leased read setup failed");
++        require(poll(f, 1u) == -418, "read did not clear completion");
++        f.now += 3u;
++        require(f.call(39u) == 1u && f.call(8u) == 1u && poll(f, 0x29u) == 0 &&
++                    f.call(11u, 1u) == 1u && f.call(50u, uint32_t(-3)) == 1u,
++                "Break conflated the signaled event with completed driver work");
++        const uint64_t due = f.deadline();
++        require(f.memory.freeAllocation(buffer) && f.memory.allocate(4096u) == buffer,
++                "cannot reuse canceled DMA destination");
++        f.memory.write32(buffer, 0x12345678u);
++        f.due(due - 1u);
++        require(f.executor.calls.empty() && f.host.reads == 0u, "abort completed synchronously");
++        f.executor.action = [&](const Call &call)
++        {
++            require(call.interrupt && f.call(8u) == 1u && f.call(11u, 1u) == 0u &&
++                        f.call(50u, uint32_t(-3)) == 0u && poll(f, 0x29u) == 0,
++                    "abort callback observed stale driver state or lost interrupt scope");
++        };
++        f.due(due); f.due(due + 5000u);
++        require(f.host.reads == 0u && f.host.opens == 0u && f.memory.read32(buffer) == 0x12345678u &&
++                    f.executor.calls.size() == 2u && f.executor.calls[0].function == 0x3000u &&
++                    f.executor.calls[0].argument == 1u && f.executor.calls[0].gp == 0x12345678u &&
++                    f.executor.calls[1].function == 0x3100u && f.executor.calls[1].argument == 8u &&
++                    f.executor.calls[1].gp == 0xABCDu && !f.intrman.inInterruptContext() &&
++                    !f.cdvd.takeCompletionCallback(),
++                "canceled payload was touched or Break/read callback reasons and order were confused");
++    }
++
++    void repeatedAbortCannotPostponeOrDuplicate()
++    {
++        for (const bool read : {false, true})
++        {
++            Fixture f;
++            require(f.call(37u, 0x3100u) == 0u && (read ? f.read() : f.call(46u)) == 1u && f.call(39u) == 1u,
++                    "repeat setup failed");
++            const uint64_t due = f.deadline();
++            for (unsigned i = 0; i < 8; ++i)
++            {
++                ++f.now;
++                require(f.call(39u) == 1u && f.cdvd.nextEventCycle(UINT64_MAX) == due,
++                        "repeated Break postponed its accepted completion");
++            }
++            require(f.call(46u) == 0u && f.read(0u, 1u, UINT32_MAX, UINT32_MAX) == 0u,
++                    "pending abort allowed a command to steal its slot");
++            f.due(due); f.due(due + 5000u);
++            require(f.executor.calls.size() == 2u && f.executor.calls[1].argument == 8u && f.host.reads == 0u,
++                    "repeated abort or canceled Nop produced duplicate callbacks or I/O");
++        }
++    }
++
++    void maskedAbortAndLiveModeKeepTheirOwnState()
++    {
++        for (unsigned gates = 1; gates <= 3; ++gates)
++        {
++            Fixture f;
++            require(f.call(37u, 0x3100u) == 0u && f.read() == 1u && f.call(39u) == 1u, "masked abort setup failed");
++            if (gates & 1u) f.memory.setInterruptControl(0u);
++            if (gates & 2u) f.memory.setInterruptMask(0u);
++            const uint64_t due = f.deadline();
++            f.due(due + 1000u);
++            require(f.executor.calls.empty() && f.host.reads == 0u && f.call(11u, 1u) == 1u &&
++                        f.cdvd.nextEventCycle(due + 2000u) == due + 2000u,
++                    "masked abort ran its callback, retained an idle spin or lost driver wait");
++            require(f.call(49u, 0x3300u, 0u, 0u, 0u, 0x778899u) == 0u, "live callback replacement failed");
++            f.memory.setInterruptMask(4u);
++            if (gates & 1u)
++            {
++                f.due(due + 1001u);
++                require(f.executor.calls.empty(), "IRQ mask bypassed disabled CPU interrupts");
++            }
++            f.memory.setInterruptControl(1u); f.due(due + 1002u); f.due(due + 1003u);
++            require(f.executor.calls.size() == 2u && f.executor.calls[0].function == 0x3300u &&
++                        f.executor.calls[0].gp == 0x778899u && f.executor.calls[1].argument == 8u,
++                    "pending abort used an old callback slot or fired twice after unmasking");
++        }
++        Fixture stopped;
++        require(stopped.call(37u, 0x3100u) == 0u && stopped.read() == 1u && stopped.call(50u, 0u) == 0u &&
++                    stopped.call(39u) == 1u, "original SC0/Break stop sequence failed");
++        stopped.due(stopped.deadline());
++        require(stopped.executor.calls.size() == 1u && stopped.executor.calls[0].function == 0x3100u &&
++                    stopped.executor.calls[0].argument == 8u && stopped.call(11u, 0u) == 0u &&
++                    stopped.call(11u, 17u) == 0u,
++                "stopped stream was restarted by its old pending callback");
++    }
++
++    void alreadyCopiedPayloadIsNotRolledBackOrRepeated()
++    {
++        Fixture f;
++        require(f.call(37u, 0x3100u) == 0u && f.read() == 1u, "completed payload setup failed");
++        f.memory.setInterruptMask(0u); const uint64_t due = f.deadline();
++        f.due(due); f.matches();
++        require(f.host.reads == 1u && f.executor.calls.empty(), "masked payload setup failed");
++        require(f.call(39u) == 1u && f.call(8u) == 1u && f.call(50u, uint32_t(-3)) == 1u &&
++                    f.cdvd.nextEventCycle(due + 100u) == due + 100u,
++                "Break incorrectly resubmitted already-completed hardware work");
++        f.matches();
++        f.memory.write32(bufferAddress, 0xCAFEBABEu);
++        f.due(due + 1u); f.memory.setInterruptMask(4u); f.due(due + 2u);
++        require(f.host.reads == 1u && f.memory.read32(bufferAddress) == 0xCAFEBABEu &&
++                    f.executor.calls.size() == 2u && f.executor.calls[1].argument == 8u,
++                "abort replayed DMA, undid delivered bytes, or reported a successful read instead of Break");
++    }
++
++    void resetAndNextCommandDoNotInheritAbortState()
++    {
++        Fixture f;
++        require(f.read() == 1u && f.call(39u) == 1u, "reset setup failed");
++        const uint64_t due = f.deadline(); f.cdvd.reset(); f.due(due + 1000u);
++        require(f.executor.calls.empty() && f.host.reads == 0u && f.call(8u) == 0u &&
++                    f.call(50u, uint32_t(-3)) == 0u, "reset retained a canceled request or abort IRQ");
++        require(f.call(49u, 0x3300u) == 0u && f.call(50u, 2u) == 2u && f.read() == 1u,
++                "fresh command failed after reset");
++        f.due(f.deadline()); f.matches();
++        require(f.executor.calls.size() == 1u && f.host.reads == 1u && f.call(8u) == 0u,
++                "new read inherited the old cancellation");
++        require(f.call(37u, 0x3100u) == 0u && f.read() == 1u && f.call(39u) == 1u, "callback reset setup failed");
++        f.executor.action = [&](const Call &) { f.cdvd.reset(); (void)f.call(37u, 0x3500u); };
++        f.due(f.deadline());
++        require(f.executor.calls.size() == 2u, "old abort delivered a user callback into a reset device");
++    }
++
++    void successorReadCannotReceiveAnEarlyUserCallback()
++    {
++        for (const bool abort : {false, true})
++        {
++            Fixture f;
++            require(f.call(37u, 0x3100u) == 0u && f.memory.zeroRam(0x8000u, 4096u) && f.read() == 1u,
++                    "successor setup failed");
++            if (abort) require(f.call(39u) == 1u, "successor abort setup failed");
++            uint64_t second = 0u;
++            f.executor.action = [&](const Call &)
++            {
++                if (f.executor.calls.size() == 1u)
++                {
++                    require(f.read(3u, 2u, 0x8000u) == 1u, "stream callback could not submit a successor");
++                    second = f.deadline();
++                }
++            };
++            f.due(f.deadline());
++            require(f.executor.calls.size() == 1u && f.call(11u, 1u) == 1u,
++                    "user callback fired early after the stream callback submitted another Read2");
++            f.due(second); f.matches(3u, 0x8000u);
++            require(f.executor.calls.size() == 3u && f.executor.calls[1].function == 0x3000u &&
++                        f.executor.calls[2].function == 0x3100u && f.executor.calls[2].argument == 1u &&
++                        f.host.reads == (abort ? 1u : 2u), "successor completion inherited the old callback reason");
++        }
++        Fixture nop;
++        require(nop.call(37u, 0x3100u) == 0u && nop.read() == 1u && nop.call(39u) == 1u, "Nop successor setup failed");
++        uint64_t next = 0u;
++        nop.executor.action = [&](const Call &)
++        {
++            if (nop.executor.calls.size() == 1u)
++            {
++                require(nop.call(46u) == 1u, "stream callback could not submit Nop");
++                next = nop.deadline();
++            }
++        };
++        nop.due(nop.deadline()); nop.due(next);
++        require(nop.executor.calls.size() == 2u && nop.executor.calls.back().function == 0x3000u,
++                "successor Nop inherited the retired abort's user reason");
++    }
++
++    void invalidAbortPreflightPreservesTheOriginalRequest()
++    {
++        Fixture f;
++        require(f.read() == 1u, "overflow setup failed"); const uint64_t due = f.deadline();
++        f.now = UINT64_MAX;
++        iop_vblank_test::rejects([&] { (void)f.call(39u); }, "abort deadline exceeds");
++        require(f.call(8u) == 0u && poll(f, 1u) == -418 && f.cdvd.nextEventCycle(UINT64_MAX) == due,
++                "overflowing abort changed event, error or command ownership");
++        f.due(due); f.matches();
++        Fixture event;
++        require(event.read() == 1u, "deleted-event setup failed");
++        IopCpuState cpu{}; cpu.gpr[4] = static_cast<uint32_t>(event.cdvd.interruptEventFlag());
++        require(event.kernel.dispatchEventImport(5u, cpu) && cpu.gpr[2] == 0u, "event deletion failed");
++        iop_vblank_test::rejects([&] { (void)event.call(39u); }, "event flag was deleted");
++        require(event.call(8u) == 0u && event.host.reads == 0u && event.executor.calls.empty(),
++                "failed abort fabricated a terminal state");
++        Fixture unsupported;
++        require(unsupported.call(50u, 1u) == 1u, "unsupported mode setup failed");
++        cpu = {}; cpu.gpr[2] = 0x12345678u;
++        require(!unsupported.cdvd.dispatchImport(39u, cpu, unsupported.now) && cpu.gpr[2] == 0x12345678u &&
++                    unsupported.call(8u) == 0u, "unmodeled stream0 abort silently succeeded");
++    }
++
++    void timeoutAbortRetiresRead2AndNewCommandClearsTimeout()
++    {
++        Fixture f;
++        require(f.read() == 1u, "timeout setup failed");
++        f.memory.write32(0x2100u, 5000u);
++        require(f.call(50u, uint32_t(-18), 0x2100u) == 0u && f.call(39u) == 1u &&
++                    f.call(50u, uint32_t(-3)) == 0u, "timeout abort failed to retire Read2 immediately");
++        f.due(f.deadline());
++        require(f.read() == 1u && f.call(39u) == 1u && f.call(50u, uint32_t(-3)) == 1u,
++                "new command inherited the previous timeout's early retirement flag");
++        f.due(f.deadline());
++        require(f.host.reads == 0u && f.executor.calls.size() == 2u, "timeout cancellation touched media");
++        Fixture idle;
++        require(idle.call(37u, 0x3100u) == 0u, "idle timeout user setup failed");
++        idle.memory.write32(0x2100u, 5000u);
++        require(idle.call(50u, uint32_t(-18), 0x2100u) == 0u && idle.call(39u) == 1u &&
++                    idle.call(11u, 1u) == 1u, "timeout recovery did not issue the primary idle abort");
++        idle.due(idle.deadline());
++        require(idle.host.reads == 0u && idle.executor.calls.size() == 2u &&
++                    idle.executor.calls[1].argument == 8u && idle.call(39u) == 1u &&
++                    idle.cdvd.nextEventCycle(UINT64_MAX) == UINT64_MAX,
++                "timeout abort was lost or reissued after clearing the completed timeout");
++    }
++
++    void rawOwnerAndHostReentryStayExplicit()
++    {
++        Fixture f;
++        require(f.read() == 1u && f.call(39u) == 1u, "raw-owner abort setup failed");
++        IopCpuState cpu{}; cpu.gpr[4] = 2u; cpu.gpr[5] = 1u; cpu.gpr[6] = 0x3600u;
++        require(f.intrman.dispatchImport(4u, cpu, f.executor), "IRQ owner setup failed");
++        const uint64_t due = f.deadline();
++        iop_vblank_test::rejects([&] { f.due(due); }, "supplied raw IRQ2 owner");
++        require(f.host.reads == 0u && f.executor.calls.empty() && f.call(11u, 1u) == 1u,
++                "abort bypassed the supplied IRQ owner or published canceled bytes");
++        require(f.intrman.dispatchImport(5u, cpu, f.executor), "IRQ owner release failed");
++        f.due(due);
++        require(f.executor.calls.size() == 1u, "ownership rejection consumed the pending abort");
++
++        Fixture host;
++        require(host.read() == 1u, "host-reentry setup failed");
++        host.host.onRead = [&]
++        {
++            iop_vblank_test::rejects([&] { (void)host.call(39u); }, "break during host I/O is unsupported");
++            require(host.call(8u) == 0u && poll(host, 1u) == -418,
++                    "unsupported host reentry changed the active driver's error or event");
++        };
++        host.due(host.deadline()); host.matches();
++        require(host.host.reads == 1u && host.executor.calls.size() == 1u && host.call(8u) == 0u,
++                "rejected host reentry corrupted the continuing read");
++    }
++
++    iop_vblank_test::Program program(uint16_t requested = 0x0101u, uint16_t provided = 0u, bool masked = false)
++    {
++        iop_vblank_test::Program p;
++        p.imports(0x1000u, "cdvdman", {114u, 49u, 50u, 39u, 37u, 11u});
++        p.image.words(0x1008u, {requested}); p.image.words(0x2020u, {0u});
++        p.begin();
++        if (provided)
++        {
++            p.image.words(0x1800u, {0x41C00000u, 0u, provided, 0x64766463u, 0x006E616Du});
++            for (uint32_t i = 0; i <= 39u; ++i) p.image.words(0x1814u + i * 4u, {p.base + 0xA00u});
++            p.constant(4u, p.base + 0x1800u); p.call(p.stub(0x1500u));
++        }
++        else
++        {
++            p.constant(28u, 0x11223344u); p.constant(4u, p.base + 0x800u); p.call(p.stub(0x1000u, 1u));
++            p.constant(28u, 0xAABBCCDDu); p.constant(4u, p.base + 0x900u); p.call(p.stub(0x1000u, 4u));
++            p.constant(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1000u, 2u));
++            if (masked)
++            {
++                p.constant(4u, p.data(0x70u)); p.call(p.stub(0x1100u));
++                p.constant(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1100u, 4u));
++            }
++            p.constant(4u, 1u); p.constant(5u, 2u); p.constant(6u, 0x30000u); p.constant(7u, p.data(0x20u));
++            p.call(p.stub(0x1000u)); p.store(2u, p.data(0x40u));
++        }
++        p.constant(28u, 0x55667788u);
++        p.constant(4u, UINT32_MAX); p.constant(5u, UINT32_MAX);
++        p.call(p.stub(0x1000u, 3u)); p.store(2u, p.data(0x44u)); p.store(28u, p.data(0x48u)); p.finish();
++        p.recordingHandler(0x800u, 0u); p.recordingHandler(0x900u, 0u);
++        p.begin(0xA00u); p.constant(8u, 0xABCDEF01u); p.store(8u, p.data()); p.finish(0x5A3u);
++        return p;
++    }
++
++    void authoredMipsAbortAndProviderPrecedence()
++    {
++        DiscHost host; IopEmulator iop(host); const auto p = program();
++        const std::vector<uint8_t> canary(4096u, 0xCCu);
++        require(iop.writeMemory(0x30000u, canary.data(), canary.size()), "MIPS buffer setup failed");
++        iop_vblank_test::start(iop, p); iop_vblank_test::advance(iop, 5000u);
++        std::vector<uint8_t> after(canary.size());
++        require(iop.readMemory(0x30000u, after.data(), after.size()) && after == canary && host.reads == 0u &&
++                    iop_vblank_test::word(iop, p.data(0x40u)) == 1u && iop_vblank_test::word(iop, p.data(0x44u)) == 1u &&
++                    iop_vblank_test::word(iop, p.data(0x48u)) == 0x55667788u && iop_vblank_test::word(iop, p.data()) == 2u &&
++                    iop_vblank_test::word(iop, p.data(0x100u)) == 1u && iop_vblank_test::word(iop, p.data(0x104u)) == 0x11223344u &&
++                    iop_vblank_test::word(iop, p.data(0x108u)) == 1u && iop_vblank_test::word(iop, p.data(0x110u)) == 8u &&
++                    iop_vblank_test::word(iop, p.data(0x114u)) == 0xAABBCCDDu && iop_vblank_test::word(iop, p.data(0x118u)) == 1u,
++                "MIPS cancellation lost the byte bounds, original continuation, ordered reasons, GP or IRQ context");
++        for (const auto [provided, requested] : {std::pair<uint16_t, uint16_t>{0x0101u, 0x0101u},
++                                                {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++        {
++            DiscHost h; IopEmulator provider(h); const auto fixture = program(requested, provided);
++            iop_vblank_test::start(provider, fixture);
++            require(iop_vblank_test::word(provider, fixture.data()) == 0xABCDEF01u &&
++                        iop_vblank_test::word(provider, fixture.data(0x44u)) == 0x5A3u && h.reads == 0u,
++                    "modeled abort shadowed a compatible supplied export");
++        }
++        DiscHost h; IopEmulator missing(h); const auto badVersion = program(0x0201u, 0x0101u);
++        iop_vblank_test::rejects([&] { iop_vblank_test::start(missing, badVersion); }, "missing import cdvdman:39");
++    }
++
++    void authoredMaskedResetAndStickyCallbackFault()
++    {
++        for (const bool reset : {false, true})
++        {
++            DiscHost host; IopEmulator iop(host); const auto p = program(0x0101u, 0u, true);
++            const std::vector<uint8_t> canary(4096u, 0xCCu);
++            require(iop.writeMemory(0x30000u, canary.data(), canary.size()), "masked MIPS buffer setup failed");
++            iop_vblank_test::start(iop, p); iop_vblank_test::advance(iop, 5000u);
++            require(host.reads == 0u && iop_vblank_test::word(iop, p.data()) == 0u, "masked abort invoked original callbacks");
++            if (reset)
++            {
++                iop.reset(); iop_vblank_test::advance(iop, 10000u);
++                require(host.reads == 0u, "full reset resurrected canceled payload");
++            }
++            else
++            {
++                iop_vblank_test::Program resume(0x20000u); resume.begin();
++                resume.load(8u, 0xBF801074u); resume.emit(0x35080004u); resume.store(8u, 0xBF801074u);
++                resume.constant(4u, 1u); resume.call(resume.stub(0x1100u, 1u)); resume.finish();
++                iop_vblank_test::start(iop, resume); iop_vblank_test::advance(iop, 1000u);
++                require(iop_vblank_test::word(iop, p.data()) == 2u, "real I_MASK/CPU resume lost pending abort completion");
++            }
++        }
++        DiscHost host; IopEmulator iop(host); auto p = program();
++        p.begin(0x800u); p.call(p.stub(0x1400u)); p.finish();
++        const std::vector<uint8_t> canary(4096u, 0xCCu);
++        require(iop.writeMemory(0x30000u, canary.data(), canary.size()), "fault fixture failed");
++        iop_vblank_test::start(iop, p);
++        iop_vblank_test::rejects([&] { iop_vblank_test::advance(iop, 5000u); }, "missing import absent:42");
++        const uint64_t instructions = iop.instructions(); iop.runEeCycles(80000u);
++        iop_vblank_test::rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:42");
++        require(iop.instructions() == instructions && host.reads == 0u && iop_vblank_test::word(iop, p.data()) == 0u,
++                "abort callback failure was swallowed or allowed its user callback to run");
++    }
++}
+diff --git a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+index deeb5cc..6c894e6 100644
+--- a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
++++ b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+@@ -9,6 +9,7 @@
+ #include <functional>
+ #include <limits>
+ #include "iop_cdvd_stream_read_fixtures.h"
++#include "iop_cdvd_break_fixtures.h"
+ 
+ namespace
+ {
+@@ -468,6 +469,19 @@ namespace
+ int main()
+ {
+     const iop_test::Test tests[] = {
++        {"Abort preserves raw IRQ ownership and rejects host-I/O reentry", iop_cdvd_break_test::rawOwnerAndHostReentryStayExplicit},
++        {"Idle abort preserves registration without inventing work", iop_cdvd_break_test::idleAbortDoesNotInventWork},
++        {"Abort cancels deferred payload and retires its buffer lease", iop_cdvd_break_test::abortBeforeDmaDropsTheBufferLease},
++        {"Repeated abort cannot postpone or duplicate completion", iop_cdvd_break_test::repeatedAbortCannotPostponeOrDuplicate},
++        {"Masked abort uses live callbacks and the original stopped mode", iop_cdvd_break_test::maskedAbortAndLiveModeKeepTheirOwnState},
++        {"Abort preserves already-copied bytes without replaying DMA", iop_cdvd_break_test::alreadyCopiedPayloadIsNotRolledBackOrRepeated},
++        {"Reset and new commands do not inherit abort state", iop_cdvd_break_test::resetAndNextCommandDoNotInheritAbortState},
++        {"Successor commands suppress stale early user callbacks", iop_cdvd_break_test::successorReadCannotReceiveAnEarlyUserCallback},
++        {"Failed abort preflight preserves the pending request", iop_cdvd_break_test::invalidAbortPreflightPreservesTheOriginalRequest},
++        {"Timeout abort retires Read2 and new commands clear timeout state", iop_cdvd_break_test::timeoutAbortRetiresRead2AndNewCommandClearsTimeout},
++        {"Authored MIPS abort preserves GP, IRQ ordering and supplied exports", iop_cdvd_break_test::authoredMipsAbortAndProviderPrecedence},
++        {"Authored abort masks, reset and callback faults preserve lifetimes", iop_cdvd_break_test::authoredMaskedResetAndStickyCallbackFault},
++
+         {"Stream reads publish real sectors before ordered IRQ callbacks", iop_stream_read_test::deferredBytesBeforeCallbacks},
+         {"Stream reads retain aliases and overlapping mode arguments", iop_stream_read_test::aliasesAndOverlappingMode},
+         {"Stream read preflight and busy refusal preserve state", iop_stream_read_test::invalidSpansAndCountsAreAtomic},
