@@ -2,11 +2,11 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original frontend graphics on Linux; main menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the original autosave caution screen with its CONTINUE Cross prompt. A longer run passes its automatic dismissal and reaches the original memory-card query, where an unsupported secondary DMA transfer currently stops execution. Source, host and runtime regression tests also pass on ARM64 macOS through patch 0028; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for exact execution evidence and remaining work.
+**Status: original frontend graphics on Linux; main menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the original autosave caution screen. The corrected memory-card transport also reaches the original no-card dialog. The physical controller path now delivers Start and Cross through the original SIO2MAN and PADMAN modules; consuming that input in the complete game is the next integration check. Source, host and runtime regression tests also pass on ARM64 macOS through patch 0031; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for execution evidence and remaining work.
 
 ![Original Mafia autosave caution screen rendered by the translated game on Linux](docs/screenshots/mafia-linux-autosave.png)
 
-Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This 120-second run reached the frontend screen without a strict execution failure. The later memory-card stop occurs before another screen is presented; main-menu entry and controller input remain unverified. The capture path also works without a display server; the earlier Gathering splash is retained in the progress report.
+Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This patch-0028, 120-second run reached the frontend screen without a strict execution failure. It documents the autosave screen; main-menu entry remains unverified. The capture path also works without a display server; the earlier Gathering splash is retained in the progress report.
 
 ## Build from your own disc
 
@@ -22,7 +22,8 @@ sudo apt install build-essential cmake python3 git pkg-config \
 export MAFIA_PS2_ISO="/absolute/path/to/Mafia.iso"
 python3 tools/bootstrap.py --diagnostic
 bash tools/build_linux.sh
-bash tools/run_linux.sh
+bash tools/run_linux.sh --elf .work/extracted/SLUS_206.71 \
+  --data-root .work/extracted --iso "$MAFIA_PS2_ISO" --timeout-ms 0
 ```
 
 On Apple Silicon:
@@ -32,14 +33,15 @@ brew install python cmake pkg-config ffmpeg
 export MAFIA_PS2_ISO="/absolute/path/to/Mafia.iso"
 python3 tools/bootstrap.py --diagnostic
 bash tools/build_macos.sh
-bash tools/run_macos.sh
+bash tools/run_macos.sh --elf .work/extracted/SLUS_206.71 \
+  --data-root .work/extracted --iso "$MAFIA_PS2_ISO" --timeout-ms 0
 ```
 
 Bootstrap reads `SYSTEM.CNF`, verifies the boot ELF, extracts the disc locally, fetches exact dependency commits, applies the reviewed patches, builds the real analyzer/recompiler and generates C++. It does not download games or BIOS files. The generated corpus and extracted files stay in ignored directories. Allow several gigabytes for the disc, extracted data, generated C++, object files and dependencies.
 
 The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA-256 in [the profile](profiles/slus-20671.json). Other builds fail with their observed hash so they can receive separate profiles. A matching filename is insufficient.
 
-`MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and running the original game corpus on Apple Silicon remain separate milestones. F11 toggles fullscreen. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio; no substitute title scene is included.
+`MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and running the original game corpus on Apple Silicon remain separate milestones. A desktop session is required for the window. F11 toggles fullscreen. When no desktop gamepad is available, the keyboard fallback maps Enter to Start, X or Space to Cross, C to Circle, and the arrows or WASD to directions. These samples feed controller port 1 through SIO2, allowing the original PADMAN module to process them. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio.
 
 For a bounded headless Linux run after building (use `run_macos.sh` on macOS):
 
@@ -55,6 +57,8 @@ python3 tools/symbolize_report.py .work/runtime.json \
 ```
 
 Timeouts, unresolved function dispatch and unsupported services return nonzero exit codes. `--validate-only` verifies input identity without claiming execution. `--timeout-ms 0` disables the execution deadline for interactive investigation. Frame capture writes the actual GS presentation surface as lossless PPM; it reports unavailable output explicitly and refuses to overwrite an existing file. A captured black frame alone is not evidence of successful rendering.
+
+Headless runs can supply reproducible button pulses with repeated `--pad-event AT_MS:BUTTON:DURATION_MS` arguments, for example `--pad-event 30000:cross:300`. Times are elapsed **host** milliseconds; software rendering and the guest clock can run more slowly. Pulses release automatically, overlapping buttons combine, and both the timeline and actual SIO2 traffic are recorded separately in the report. The timeline supports all 16 digital buttons and at most 256 pulses per run. It requires headless execution and does not change guest code or write the game's controller buffers. A timed pulse alone does not prove that the original game consumed it.
 
 ## Inspect and test
 

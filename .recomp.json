@@ -23,15 +23,11 @@
     "game_initialization_complete": false,
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
-      "subsystem": "Ordered secondary DMA from original IOP packet RPC",
-      "guest_pc": "0x004057E8",
-      "symbol": "sceSifSetDma",
-      "branch_source_pc": "0x004079E4",
-      "branch_source_symbol": "_sceSifSendCmd",
-      "status": "failed",
-      "error": "Physical IOP packet RPC: callback SIF DMA requires an ordered packet transport",
-      "original_stage": "Caution auto-dismiss completed; original sceMcGetInfo / MCSERV function 1",
-      "elapsed_wall_seconds": 360.825
+      "subsystem": "Full native EE frontend integration after physical controller and scheduler fixes",
+      "status": "validation-in-progress",
+      "original_stage": "The preceding full-game run displayed a controller warning; fresh original SIO2MAN/PADMAN controls now complete negotiation and deliver Start/Cross through original DMA.",
+      "original_iop_driver_transport_verified": true,
+      "native_game_input_consumption_verified": false
     },
     "macos_arm64_synthetic_host_verified": true,
     "first_game_frame_verified": false,
@@ -41,17 +37,24 @@
     "startup_graphics_kind": "Gathering publisher splash",
     "startup_screenshot": "docs/screenshots/mafia-linux-gathering.png",
     "menu_verified": false,
-    "macos_arm64_synthetic_host_verified_patch_set": "0001-0028",
-    "latest_runtime_patch_set": "0001-0029",
+    "macos_arm64_synthetic_host_verified_patch_set": "0001-0031",
+    "latest_runtime_patch_set": "0001-0032",
     "latest_runtime_platform": "linux-x86_64",
-    "latest_runtime_binary_sha256": "4f69a627b2aabbd50439c099d09faa817c18f37b9103dfd4fb9637069f7e23b7",
+    "latest_runtime_binary_sha256": "7b16b5049367570597bd5a86ab42f6f944105782532c68022ef5c713f0db0d15",
     "updated_macos_ci_verified": true,
     "linux_arm64_game_execution_verified": false,
-    "last_verified_ci_patch_set": "0001-0028",
+    "last_verified_ci_patch_set": "0001-0031",
     "original_frontend_screen_verified": true,
     "frontend_screenshot": "docs/screenshots/mafia-linux-autosave.png",
     "controller_input_verified": false,
-    "original_caution_auto_dismiss_verified": true
+    "original_caution_auto_dismiss_verified": true,
+    "latest_reviewed_patch_set": "0001-0033",
+    "original_memory_card_query_completed": true,
+    "original_no_card_dialog_verified": true,
+    "original_iop_controller_input_verified": true,
+    "latest_runtime_evidence_kind": "historical-controller-prototype-before-workspace-recovery",
+    "latest_runtime_patch_set_is_historical": true,
+    "latest_runtime_uses_current_reconstructed_patch_set": false
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,
@@ -72,9 +75,9 @@
     }
   ],
   "retained_local_inputs": {
-    "complete_installation": false,
-    "files": 54,
-    "bytes": 849989225,
-    "complete_iso_retained": false
+    "complete_installation": true,
+    "files": 281,
+    "bytes": 4126918314,
+    "complete_iso_retained": true
   }
 }
