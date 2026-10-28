@@ -1,0 +1,651 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 8b1707b..5e82d57 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,8 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <limits>
++#include <stdexcept>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -34,6 +36,8 @@ namespace ps2x::iop::detail
+         m_nextEventFlagId = 1;
+         m_nextMailboxId = 1;
+         m_nextMailboxWaitOrder = 1u;
++        m_nextReadyOrder = 1u;
++        m_reschedulePending = false;
+         m_currentThread = nullptr;
+     }
+ 
+@@ -105,7 +109,7 @@ namespace ps2x::iop::detail
+             thread.waitResultAddress = 0u;
+             thread.mailboxWaitOrder = 0u;
+             thread.mailboxWaitOwner = 0u;
+-            thread.state = IopThreadState::Ready;
++            makeReady(thread);
+             setV0(0);
+             return true;
+         }
+@@ -150,14 +154,57 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             it->second.priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
++            if (it->second.state == IopThreadState::Ready || it->second.state == IopThreadState::Running)
++            {
++                makeReady(it->second);
++                if (&it->second == m_currentThread)
++                    m_currentThread->cpu.yielded = true;
++            }
+             setV0(0);
+             return true;
+         }
+-        case 16:
+-        case 17:
++        case 16: // RotateThreadReadyQueue
++        case 17: // iRotateThreadReadyQueue
++        {
++            // A direct startup/RPC call has no resumable managed thread CPU.
++            // Keep its requested yield visible to strict completion checks.
++            if (ordinal == 16u && (m_currentThread == nullptr || &cpu != &m_currentThread->cpu))
++            {
++                setV0(0);
++                cpu.yielded = true;
++                return true;
++            }
++            uint32_t priority = cpu.gpr[4];
++            if (priority == 0u)
++            {
++                priority = 127u;
++                for (const auto &[id, thread] : m_threads)
++                {
++                    if (thread.state == IopThreadState::Running)
++                        priority = std::min(priority, thread.priority);
++                    else if (ordinal == 17u && thread.state == IopThreadState::Ready)
++                        priority = std::min(priority, thread.priority);
++                }
++            }
++            IopThread *first = nullptr;
++            for (auto &[id, thread] : m_threads)
++            {
++                if (thread.priority != priority ||
++                    (thread.state != IopThreadState::Ready && thread.state != IopThreadState::Running))
++                    continue;
++                if (first == nullptr || thread.state == IopThreadState::Running ||
++                    (first->state != IopThreadState::Running && thread.readyOrder < first->readyOrder))
++                    first = &thread;
++            }
++            if (first != nullptr)
++            {
++                makeReady(*first);
++                if (first == m_currentThread)
++                    m_currentThread->cpu.yielded = true;
++            }
+             setV0(0);
+-            cpu.yielded = true;
+             return true;
++        }
+         case 18:
+         case 19:
+         {
+@@ -173,6 +220,8 @@ namespace ps2x::iop::detail
+             {
+                 it->second.state = it->second.state == IopThreadState::MailboxSuspended ?
+                     IopThreadState::Suspended : IopThreadState::Ready;
++                if (it->second.state == IopThreadState::Ready)
++                    makeReady(it->second);
+                 it->second.cpu.gpr[2] = static_cast<uint32_t>(-418); // KE_RELEASE_WAIT.
+                 it->second.waitId = 0;
+                 it->second.waitResultAddress = 0u;
+@@ -184,7 +233,7 @@ namespace ps2x::iop::detail
+                 it->second.state == IopThreadState::Semaphore ||
+                 it->second.state == IopThreadState::EventFlag)
+             {
+-                it->second.state = IopThreadState::Ready;
++                makeReady(it->second);
+             }
+             setV0(0);
+             return true;
+@@ -220,7 +269,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             if (it->second.state == IopThreadState::Sleep)
+-                it->second.state = IopThreadState::Ready;
++                makeReady(it->second);
+             else
+                 ++it->second.wakeupCount;
+             setV0(0);
+@@ -270,7 +319,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             if (it->second.state == IopThreadState::Suspended)
+-                it->second.state = IopThreadState::Ready;
++                makeReady(it->second);
+             else if (it->second.state == IopThreadState::MailboxSuspended)
+                 it->second.state = IopThreadState::Mailbox;
+             setV0(0);
+@@ -493,7 +542,7 @@ namespace ps2x::iop::detail
+         if (best != nullptr && semaphore != m_semaphores.end() && semaphore->second.current > 0)
+         {
+             --semaphore->second.current;
+-            best->state = IopThreadState::Ready;
++            makeReady(*best);
+             best->waitId = 0;
+         }
+     }
+@@ -519,7 +568,7 @@ namespace ps2x::iop::detail
+             thread.cpu.gpr[2] = 0u;
+             if ((thread.waitMode & 0x10u) != 0u)
+                 event.bits = 0u;
+-            thread.state = IopThreadState::Ready;
++            makeReady(thread);
+             thread.waitId = 0;
+             thread.waitBits = 0;
+             thread.waitMode = 0;
+@@ -580,7 +629,7 @@ namespace ps2x::iop::detail
+             {
+                 if (thread.state == IopThreadState::EventFlag && thread.waitId == id)
+                 {
+-                    thread.state = IopThreadState::Ready;
++                    makeReady(thread);
+                     thread.waitId = 0;
+                     thread.cpu.gpr[2] = static_cast<uint32_t>(-1);
+                 }
+@@ -696,27 +745,72 @@ namespace ps2x::iop::detail
+         cpu.yielded = true;
+     }
+ 
++    void IopKernel::makeReady(IopThread &thread)
++    {
++        if (m_nextReadyOrder == std::numeric_limits<uint64_t>::max())
++            throw std::runtime_error("IOP thread ready ordering exhausted");
++        thread.readyOrder = m_nextReadyOrder++;
++        thread.state = IopThreadState::Ready;
++        m_reschedulePending = true;
++    }
++
++    bool IopKernel::shouldReschedule(const IopCpuState &cpu)
++    {
++        // Direct module calls and interrupt callbacks have separate CPUs. A
++        // wakeup inside one is acted on only after the interrupted CPU resumes.
++        if (m_currentThread == nullptr || &cpu != &m_currentThread->cpu)
++            return false;
++        if (m_currentThread->state != IopThreadState::Running)
++            return true;
++        if (!m_reschedulePending || m_memory.interruptControl() == 0u)
++            return false;
++        m_reschedulePending = false;
++        for (const auto &[id, thread] : m_threads)
++            if (thread.state == IopThreadState::Ready && thread.priority < m_currentThread->priority)
++                return true;
++        return false;
++    }
++
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+         for (auto &[id, thread] : m_threads)
+         {
+             if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+-                thread.state = IopThreadState::Ready;
++                makeReady(thread);
+         }
+ 
++        IopThread *running = nullptr;
+         IopThread *next = nullptr;
+         for (auto &[id, thread] : m_threads)
+         {
++            if (thread.state == IopThreadState::Running)
++                running = &thread;
+             if (thread.state != IopThreadState::Ready)
+                 continue;
+             if (next == nullptr || thread.priority < next->priority ||
+-                (thread.priority == next->priority && thread.id < next->id))
++                (thread.priority == next->priority && thread.readyOrder < next->readyOrder))
+                 next = &thread;
+         }
++        // A host cycle budget is not a guest yield. The kernel keeps the
++        // running thread ahead of equal-priority peers; only a higher-priority
++        // ready thread can preempt it. A guest interrupt-disabled critical
++        // section also survives a host budget boundary.
++        // PS2SDK iop/system/threadman/src/thcommon.c: schedule_next/thread_start.
++        const bool readyPreemptsRunning = running != nullptr && next != nullptr &&
++            next->priority < running->priority;
++        if (running != nullptr)
++        {
++            if (m_memory.interruptControl() == 0u || next == nullptr || next->priority >= running->priority)
++                next = running;
++            else
++                // Retain its FIFO position at the front of its priority queue.
++                running->state = IopThreadState::Ready;
++        }
+         if (next == nullptr)
+             return nullptr;
+ 
+         m_currentThread = next;
++        m_reschedulePending = next == running && readyPreemptsRunning;
+         next->state = IopThreadState::Running;
+         next->cpu.stopped = false;
+         next->cpu.yielded = false;
+@@ -736,10 +830,13 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
+     {
+-        if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
++        if (thread.state != IopThreadState::Dead &&
++            (thread.cpu.pc == returnSentinel || thread.cpu.stopped))
+             thread.state = IopThreadState::Dormant;
+-        else if (thread.state == IopThreadState::Running)
+-            thread.state = IopThreadState::Ready;
++        else if (thread.state == IopThreadState::Running && thread.cpu.yielded)
++            makeReady(thread);
++        // A runnable continuation remains logically Running between host
++        // calls. m_currentThread denotes only the CPU currently executing.
+         m_currentThread = nullptr;
+         cleanupDeadThreads();
+     }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index d09bb3c..23ddc88 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -36,6 +36,7 @@ namespace ps2x::iop::detail
+         uint32_t stackSize = 0;
+         uint32_t priority = 0x40;
+         uint32_t initialPriority = 0x40;
++        uint64_t readyOrder = 0u;
+         uint32_t option = 0;
+         uint32_t attr = 0;
+         uint64_t wakeCycle = 0;
+@@ -67,6 +68,7 @@ namespace ps2x::iop::detail
+         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+ 
+         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
++        [[nodiscard]] bool shouldReschedule(const IopCpuState &cpu);
+         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
+         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
+         void cleanupDeadThreads();
+@@ -105,6 +107,7 @@ namespace ps2x::iop::detail
+             std::vector<MailboxMessage> messages;
+         };
+ 
++        void makeReady(IopThread &thread);
+         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
+         void wakeOneSemaphore(int id);
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+@@ -120,6 +123,8 @@ namespace ps2x::iop::detail
+         uint32_t m_nextEventFlagId = 1;
+         uint32_t m_nextMailboxId = 1;
+         uint64_t m_nextMailboxWaitOrder = 1u;
++        uint64_t m_nextReadyOrder = 1u;
++        bool m_reschedulePending = false;
+         IopThread *m_currentThread = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_mailbox.cpp b/ps2xIOP/src/emulator/core/iop_mailbox.cpp
+index 281f295..4a3c1ff 100644
+--- a/ps2xIOP/src/emulator/core/iop_mailbox.cpp
++++ b/ps2xIOP/src/emulator/core/iop_mailbox.cpp
+@@ -130,7 +130,11 @@ namespace ps2x::iop::detail
+             // Deletion never dereferences or frees the caller's messages.
+             for (auto &[threadId, thread] : m_threads)
+                 if (waiting(thread, id))
++                {
+                     release(thread, -425); // KE_WAIT_DELETE.
++                    if (thread.state == IopThreadState::Ready)
++                        makeReady(thread);
++                }
+             m_mailboxes.erase(found);
+             result(0);
+             return true;
+@@ -164,6 +168,8 @@ namespace ps2x::iop::detail
+                               selected->mailboxWaitOwner, "waiting result");
+                 m_memory.write32(selected->waitResultAddress, address);
+                 release(*selected, 0);
++                if (selected->state == IopThreadState::Ready)
++                    makeReady(*selected);
+                 // Direct delivery does not write the caller's message header.
+                 result(0);
+                 return true;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e84fc11..154a637 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -873,6 +873,8 @@ namespace ps2x::iop::detail
+                         servicePendingDmaInterrupts();
+                     if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                         servicePendingGuestCallbacks();
++                    if (kernel.shouldReschedule(cpu))
++                        break;
+                 }
+             }
+             catch (const std::exception &error)
+@@ -1057,6 +1059,10 @@ namespace ps2x::iop::detail
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this, intrman);
++                    // Guest interrupt/callback instructions count toward this
++                    // budget and may already have consumed its final cycles.
++                    if (totalCycles >= target)
++                        break;
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+diff --git a/ps2xIOP/tests/iop_scheduler_fixtures.h b/ps2xIOP/tests/iop_scheduler_fixtures.h
+new file mode 100644
+index 0000000..58b6200
+--- /dev/null
++++ b/ps2xIOP/tests/iop_scheduler_fixtures.h
+@@ -0,0 +1,286 @@
++#pragma once
++
++#include "iop_compat_test_support.h"
++#include "iop_vblank_fixtures.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++
++namespace iop_scheduler_test
++{
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++    using iop_vblank_test::Program;
++
++    // Entirely authored kernel and MIPS programs. No original driver bytes.
++    struct Fixture
++    {
++        IopMemory memory;
++        IopKernel kernel{memory};
++        static constexpr uint32_t sentinel = 0xFFFF0000u;
++
++        int call(uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u, IopCpuState *active = nullptr)
++        {
++            IopCpuState local{};
++            IopCpuState &cpu = active == nullptr ? local : *active;
++            cpu.gpr[4] = a0;
++            cpu.gpr[5] = a1;
++            require(kernel.dispatchThreadImport(ordinal, cpu, 0u), "authored thread import absent");
++            return static_cast<int>(cpu.gpr[2]);
++        }
++        int create(uint32_t priority = 40u)
++        {
++            memory.write32(0x10000u, 0u);
++            memory.write32(0x10004u, 0u);
++            memory.write32(0x10008u, 0x10400u);
++            memory.write32(0x1000Cu, 0x1000u);
++            memory.write32(0x10010u, priority);
++            const int id = call(4u, 0x10000u);
++            require(id > 0, "authored thread allocation failed");
++            return id;
++        }
++        int start(uint32_t priority = 40u)
++        {
++            const int id = create(priority);
++            require(call(6u, id) == 0, "authored thread start failed");
++            return id;
++        }
++        IopThread &next(int id)
++        {
++            IopThread *thread = kernel.beginNextReady(0u);
++            require(thread != nullptr && thread->id == id, "wrong guest scheduling order");
++            return *thread;
++        }
++        void end(IopThread &thread) { kernel.endTimeslice(thread, sentinel); }
++        void sleep(IopThread &thread)
++        {
++            require(call(24u, 0u, 0u, &thread.cpu) == 0, "authored SleepThread failed");
++            end(thread);
++        }
++        void finish(IopThread &thread)
++        {
++            thread.cpu.pc = sentinel;
++            end(thread);
++        }
++    };
++
++    inline void equalPriorityContinuation()
++    {
++        Fixture f;
++        const int older = f.start(), newer = f.start();
++        f.sleep(f.next(older));
++        IopThread &running = f.next(newer);
++        require(f.call(25u, older) == 0, "could not wake the equal-priority peer");
++        f.end(running); // The host budget expires; the guest has not yielded.
++        f.next(newer);
++        f.finish(running);
++        f.next(older);
++    }
++
++    inline void fifoReadinessAndPreemptedFront()
++    {
++        Fixture f;
++        const int a = f.create(), b = f.create(), c = f.create();
++        require(f.call(6u, c) == 0 && f.call(6u, a) == 0 && f.call(6u, b) == 0, "FIFO starts failed");
++        f.finish(f.next(c));
++        f.finish(f.next(a));
++        f.finish(f.next(b));
++
++        const int older = f.start(), runningId = f.start();
++        f.sleep(f.next(older));
++        IopThread &running = f.next(runningId);
++        require(f.call(25u, older) == 0, "peer wake failed");
++        const int high = f.start(10u);
++        f.end(running);
++        f.sleep(f.next(high));
++        // A higher-priority preemption does not move its victim behind peers.
++        f.finish(f.next(runningId));
++        f.next(older);
++    }
++
++    inline void criticalSectionAcrossBudgets()
++    {
++        Fixture f;
++        const int low = f.start(60u);
++        IopThread &running = f.next(low);
++        f.memory.setInterruptControl(0u);
++        const int high = f.start(10u);
++        f.end(running);
++        f.next(low);
++        f.memory.setInterruptControl(1u);
++        f.end(running);
++        f.next(high);
++    }
++
++    inline void explicitRotationAndPriority()
++    {
++        Fixture f;
++        const int a = f.start(), b = f.start(), c = f.start();
++        IopThread &first = f.next(a);
++        require(f.call(16u, 0u, 0u, &first.cpu) == 0, "explicit rotation failed");
++        f.end(first);
++        IopThread &second = f.next(b);
++        require(f.call(14u, 0u, 60u, &second.cpu) == 0, "current priority change failed");
++        f.end(second);
++        f.finish(f.next(c));
++        f.finish(f.next(a));
++        f.finish(f.next(b));
++
++        const int active = f.start(10u), q1 = f.start(50u), q2 = f.start(50u);
++        IopThread &high = f.next(active);
++        require(f.call(16u, 50u, 0u, &high.cpu) == 0 && !high.cpu.yielded,
++                "rotating another priority spuriously yielded the current thread");
++        f.end(high);
++        f.finish(f.next(active));
++        f.finish(f.next(q2));
++        f.next(q1);
++    }
++
++    inline void continuationLifetime()
++    {
++        Fixture f;
++        int id = f.start();
++        IopThread &running = f.next(id);
++        f.end(running);
++        require(f.call(29u, id) == 0 && f.kernel.beginNextReady(0u) == nullptr,
++                "suspended continuation remained runnable");
++        require(f.call(31u, id) == 0, "resume failed");
++        f.next(id);
++        require(f.call(9u, 0u, 0u, &running.cpu) == 0, "ExitDeleteThread failed");
++        f.end(running); // Do not use the deleted reference again.
++        require(f.kernel.threadCount() == 0u && f.kernel.beginNextReady(0u) == nullptr,
++                "ExitDeleteThread left a dead continuation or stack owner");
++        id = f.start();
++        f.end(f.next(id));
++        require(f.call(10u, id) == 0 && f.call(5u, id) == 0 && f.kernel.beginNextReady(0u) == nullptr,
++                "terminated/deleted continuation was reused");
++        id = f.start();
++        f.end(f.next(id));
++        f.kernel.reset();
++        f.memory.reset();
++        require(f.kernel.beginNextReady(0u) == nullptr && f.kernel.threadCount() == 0u,
++                "reset retained a running or ready thread");
++        require(f.start() == 1, "reset did not restore thread identity state");
++        f.next(1);
++    }
++
++    inline void createThread(Program &p, uint32_t descriptor, uint32_t offset, uint32_t priority)
++    {
++        p.image.words(descriptor - p.base, {0u, 0u, p.base + offset, 0x1000u, priority});
++        p.constant(4u, descriptor);
++        p.call(p.stub(0x1200u));
++        p.move(4u, 2u);
++        p.constant(5u, 0u);
++        p.call(p.stub(0x1200u, 1u));
++    }
++
++    inline Program handshake(uint32_t waiterPriority)
++    {
++        Program p;
++        p.imports(0x1300u, "thevent", {4u, 6u, 10u});
++        p.image.words(0x2000u, {2u, 0u, 0u});
++        p.begin();
++        p.constant(4u, p.data());
++        p.call(p.stub(0x1300u));
++        p.store(2u, p.data(0x40u));
++        createThread(p, p.data(0x100u), 0x400u, waiterPriority);
++        createThread(p, p.data(0x120u), 0x600u, 40u);
++        p.finish();
++
++        // The older peer waits, then observes the publishing thread's marker.
++        p.begin(0x400u);
++        p.load(4u, p.data(0x40u));
++        p.constant(5u, 1u); p.constant(6u, 0x10u); p.constant(7u, 0u);
++        p.call(p.stub(0x1300u, 2u));
++        p.load(8u, p.data(0x50u));
++        p.store(8u, p.data(0x54u));
++        p.constant(8u, 1u); p.store(8u, p.data(0x58u));
++        p.finish();
++
++        p.begin(0x600u);
++        p.load(4u, p.data(0x40u)); p.constant(5u, 1u);
++        p.call(p.stub(0x1300u, 1u));
++        for (size_t i = 0u; i < 32u; ++i) p.emit(0u);
++        p.constant(8u, 0xC0DEC0DEu); p.store(8u, p.data(0x50u));
++        p.finish();
++        return p;
++    }
++
++    inline void runHandshake(uint32_t waiterPriority, uint32_t quantum, uint32_t expected)
++    {
++        iop_test::Host host;
++        IopEmulator iop(host);
++        const Program p = handshake(waiterPriority);
++        iop_vblank_test::start(iop, p);
++        for (uint32_t left = 8000u; left != 0u;)
++        {
++            const uint32_t step = std::min(left, quantum);
++            iop.runEeCycles(step);
++            left -= step;
++        }
++        iop.checkExecutionFailure();
++        require(iop_vblank_test::word(iop, p.data(0x50u)) == 0xC0DEC0DEu &&
++                iop_vblank_test::word(iop, p.data(0x58u)) == 1u,
++                "authored handshake did not finish within its cycle bound");
++        require(iop_vblank_test::word(iop, p.data(0x54u)) == expected,
++                "host chunk size changed the guest event handshake order");
++    }
++
++    inline void authoredEqualPriorityHandshake()
++    {
++        for (const uint32_t quantum : {8000u, 32u, 8u})
++            runHandshake(40u, quantum, 0xC0DEC0DEu);
++    }
++
++    inline void authoredHigherPriorityPreemption()
++    {
++        for (const uint32_t quantum : {8000u, 32u, 8u})
++            runHandshake(20u, quantum, 0u);
++    }
++
++    inline void callbacksConsumeTheirCycleBudget()
++    {
++        Program p;
++        p.imports(0x1600u, "timrman", {4u, 20u, 22u, 23u});
++        p.begin();
++        createThread(p, p.data(0x100u), 0x400u, 40u);
++        p.constant(4u, 1u); p.constant(5u, 32u); p.constant(6u, 1u);
++        p.call(p.stub(0x1600u));
++        p.store(2u, p.data(0x60u));
++        p.move(4u, 2u); p.constant(5u, 1000u); p.constant(6u, p.base + 0x800u); p.constant(7u, 0u);
++        p.call(p.stub(0x1600u, 1u));
++        p.load(4u, p.data(0x60u)); p.constant(5u, 1u); p.constant(6u, 0u); p.constant(7u, 1u);
++        p.call(p.stub(0x1600u, 2u));
++        p.load(4u, p.data(0x60u)); p.call(p.stub(0x1600u, 3u));
++        p.finish();
++
++        p.cursor = 0x400u;
++        p.constant(8u, 0u); p.constant(9u, p.data(0x84u));
++        const uint32_t loop = p.base + p.cursor;
++        p.emit(0x25080001u); p.emit(0xAD280000u);
++        p.emit(0x08000000u | (loop >> 2u)); p.emit(0u);
++        p.begin(0x800u);
++        for (size_t i = 0u; i < 128u; ++i) p.emit(0u);
++        p.constant(8u, 1u); p.store(8u, p.data(0x80u));
++        p.finish(0u); // One-shot timer.
++
++        iop_test::Host host;
++        IopEmulator iop(host);
++        iop_vblank_test::start(iop, p);
++        bool observed = false;
++        for (size_t attempt = 0u; attempt < 3000u; ++attempt)
++        {
++            const uint32_t before = iop_vblank_test::word(iop, p.data(0x84u));
++            iop.runEeCycles(8u); // One IOP cycle, much shorter than the callback.
++            iop.checkExecutionFailure();
++            if (iop_vblank_test::word(iop, p.data(0x80u)) != 0u)
++            {
++                const uint32_t after = iop_vblank_test::word(iop, p.data(0x84u));
++                require(after - before <= 1u,
++                        "callback overrun underflowed the remaining budget and ran an extra thread slice");
++                observed = true;
++                break;
++            }
++        }
++        require(observed, "authored timer callback did not run within its cycle bound");
++    }
++}
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index d3eae31..0a428c6 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -1,5 +1,6 @@
+ #include "iop_strict_fixtures.h"
+ #include "iop_vblank_fixtures.h"
++#include "iop_scheduler_fixtures.h"
+ #include "emulator/iop_emulator.h"
+ 
+ #include <functional>
+@@ -1395,6 +1396,14 @@ namespace
+ int main()
+ {
+     const Test tests[] = {
++        {"Host budgets preserve equal-priority IOP continuation", iop_scheduler_test::equalPriorityContinuation},
++        {"IOP readiness is FIFO and preemption preserves the interrupted queue head", iop_scheduler_test::fifoReadinessAndPreemptedFront},
++        {"IOP interrupt-disabled critical sections survive host budget boundaries", iop_scheduler_test::criticalSectionAcrossBudgets},
++        {"Explicit IOP rotation and priority changes requeue only their target", iop_scheduler_test::explicitRotationAndPriority},
++        {"IOP continuation lifetime follows block, exit, deletion and reset", iop_scheduler_test::continuationLifetime},
++        {"Authored equal-priority event handshake is independent of host chunk size", iop_scheduler_test::authoredEqualPriorityHandshake},
++        {"Authored higher-priority wakeup preempts at the guest import boundary", iop_scheduler_test::authoredHigherPriorityPreemption},
++        {"IOP callback instructions consume the short caller cycle budget", iop_scheduler_test::callbacksConsumeTheirCycleBudget},
+         {"VBlank phases preserve priority, arguments, GP and interrupt context", iop_vblank_test::phasePriorityArgumentsAndContext},
+         {"VBlank registration, release and bounded capacity follow the kernel ABI", iop_vblank_test::registrationReleaseAndCapacity},
+         {"VBlank return-zero removal forbids mutation from interrupt context", iop_vblank_test::returnZeroAndIllegalCallbackMutation},

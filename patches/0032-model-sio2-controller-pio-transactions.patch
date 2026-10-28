@@ -1,0 +1,1412 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -16,6 +16,7 @@
+     src/emulator/core/iop_kernel.cpp
+     src/emulator/core/iop_mailbox.cpp
+     src/emulator/core/iop_memory.cpp
++    src/emulator/core/iop_sio2.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+     src/emulator/imports/iop_cdvd.cpp
+@@ -35,6 +36,9 @@
+     src/modules/mcserv.cpp
+ )
+ 
++find_package(Threads REQUIRED)
++target_link_libraries(ps2_iop PUBLIC Threads::Threads)
++
+ target_compile_features(ps2_iop PUBLIC cxx_std_20)
+ 
+ target_include_directories(ps2_iop
+@@ -49,6 +53,11 @@
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_sio2_tests tests/iop_sio2_tests.cpp)
++    target_link_libraries(ps2_iop_sio2_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_sio2_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_sio2_tests COMMAND ps2_iop_sio2_tests)
++
+     add_executable(ps2_iop_cdvd_tray_tests tests/iop_cdvd_tray_tests.cpp)
+     target_link_libraries(ps2_iop_cdvd_tray_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_cdvd_tray_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/include/ps2x/iop/iop_controller.h b/ps2xIOP/include/ps2x/iop/iop_controller.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_controller.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace ps2x::iop
++{
++    // One host sample, consumed by the physical SIO2 controller endpoint.
++    // Buttons use the PS2 active-low mask: Start=0x0008, Cross=0x4000.
++    // Pressure order: Right, Left, Up, Down, Triangle, Circle, Cross, Square,
++    // L1, R1, L2, R2. An absent host does not attach an imaginary controller.
++    struct ControllerState
++    {
++        bool connected = false;
++        uint16_t buttons = 0xFFFFu;
++        uint8_t rightX = 0x80u;
++        uint8_t rightY = 0x80u;
++        uint8_t leftX = 0x80u;
++        uint8_t leftY = 0x80u;
++        std::array<uint8_t, 12u> pressures{};
++    };
++}
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -12,6 +12,8 @@
+ 
+ namespace ps2x::iop
+ {
++    struct ControllerState;
++
+     // One ordered IOP -> EE reply: callback DMA snapshots precede result bytes
+     // and either a command packet or direct RPC completion.
+     struct SifEeReply
+@@ -47,6 +49,8 @@
+         IopSubsystem &operator=(IopSubsystem &&) noexcept;
+ 
+         void reset();
++        // Host sample updates may run concurrently with IOP execution/reset.
++        void setControllerState(uint32_t port, const ControllerState &state);
+         [[nodiscard]] std::vector<uint8_t> readRebootImage(std::string_view path) const;
+         void rebootFromImage(std::string path, std::vector<uint8_t> image);
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -61,6 +61,27 @@
+         m_cdvdRegisters = registers;
+     }
+ 
++    void IopMemory::bindSio2Registers(const std::shared_ptr<IopSio2Registers> &registers) noexcept
++    {
++        m_sio2Registers = registers;
++    }
++
++    uint32_t IopMemory::readSio2(uint32_t physical, uint32_t width) const
++    {
++        const auto registers = m_sio2Registers.lock();
++        if (!registers)
++            throw std::runtime_error("SIO2 register read without a live device");
++        return registers->readSio2Register(physical, width);
++    }
++
++    void IopMemory::writeSio2(uint32_t physical, uint32_t width, uint32_t value)
++    {
++        const auto registers = m_sio2Registers.lock();
++        if (!registers)
++            throw std::runtime_error("SIO2 register write without a live device");
++        registers->writeSio2Register(physical, width, value);
++    }
++
+     uint8_t IopMemory::readCdvdByte(uint32_t physical) const
+     {
+         const auto registers = m_cdvdRegisters.lock();
+@@ -80,6 +101,8 @@
+     uint8_t IopMemory::read8(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Sio2Base && phys < Sio2End)
++            return static_cast<uint8_t>(readSio2(phys, 1u));
+         if (phys < RamSize)
+             return m_ram[phys];
+         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
+@@ -93,6 +116,8 @@
+     uint16_t IopMemory::read16(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (uint64_t(phys) < Sio2End && uint64_t(phys) + 2u > Sio2Base)
++            return static_cast<uint16_t>(readSio2(phys, 2u));
+         if (phys + 1u < RamSize)
+         {
+             uint16_t value;
+@@ -107,6 +132,8 @@
+     uint32_t IopMemory::read32(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (uint64_t(phys) < Sio2End && uint64_t(phys) + 4u > Sio2Base)
++            return readSio2(phys, 4u);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+         {
+             uint32_t value;
+@@ -131,6 +158,11 @@
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= Sio2Base && phys < Sio2End)
++        {
++            writeSio2(phys, 1u, value);
++            return;
++        }
+         if (overlapsCdvd(phys, 1u))
+             unsupportedCdvd("write", phys, 1u);
+         if (phys < RamSize)
+@@ -154,6 +186,11 @@
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (uint64_t(phys) < Sio2End && uint64_t(phys) + 2u > Sio2Base)
++        {
++            writeSio2(phys, 2u, value);
++            return;
++        }
+         if (overlapsCdvd(phys, 2u))
+             unsupportedCdvd("write", phys, 2u);
+         if (phys + 1u < RamSize)
+@@ -169,6 +206,11 @@
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (uint64_t(phys) < Sio2End && uint64_t(phys) + 4u > Sio2Base)
++        {
++            writeSio2(phys, 4u, value);
++            return;
++        }
+         if (overlapsCdvd(phys, 4u))
+             unsupportedCdvd("write", phys, 4u);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -21,6 +21,14 @@
+         [[nodiscard]] virtual bool readCdvdRegister(uint32_t physical, uint8_t &value) = 0;
+     };
+ 
++    class IopSio2Registers
++    {
++    public:
++        virtual ~IopSio2Registers() = default;
++        [[nodiscard]] virtual uint32_t readSio2Register(uint32_t physical, uint32_t width) = 0;
++        virtual void writeSio2Register(uint32_t physical, uint32_t width, uint32_t value) = 0;
++    };
++
+     class IopMemory
+     {
+     public:
+@@ -29,6 +37,8 @@
+         static constexpr uint32_t ScratchSize = 0x400u;
+         static constexpr uint32_t CdvdBase = 0x1F402000u;
+         static constexpr uint32_t CdvdEnd = 0x1F402040u;
++        static constexpr uint32_t Sio2Base = 0x1F808200u;
++        static constexpr uint32_t Sio2End = 0x1F808284u;
+         static constexpr uint32_t HardwareBase = 0x1F801000u;
+         static constexpr uint32_t HardwareEnd = 0x1F900000u;
+         static constexpr uint32_t Spu2Base = 0x1F900000u;
+@@ -55,6 +65,7 @@
+ 
+         void reset();
+         void bindCdvdRegisters(const std::shared_ptr<IopCdvdRegisters> &registers) noexcept;
++        void bindSio2Registers(const std::shared_ptr<IopSio2Registers> &registers) noexcept;
+ 
+         [[nodiscard]] uint8_t read8(uint32_t address) const;
+         [[nodiscard]] uint16_t read16(uint32_t address) const;
+@@ -93,6 +104,8 @@
+ 
+     private:
+         [[nodiscard]] uint8_t readCdvdByte(uint32_t physical) const;
++        [[nodiscard]] uint32_t readSio2(uint32_t physical, uint32_t width) const;
++        void writeSio2(uint32_t physical, uint32_t width, uint32_t value);
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
+@@ -102,6 +115,7 @@
+         std::vector<uint8_t> m_scratch;
+         std::unordered_map<uint32_t, uint32_t> m_hardware;
+         std::weak_ptr<IopCdvdRegisters> m_cdvdRegisters;
++        std::weak_ptr<IopSio2Registers> m_sio2Registers;
+         std::vector<Allocation> m_allocations;
+         uint64_t m_nextAllocationIdentity = 1u; // survives RAM reset and ordinary staged copies
+         uint32_t m_interruptStatus = 0;
+diff --git a/ps2xIOP/src/emulator/core/iop_sio2.cpp b/ps2xIOP/src/emulator/core/iop_sio2.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_sio2.cpp
+@@ -0,0 +1,432 @@
++#include "iop_sio2.h"
++#include "iop_memory.h"
++#include "../imports/iop_intrman.h"
++
++#include <algorithm>
++#include <array>
++#include <mutex>
++#include <span>
++#include <sstream>
++#include <stdexcept>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint32_t kQueue = 0x1F808200u;
++        constexpr uint32_t kPortControl = 0x1F808240u;
++        constexpr uint32_t kTx = 0x1F808260u;
++        constexpr uint32_t kRx = 0x1F808264u;
++        constexpr uint32_t kControl = 0x1F808268u;
++        constexpr uint32_t kStatus = 0x1F80826Cu;
++        constexpr uint32_t kConnections = 0x1F808270u;
++        constexpr uint32_t kFifoStatus = 0x1F808274u;
++        constexpr uint32_t kTxPointer = 0x1F808278u;
++        constexpr uint32_t kRxPointer = 0x1F80827Cu;
++        constexpr uint32_t kIrqStatus = 0x1F808280u;
++        constexpr size_t kFifoCapacity = 256u;
++        constexpr uint32_t kIrq = 17u;
++
++        [[noreturn]] void unsupported(const char *operation, uint32_t value)
++        {
++            std::ostringstream message;
++            message << "Unsupported IOP SIO2 " << operation << " 0x" << std::hex << value;
++            throw std::runtime_error(message.str());
++        }
++
++        struct InputSample
++        {
++            ControllerState state;
++            uint64_t connectionSerial = 1u;
++        };
++
++        struct PadProtocol
++        {
++            uint64_t connectionSerial = 0u;
++            uint8_t mode = 0x41u;
++            bool configuration = false;
++            bool analogLocked = false;
++            std::array<uint8_t, 6u> actuatorMap{0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu};
++            std::array<uint8_t, 6u> vref{};
++        };
++
++        // These bytes describe the DS2 serial protocol, independently of guest
++        // module names, RPC functions, or EE pad buffers.
++        std::vector<uint8_t> controllerReply(PadProtocol &pad, const InputSample &input,
++                                              std::span<const uint8_t> tx, size_t receiveSize)
++        {
++            if (pad.connectionSerial != input.connectionSerial)
++            {
++                pad = {};
++                pad.connectionSerial = input.connectionSerial;
++            }
++            if (tx.size() < 3u)
++                unsupported("short controller packet", static_cast<uint32_t>(tx.size()));
++            const uint8_t command = tx[1];
++            const bool configurationAtStart = pad.configuration;
++            if (command != 0x42u && command != 0x43u && !configurationAtStart)
++                unsupported("controller configuration command outside configuration mode", command);
++            std::array<uint8_t, 21u> response{};
++            response[0] = 0xFFu;
++            response[1] = configurationAtStart ? 0xF3u : pad.mode;
++            response[2] = 0x5Au;
++            const size_t responseSize = configurationAtStart ? 9u :
++                (pad.mode == 0x79u ? 21u : pad.mode == 0x73u ? 9u : 5u);
++            const auto requireSize = [&](size_t size)
++            {
++                if (tx.size() < size)
++                    unsupported("truncated controller command", command);
++            };
++            switch (command)
++            {
++            case 0x42u:
++                response[3] = static_cast<uint8_t>(input.state.buttons);
++                response[4] = static_cast<uint8_t>(input.state.buttons >> 8u);
++                response[5] = input.state.rightX;
++                response[6] = input.state.rightY;
++                response[7] = input.state.leftX;
++                response[8] = input.state.leftY;
++                std::copy(input.state.pressures.begin(), input.state.pressures.end(), response.begin() + 9u);
++                break;
++            case 0x43u:
++                requireSize(4u);
++                pad.configuration = tx[3] != 0u;
++                break;
++            case 0x40u:
++                requireSize(9u);
++                std::copy_n(tx.begin() + 3u, pad.vref.size(), pad.vref.begin());
++                response[5] = 2u;
++                response[8] = 0x5Au;
++                break;
++            case 0x41u:
++                requireSize(9u);
++                if (pad.mode != 0x41u)
++                {
++                    response[3] = response[4] = 0xFFu;
++                    response[5] = 3u;
++                    response[8] = 0x5Au;
++                }
++                break;
++            case 0x44u:
++                requireSize(9u);
++                pad.mode = tx[3] != 0u ? 0x73u : 0x41u;
++                pad.analogLocked = tx[4] == 3u;
++                break;
++            case 0x45u:
++                requireSize(9u);
++                response[3] = 3u;
++                response[4] = 2u;
++                response[5] = pad.mode == 0x41u ? 0u : 1u;
++                response[6] = 2u;
++                response[7] = 1u;
++                break;
++            case 0x46u:
++                requireSize(9u);
++                if (tx[3] > 1u)
++                    unsupported("actuator query selector", tx[3]);
++                response[5] = 1u;
++                response[6] = tx[3] == 0u ? 2u : 1u;
++                response[7] = tx[3] == 0u ? 0u : 1u;
++                response[8] = tx[3] == 0u ? 0x0Au : 0x14u;
++                break;
++            case 0x47u:
++                requireSize(9u);
++                response[5] = 2u;
++                response[7] = 1u;
++                break;
++            case 0x4Cu:
++                requireSize(9u);
++                if (tx[3] > 1u)
++                    unsupported("mode query selector", tx[3]);
++                response[6] = tx[3] == 0u ? 4u : 7u;
++                break;
++            case 0x4Du:
++                requireSize(9u);
++                std::copy(pad.actuatorMap.begin(), pad.actuatorMap.end(), response.begin() + 3u);
++                std::copy_n(tx.begin() + 3u, pad.actuatorMap.size(), pad.actuatorMap.begin());
++                break;
++            case 0x4Fu:
++            {
++                requireSize(9u);
++                const uint32_t mask = uint32_t(tx[3]) | (uint32_t(tx[4]) << 8u) | (uint32_t(tx[5]) << 16u);
++                if (mask == 0u)
++                    pad.mode = 0x41u;
++                else if (mask == 0x3Fu)
++                    pad.mode = 0x73u;
++                else if (mask == 0x3FFFFu)
++                    pad.mode = 0x79u;
++                else
++                    unsupported("controller response mask", mask);
++                response[8] = 0x5Au;
++                break;
++            }
++            default:
++                unsupported("controller command", command);
++            }
++            std::vector<uint8_t> result(receiveSize, 0xFFu);
++            std::copy_n(response.begin(), std::min(responseSize, receiveSize), result.begin());
++            return result;
++        }
++    }
++
++    class IopSio2::Impl final : public IopSio2Registers
++    {
++    public:
++        explicit Impl(IopMemory &owner) : memory(owner) {}
++
++        void clearTransfer()
++        {
++            tx.clear();
++            rx.clear();
++            rxPosition = 0u;
++            status = 0x1000u;
++            irqStatus = 0u;
++            irqDelivered = false;
++        }
++
++        void reset()
++        {
++            // Host setters only access inputs under inputMutex. Neither the
++            // mutex, the samples, nor their connection lifetimes are replaced.
++            descriptors = {};
++            portControls = {};
++            protocols = {};
++            control = 0u;
++            servicing = false;
++            clearTransfer();
++            transfers = irqCallbacks = controllerPackets = memoryCardPackets = missingDevices = 0u;
++            lastPort = lastCommand = 0u;
++            lastButtons = 0xFFFFu;
++        }
++
++        void setControllerState(uint32_t port, const ControllerState &state)
++        {
++            if (port >= inputs.size())
++                throw std::out_of_range("SIO2 controller port must be 0 or 1");
++            const std::lock_guard lock(inputMutex);
++            auto &input = inputs[port];
++            if (input.state.connected != state.connected && ++input.connectionSerial == 0u)
++                input.connectionSerial = 1u;
++            input.state = state;
++        }
++
++        uint32_t readSio2Register(uint32_t physical, uint32_t width) override
++        {
++            if (physical == kRx && (width == 1u || width == 2u || width == 4u))
++            {
++                if (width > rx.size() - rxPosition)
++                    unsupported("RX FIFO underflow", width);
++                uint32_t value = 0u;
++                for (uint32_t i = 0u; i < width; ++i)
++                    value |= uint32_t(rx[rxPosition++]) << (i * 8u);
++                return value;
++            }
++            if (width != 4u || (physical & 3u) != 0u)
++                unsupported("register read width/alignment", physical);
++            if (physical >= kQueue && physical < kPortControl)
++                return descriptors[(physical - kQueue) / 4u];
++            if (physical >= kPortControl && physical < kTx)
++                return portControls[(physical - kPortControl) / 4u];
++            switch (physical)
++            {
++            case kControl: return control;
++            case kStatus: return status;
++            case kConnections: return 0xFu; // The fixed, ordinary two-port/no-multitap profile.
++            case kFifoStatus: return static_cast<uint32_t>(tx.size()) |
++                (static_cast<uint32_t>(rx.size() - rxPosition) << 16u);
++            case kTxPointer:
++            case kRxPointer: return 0u;
++            case kIrqStatus: return irqStatus;
++            default: unsupported("register read", physical);
++            }
++        }
++
++        void writeSio2Register(uint32_t physical, uint32_t width, uint32_t value) override
++        {
++            if (physical == kTx && width == 1u)
++            {
++                if (tx.size() == kFifoCapacity)
++                    unsupported("TX FIFO overflow", static_cast<uint32_t>(tx.size()));
++                tx.push_back(static_cast<uint8_t>(value));
++                return;
++            }
++            if (width != 4u || (physical & 3u) != 0u)
++                unsupported("register write width/alignment", physical);
++            if (physical >= kQueue && physical < kPortControl)
++            {
++                descriptors[(physical - kQueue) / 4u] = value;
++                return;
++            }
++            if (physical >= kPortControl && physical < kTx)
++            {
++                portControls[(physical - kPortControl) / 4u] = value;
++                return;
++            }
++            if (physical == kTxPointer || physical == kRxPointer)
++            {
++                if (value != 0u)
++                    unsupported("FIFO pointer write", value);
++                return;
++            }
++            if (physical == kIrqStatus)
++            {
++                irqStatus &= ~value; // Hardware interrupt status is write-one-to-clear.
++                if (irqStatus == 0u)
++                    irqDelivered = false;
++                return;
++            }
++            if (physical != kControl)
++                unsupported("register write", physical);
++            if ((value & ~0xFBFu) != 0u || (value & 2u) != 0u)
++                unsupported("control mode", value);
++            if ((value & 1u) != 0u)
++                transfer();
++            else if ((value & 0xCu) != 0u)
++                clearTransfer();
++            // START/reset are strobes. A driver's read|START must not reset TX.
++            control = value & ~0xFu;
++        }
++
++        void transfer()
++        {
++            size_t transmitSize = 0u, receiveSize = 0u, count = 0u;
++            for (; count < descriptors.size() && descriptors[count] != 0u; ++count)
++            {
++                const uint32_t descriptor = descriptors[count];
++                if ((descriptor & 0xFCu) != 0x40u || (descriptor & 0x38020000u) != 0u)
++                    unsupported("transfer descriptor (only normal PIO is modeled)", descriptor);
++                const size_t send = (descriptor >> 8u) & 0x1FFu;
++                const size_t receive = (descriptor >> 18u) & 0x1FFu;
++                if (send == 0u || receive == 0u || send > kFifoCapacity || receive > kFifoCapacity ||
++                    send > kFifoCapacity - transmitSize || receive > kFifoCapacity - receiveSize)
++                    unsupported("transfer size", descriptor);
++                transmitSize += send;
++                receiveSize += receive;
++            }
++            if (count == 0u || transmitSize != tx.size())
++                unsupported("TX count does not match descriptor queue", static_cast<uint32_t>(tx.size()));
++            if (rxPosition != rx.size())
++                unsupported("unread RX data before next transfer", static_cast<uint32_t>(rx.size() - rxPosition));
++
++            std::array<InputSample, 2u> samples;
++            {
++                const std::lock_guard lock(inputMutex);
++                samples = inputs;
++            }
++            // Queue and protocol preflight is transactional: even a later
++            // unsupported packet cannot partially change negotiation or RX.
++            auto nextProtocols = protocols;
++            std::vector<uint8_t> result;
++            result.reserve(receiveSize);
++            size_t txPosition = 0u;
++            uint64_t nextControllerPackets = 0u, nextCardPackets = 0u, nextMissingDevices = 0u;
++            uint32_t nextPort = 0u, nextCommand = 0u, nextButtons = lastButtons;
++            uint32_t nextStatus = 0x1000u | (static_cast<uint32_t>(count & 0xFu) << 8u);
++            for (size_t index = 0u; index < count; ++index)
++            {
++                const uint32_t descriptor = descriptors[index];
++                const uint32_t port = descriptor & 3u;
++                const size_t send = (descriptor >> 8u) & 0x1FFu;
++                const size_t receive = (descriptor >> 18u) & 0x1FFu;
++                const std::span packet(tx.data() + txPosition, send);
++                txPosition += send;
++                nextPort = port;
++                nextCommand = packet.size() > 1u ? packet[1] : 0u;
++                nextControllerPackets += packet[0] == 0x01u;
++                nextCardPackets += packet[0] == 0x81u;
++                if (packet[0] == 0x01u && port < samples.size() && samples[port].state.connected)
++                {
++                    const auto reply = controllerReply(nextProtocols[port], samples[port], packet, receive);
++                    result.insert(result.end(), reply.begin(), reply.end());
++                    nextButtons = samples[port].state.buttons;
++                }
++                else
++                {
++                    // No physical card or multitap is attached. Address 0x81
++                    // never receives pad bytes or a fabricated HLE card image.
++                    result.insert(result.end(), receive, 0xFFu);
++                    // PS2SDK STAT_ERR_QUEUE_SLOT identifies descriptor position,
++                    // not port number; several slots can address the same port.
++                    nextStatus |= 0xC000u | (1u << (16u + index));
++                    ++nextMissingDevices;
++                }
++            }
++            protocols = nextProtocols;
++            ++transfers;
++            controllerPackets += nextControllerPackets;
++            memoryCardPackets += nextCardPackets;
++            missingDevices += nextMissingDevices;
++            lastPort = nextPort;
++            lastCommand = nextCommand;
++            lastButtons = nextButtons;
++            tx.clear();
++            rx = std::move(result);
++            rxPosition = 0u;
++            status = nextStatus;
++            if (irqStatus == 0u)
++                irqDelivered = false;
++            irqStatus |= 1u | ((status & 0xC000u) != 0u ? 2u : 0u);
++        }
++
++        void serviceInterrupt(const IopIntrman &intrman, IopGuestExecutor &executor)
++        {
++            const bool enabled = ((irqStatus & 1u) != 0u && (control & 0x200u) != 0u) ||
++                                 ((irqStatus & 2u) != 0u && (control & 0x100u) != 0u);
++            if (!enabled || irqDelivered || servicing || intrman.inInterruptContext() ||
++                memory.interruptControl() == 0u || (memory.interruptMask() & (1u << kIrq)) == 0u)
++                return;
++            struct Scope
++            {
++                bool &value;
++                explicit Scope(bool &flag) : value(flag) { value = true; }
++                ~Scope() { value = false; }
++            } scope(servicing);
++            irqDelivered = true;
++            if (!intrman.dispatchRegisteredInterrupt(static_cast<int>(kIrq), executor))
++                irqDelivered = false;
++            else
++                ++irqCallbacks;
++            // Original guest ISR acknowledges W1C. Do not also assert raw
++            // I_STAT and invoke the same handler through a COP0 exception.
++        }
++
++        DebugService debugSnapshot() const
++        {
++            DebugService row;
++            row.name = "sio2_device";
++            row.metrics = {{"pio_transfers", transfers}, {"irq_callbacks", irqCallbacks},
++                {"controller_packets", controllerPackets}, {"memory_card_packets", memoryCardPackets},
++                {"missing_devices", missingDevices}, {"last_port", lastPort},
++                {"last_command", lastCommand, true}, {"last_buttons", lastButtons, true},
++                {"irq_status", irqStatus, true}, {"rx_remaining", rx.size() - rxPosition}};
++            return row;
++        }
++
++        IopMemory &memory;
++        std::mutex inputMutex;
++        std::array<InputSample, 2u> inputs{};
++        std::array<PadProtocol, 2u> protocols{};
++        std::array<uint32_t, 16u> descriptors{};
++        std::array<uint32_t, 8u> portControls{};
++        std::vector<uint8_t> tx, rx;
++        size_t rxPosition = 0u;
++        uint32_t control = 0u, status = 0x1000u, irqStatus = 0u;
++        bool irqDelivered = false, servicing = false;
++        uint64_t transfers = 0u, irqCallbacks = 0u, controllerPackets = 0u;
++        uint64_t memoryCardPackets = 0u, missingDevices = 0u;
++        uint32_t lastPort = 0u, lastCommand = 0u, lastButtons = 0xFFFFu;
++    };
++
++    IopSio2::IopSio2(IopMemory &memory) : m_impl(std::make_shared<Impl>(memory))
++    {
++        memory.bindSio2Registers(m_impl);
++        reset();
++    }
++
++    IopSio2::~IopSio2() = default;
++    void IopSio2::reset() { m_impl->reset(); }
++    void IopSio2::setControllerState(uint32_t port, const ControllerState &state) { m_impl->setControllerState(port, state); }
++    void IopSio2::serviceInterrupt(const IopIntrman &intrman, IopGuestExecutor &executor) { m_impl->serviceInterrupt(intrman, executor); }
++    DebugService IopSio2::debugSnapshot() const { return m_impl->debugSnapshot(); }
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_sio2.h b/ps2xIOP/src/emulator/core/iop_sio2.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_sio2.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include "ps2x/iop/iop_controller.h"
++#include "ps2x/iop/iop_types.h"
++
++#include <memory>
++
++namespace ps2x::iop::detail
++{
++    class IopMemory;
++    class IopIntrman;
++    class IopGuestExecutor;
++
++    class IopSio2
++    {
++    public:
++        explicit IopSio2(IopMemory &memory);
++        ~IopSio2();
++        IopSio2(const IopSio2 &) = delete;
++        IopSio2 &operator=(const IopSio2 &) = delete;
++
++        // A guest reset clears bus/protocol state but preserves the synchronized
++        // host samples. The owning object is not replaced by an IOP reset.
++        void reset();
++        void setControllerState(uint32_t port, const ControllerState &state);
++        void serviceInterrupt(const IopIntrman &intrman, IopGuestExecutor &executor);
++        [[nodiscard]] DebugService debugSnapshot() const;
++
++    private:
++        class Impl;
++        std::shared_ptr<Impl> m_impl;
++    };
++}
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -9,6 +9,7 @@
+ #include "core/iop_kernel.h"
+ #include "imports/iop_loadcore.h"
+ #include "core/iop_memory.h"
++#include "core/iop_sio2.h"
+ #include "services/iop_module_loader.h"
+ #include "services/iop_rpc.h"
+ #include "imports/iop_stdio.h"
+@@ -347,6 +348,7 @@
+               kernel(memory),
+               cdvd(host, memory, kernel),
+               vblank(kernel, memory),
++              sio2(memory),
+               rpc(host, memory, kernel),
+               sysclib(memory),
+               stdio(host, memory),
+@@ -378,6 +380,7 @@
+             cdvd.reset();
+             intrman.reset();
+             vblank.reset();
++            sio2.reset();
+             timrman.reset();
+             ioman.reset();
+             pendingDmaInterrupts.clear();
+@@ -869,6 +872,7 @@
+                     if (!step(cpu))
+                         break;
+                     serviceVblankCallbacks();
++                    serviceSio2Interrupt();
+                     if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                         servicePendingDmaInterrupts();
+                     if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+@@ -971,6 +975,12 @@
+             vblank.serviceDue(totalCycles, *this, intrman);
+         }
+ 
++        void serviceSio2Interrupt()
++        {
++            const RestoreValue strictGuard(strictExecution, true);
++            sio2.serviceInterrupt(intrman, *this);
++        }
++
+         // Not that good to use exception handling for control flow but will do for now
+         void servicePendingDmaInterrupts()
+         {
+@@ -1054,6 +1064,7 @@
+                 while (totalCycles < target)
+                 {
+                     serviceVblankCallbacks();
++                    serviceSio2Interrupt();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this, intrman);
+@@ -1383,6 +1394,7 @@
+         IopKernel kernel;
+         IopCdvd cdvd;
+         IopVblank vblank;
++        IopSio2 sio2;
+         IopRpcBridge rpc;
+         IopSysclib sysclib;
+         IopStdio stdio;
+@@ -1478,6 +1490,16 @@
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
++    void IopEmulator::setControllerState(uint32_t port, const ControllerState &state)
++    {
++        m_impl->sio2.setControllerState(port, state);
++    }
++
++    DebugService IopEmulator::sio2DebugSnapshot() const
++    {
++        return m_impl->sio2.debugSnapshot();
++    }
++
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "ps2x/iop/iop_host.h"
++#include "ps2x/iop/iop_controller.h"
+ #include "ps2x/iop/iop_types.h"
+ #include "ps2x/iop/iop_sif_transfer.h"
+ 
+@@ -23,6 +24,8 @@
+         IopEmulator &operator=(const IopEmulator &) = delete;
+ 
+         void reset();
++        void setControllerState(uint32_t port, const ControllerState &state);
++        [[nodiscard]] DebugService sio2DebugSnapshot() const;
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] ModuleLoadResult loadModuleStrict(std::string_view path, const void *arguments, uint32_t argumentSize);
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -152,6 +152,11 @@
+                 m_impl->sifCommand.rebindOwner(*this);
+         }
+         return *this;
++    }
++
++    void IopSubsystem::setControllerState(uint32_t port, const ControllerState &state)
++    {
++        m_impl->emulator.setControllerState(port, state);
+     }
+ 
+     void IopSubsystem::reset()
+@@ -539,6 +544,7 @@
+         snapshot.emulatorLoadedModules = m_impl->emulator.loadedModuleCount();
+         snapshot.emulatorThreads = m_impl->emulator.threadCount();
+         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
++        snapshot.services.push_back(m_impl->emulator.sio2DebugSnapshot());
+         snapshot.diagnostics = m_impl->loadOutcomes;
+         if (!m_impl->bootFailure.empty())
+             snapshot.diagnostics.push_back(m_impl->bootFailure);
+diff --git a/ps2xIOP/tests/iop_sio2_tests.cpp b/ps2xIOP/tests/iop_sio2_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_sio2_tests.cpp
+@@ -0,0 +1,533 @@
++#include "iop_compat_test_support.h"
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_intrman.h"
++#include "emulator/services/iop_rpc.h"
++#ifndef PS2X_SIO2_BASELINE_ONLY
++#include "emulator/core/iop_sio2.h"
++#endif
++
++#include <atomic>
++#include <functional>
++#include <memory>
++#include <thread>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++    constexpr uint32_t Q = 0xBF808200u, TX = Q + 0x60u, RX = Q + 0x64u;
++    constexpr uint32_t CTRL = Q + 0x68u, STAT = Q + 0x6Cu, FIFO = Q + 0x74u, IRQ = Q + 0x80u;
++
++    template <typename Function> void throws(Function function)
++    {
++        bool failed = false;
++        try { function(); } catch (const std::exception &) { failed = true; }
++        require(failed, "unsupported or invalid transaction was silently accepted");
++    }
++
++    uint32_t descriptor(uint32_t port, size_t send, size_t receive)
++    {
++        return port | 0x40u | (static_cast<uint32_t>(send) << 8u) |
++            (static_cast<uint32_t>(receive) << 18u);
++    }
++
++    // Authored MIPS startup and ISR. No original IRX bytes or EE-pad-buffer
++    // shortcut: the module registers IRQ17, writes real MMIO, and its ISR reads
++    // the RX FIFO and W1C status into its own ordinary IOP data segment.
++    iop_test::Irx guestTransfer(uint8_t address)
++    {
++        iop_test::Irx image(0x10000u, 0x500u);
++        std::vector<uint32_t> code;
++        const auto emit = [&](uint32_t word) { code.push_back(word); };
++        const auto li = [&](uint32_t reg, uint32_t value)
++        {
++            emit(0x3C000000u | (reg << 16u) | (value >> 16u));
++            emit(0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu));
++        };
++        const auto call = [&](uint32_t function)
++        {
++            emit(0x0C000000u | (function >> 2u)); emit(0u);
++        };
++        emit(0x27BDFFE0u); emit(0xAFBF001Cu);
++        li(4u, 17u); li(5u, 1u); li(6u, 0x10200u); li(7u, 0x10400u);
++        call(0x10314u); // intrman RegisterIntrHandler
++        li(4u, 17u); call(0x1031Cu); // EnableIntr
++        li(17u, Q); li(8u, 0x3BCu); emit(0xAE280068u);
++        li(8u, descriptor(0u, 5u, 5u)); emit(0xAE280000u); emit(0xAE200004u);
++        for (const uint8_t byte : {address, uint8_t{0x42u}, uint8_t{0u}, uint8_t{0u}, uint8_t{0u}})
++        {
++            li(8u, byte); emit(0xA2280060u);
++        }
++        emit(0x8E280068u); emit(0u); emit(0x35080001u); emit(0xAE280068u);
++        emit(0x8FBF001Cu); emit(0x27BD0020u); emit(0x03E00008u); emit(0x00001021u);
++        require(code.size() * 4u < 0x200u, "authored entry overlaps ISR");
++        uint32_t offset = 0u;
++        for (const uint32_t word : code) { image.words(offset, {word}); offset += 4u; }
++        image.words(0x200u, {
++            0x3C08BF80u, 0x35088200u, 0x8C890000u, 0u, 0x25290001u, 0xAC890000u,
++            0x8D0A0064u, 0u, 0xAC8A0004u, 0x910B0064u, 0u, 0xAC8B0008u,
++            0x8D0A006Cu, 0u, 0xAC8A000Cu, 0x8D0A0080u, 0u, 0xAC8A0010u,
++            0x240A0003u, 0xAD0A0080u, 0x03E00008u, 0x24020001u,
++        });
++        image.words(0x300u, {0x41E00000u, 0u, 0x0101u, 0x72746E69u, 0x006E616Du,
++            0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++        return image;
++    }
++
++    std::array<uint32_t, 5u> executeTransfer(IopSubsystem &iop, uint8_t address)
++    {
++        const auto image = guestTransfer(address);
++        const auto loaded = iop.loadModuleImage("authored-sio2.irx", image.bytes, nullptr, 0u);
++        require(loaded.handled && loaded.moduleId > 0 && loaded.startResult == 0,
++                "authored SIO2 MIPS entry did not return resident");
++        std::array<uint32_t, 5u> result{};
++        require(iop.readMemory(0x10400u, result.data(), sizeof(result)), "cannot read authored ISR result");
++        return result;
++    }
++
++    void originalInstructionPathStart()
++    {
++        iop_test::Host host;
++        IopSubsystem iop(host);
++#ifndef PS2X_SIO2_BASELINE_ONLY
++        ControllerState state;
++        state.connected = true;
++        state.buttons = 0xFFF7u;
++        iop.setControllerState(0u, state);
++#endif
++        const auto result = executeTransfer(iop, 0x01u);
++        require(result[0] == 1u && result[1] == 0xF75A41FFu && result[2] == 0xFFu &&
++                    result[3] == 0x1100u && result[4] == 1u,
++                "MIPS FIFO/IRQ path did not deliver the physical Start sample exactly once");
++        require(host.guestWrites == 0u && host.cardCalls.empty(), "controller fabricated an EE packet or HLE card call");
++    }
++
++    void originalInstructionPathAbsentCard()
++    {
++        iop_test::Host host;
++        IopSubsystem iop(host);
++        const auto result = executeTransfer(iop, 0x81u);
++        require(result[0] == 1u && result[1] == 0xFFFFFFFFu && result[2] == 0xFFu &&
++                    result[3] == 0x1D100u && result[4] == 3u,
++                "MIPS memory-card selection did not receive no-ACK bytes and device IRQ status");
++        require(host.cardCalls.empty() && host.guestWrites == 0u, "physical no-card transfer reached HLE/EE buffer substitution");
++    }
++
++#ifndef PS2X_SIO2_BASELINE_ONLY
++    class Executor final : public IopGuestExecutor
++    {
++    public:
++        Executor(IopMemory &memory, IopIntrman &intrman) : memory(memory), intrman(intrman) {}
++        uint32_t executeGuestFunction(uint32_t address, uint32_t a0, uint32_t,
++                                     uint32_t, uint32_t, uint32_t gp) override
++        {
++            ++calls;
++            require(address == 0x1234u && a0 == 0x5678u && gp == 0x9ABCu, "IRQ registration ABI changed");
++            require(intrman.inInterruptContext(), "SIO2 ISR lacks interrupt context");
++            if (callback) callback();
++            if (fail) throw std::runtime_error("authored ISR failure");
++            if (ack) memory.write32(IRQ, 3u);
++            return 1u;
++        }
++        IopMemory &memory;
++        IopIntrman &intrman;
++        size_t calls = 0u;
++        bool ack = false, fail = false;
++        std::function<void()> callback;
++    };
++
++    struct Fixture
++    {
++        IopMemory memory;
++        IopSio2 device{memory};
++        IopIntrman intrman{memory};
++        Executor executor{memory, intrman};
++        Fixture() { intrman.reset(); }
++        void set(uint32_t port, uint16_t buttons = 0xFFFFu)
++        {
++            ControllerState state;
++            state.connected = true;
++            state.buttons = buttons;
++            device.setControllerState(port, state);
++        }
++        void import(uint16_t ordinal, uint32_t a0 = 17u)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = a0; cpu.gpr[5] = 1u; cpu.gpr[6] = 0x1234u;
++            cpu.gpr[7] = 0x5678u; cpu.gpr[28] = 0x9ABCu;
++            if (ordinal == 7u) cpu.gpr[5] = 0u;
++            require(intrman.dispatchImport(ordinal, cpu, executor), "missing authored intrman import");
++        }
++        void install() { import(4u); import(6u); }
++        void begin(std::span<const uint8_t> bytes, size_t receive, uint32_t port = 0u, uint32_t control = 0x201u)
++        {
++            memory.write32(CTRL, 0x3BCu);
++            memory.write32(Q, descriptor(port, bytes.size(), receive));
++            memory.write32(Q + 4u, 0u);
++            for (const uint8_t byte : bytes) memory.write8(TX, byte);
++            memory.write32(CTRL, control);
++        }
++        std::vector<uint8_t> drain(size_t size)
++        {
++            std::vector<uint8_t> result(size);
++            for (auto &byte : result) byte = memory.read8(RX);
++            return result;
++        }
++        std::vector<uint8_t> exchange(std::span<const uint8_t> bytes, size_t receive = 9u, uint32_t port = 0u)
++        {
++            begin(bytes, receive, port);
++            return drain(receive);
++        }
++        std::vector<uint8_t> command(uint8_t command, uint8_t argument = 0u, uint32_t port = 0u)
++        {
++            const std::array<uint8_t, 9u> bytes{1u, command, 0u, argument};
++            return exchange(bytes, 9u, port);
++        }
++        void pressure(uint32_t port = 0u)
++        {
++            (void)command(0x43u, 1u, port);
++            const std::array<uint8_t, 9u> bytes{1u, 0x4Fu, 0u, 0xFFu, 0xFFu, 3u};
++            (void)exchange(bytes, 9u, port);
++            (void)command(0x43u, 0u, port);
++        }
++        void service() { device.serviceInterrupt(intrman, executor); }
++    };
++
++    constexpr std::array<uint8_t, 5u> poll{1u, 0x42u, 0u, 0u, 0u};
++
++    void digitalPressAndRelease()
++    {
++        Fixture f; f.set(0u);
++        require(f.exchange(poll, 5u) == std::vector<uint8_t>({0xFFu, 0x41u, 0x5Au, 0xFFu, 0xFFu}), "neutral digital packet differs");
++        f.set(0u, 0xFFF7u);
++        require(f.exchange(poll, 5u)[3] == 0xF7u, "active-low Start was byte swapped or inverted");
++        f.set(0u);
++        require(f.exchange(poll, 5u)[3] == 0xFFu, "released Start remains pressed");
++    }
++
++    void transactionSamplesOnce()
++    {
++        Fixture f; f.set(0u, 0xFFF7u); f.begin(poll, 5u);
++        f.set(0u, 0xBFFFu);
++        require(f.drain(5u)[3] == 0xF7u, "host update rewrote an already queued serial response");
++        const auto next = f.exchange(poll, 5u);
++        require(next[3] == 0xFFu && next[4] == 0xBFu, "next transaction did not sample Cross");
++    }
++
++    void configurationIdsAndAnalog()
++    {
++        Fixture f; f.set(0u);
++        const auto enter = f.command(0x43u, 1u);
++        require(enter[1] == 0x41u && enter[3] == 0u && enter[4] == 0u && enter[5] == 0xFFu,
++                "config entry did not retain transaction-start digital length/ID");
++        const std::array<uint8_t, 9u> analog{1u, 0x44u, 0u, 1u, 3u};
++        require(f.exchange(analog)[1] == 0xF3u, "configuration response ID differs");
++        require(f.command(0x43u)[1] == 0xF3u, "config exit changed the ID mid-transaction");
++        const auto response = f.command(0x42u);
++        require(response[1] == 0x73u && response[5] == 0x80u && response[8] == 0x80u, "analog mode/centered axes differ");
++    }
++
++    void pressureOrderAndResponseMask()
++    {
++        Fixture f;
++        ControllerState state; state.connected = true; state.buttons = 0xBFFFu;
++        state.rightX = 0x12u; state.rightY = 0x34u; state.leftX = 0x56u; state.leftY = 0x78u;
++        for (size_t i = 0u; i < state.pressures.size(); ++i) state.pressures[i] = static_cast<uint8_t>(0x90u + i);
++        f.device.setControllerState(0u, state); f.pressure();
++        const std::array<uint8_t, 21u> bytes{1u, 0x42u};
++        const auto response = f.exchange(bytes, 21u);
++        require(response[1] == 0x79u && response[3] == 0xFFu && response[4] == 0xBFu &&
++                    response[5] == 0x12u && response[6] == 0x34u && response[7] == 0x56u && response[8] == 0x78u,
++                "pressure mode changed digital/axis wire ordering");
++        for (size_t i = 0u; i < state.pressures.size(); ++i) require(response[9u + i] == 0x90u + i, "pressure order differs");
++        (void)f.command(0x43u, 1u);
++        const std::array<uint8_t, 9u> analog{1u, 0x4Fu, 0u, 0x3Fu};
++        (void)f.exchange(analog); (void)f.command(0x43u);
++        require(f.command(0x42u)[1] == 0x73u, "analog response mask ignored");
++    }
++
++    void configurationQueriesAndMapping()
++    {
++        Fixture f; f.set(0u); (void)f.command(0x43u, 1u);
++        require(f.command(0x45u) == std::vector<uint8_t>({0xFFu,0xF3u,0x5Au,3u,2u,0u,2u,1u,0u}), "DS2 model query differs");
++        require(f.command(0x46u, 0u) == std::vector<uint8_t>({0xFFu,0xF3u,0x5Au,0u,0u,1u,2u,0u,10u}), "first actuator query differs");
++        require(f.command(0x46u, 1u)[8] == 20u && f.command(0x47u)[5] == 2u &&
++                    f.command(0x4Cu, 0u)[6] == 4u && f.command(0x4Cu, 1u)[6] == 7u, "capability query differs");
++        require(f.command(0x40u)[8] == 0x5Au, "pressure-reference response differs");
++        require(f.command(0x41u)[3] == 0u, "digital mode advertises an analog pressure mask");
++        (void)f.command(0x44u, 1u);
++        const auto mask = f.command(0x41u);
++        require(mask[3] == 0xFFu && mask[4] == 0xFFu && mask[5] == 3u && mask[8] == 0x5Au, "analog button mask differs");
++        const std::array<uint8_t, 9u> mapping{1u,0x4Du,0u,0u,1u,0xFFu,0xFFu,0xFFu,0xFFu};
++        const auto before = f.exchange(mapping);
++        require(std::all_of(before.begin() + 3, before.end(), [](auto x) { return x == 0xFFu; }), "initial actuator map differs");
++        const auto after = f.exchange(mapping);
++        require(after[3] == 0u && after[4] == 1u && after[8] == 0xFFu, "actuator-map response did not report previous mapping");
++    }
++
++    void portsAreIndependent()
++    {
++        Fixture f; f.set(0u, 0xFFF7u); f.set(1u, 0xBFFFu); f.pressure(1u);
++        require(f.exchange(poll, 5u, 0u)[1] == 0x41u, "port1 mode changed port0");
++        const std::array<uint8_t, 21u> bytes{1u,0x42u};
++        const auto second = f.exchange(bytes, 21u, 1u);
++        require(second[1] == 0x79u && second[4] == 0xBFu, "port1 input/mode was not retained");
++    }
++
++    void resetPreservesSamples()
++    {
++        Fixture f; f.set(0u, 0xFFF7u); f.pressure(); f.device.reset();
++        const auto response = f.exchange(poll, 5u);
++        require(response[1] == 0x41u && response[3] == 0xF7u, "reset lost host input or retained pressure negotiation");
++        f.memory.reset(); // Weak route survives loader RAM copies/reset as CDVD does.
++        require(f.exchange(poll, 5u)[3] == 0xF7u, "RAM reset disconnected the live device route");
++    }
++
++    void reconnectResetsOnlyThatPad()
++    {
++        Fixture f; f.set(0u); f.set(1u); f.pressure(0u); f.pressure(1u);
++        ControllerState unplugged; f.device.setControllerState(0u, unplugged); f.set(0u, 0xFFF7u);
++        const auto response = f.exchange(poll, 5u);
++        require(response[1] == 0x41u && response[3] == 0xF7u, "reconnect reused previous hardware negotiation");
++        const std::array<uint8_t,21u> bytes{1u,0x42u};
++        require(f.exchange(bytes,21u,1u)[1] == 0x79u, "port0 reconnect reset port1");
++    }
++
++    void absentDevicesAndCardAreDistinct()
++    {
++        Fixture f;
++        require(f.exchange(poll,5u) == std::vector<uint8_t>(5u,0xFFu), "absent pad returned controller bytes");
++        require(f.memory.read32(STAT) == 0x1D100u && f.memory.read32(IRQ) == 3u, "missing-pad ACK/error status differs");
++        f.set(0u);
++        const std::array<uint8_t,5u> card{0x81u,0x11u};
++        require(f.exchange(card,5u) == std::vector<uint8_t>(5u,0xFFu), "card selection received an attached pad response");
++        const auto row = f.device.debugSnapshot();
++        require(row.name == "sio2_device", "missing bus diagnostic row");
++        const auto metric = [&](const char *name)
++        {
++            for (const auto &value : row.metrics) if (value.name == name) return value.value;
++            throw std::runtime_error("missing metric");
++        };
++        require(metric("controller_packets") == 1u && metric("memory_card_packets") == 1u && metric("missing_devices") == 2u,
++                "device selection diagnostic counts differ");
++    }
++
++    void descriptorErrorsUseQueueIndex()
++    {
++        Fixture f; f.set(0u);
++        for (const bool missingFirst : {false,true})
++        {
++            f.memory.write32(CTRL,0x3BCu);
++            f.memory.write32(Q,descriptor(missingFirst ? 1u : 0u,5u,5u));
++            f.memory.write32(Q+4u,descriptor(missingFirst ? 0u : 1u,5u,5u));
++            f.memory.write32(Q+8u,0u);
++            for (unsigned i=0u;i<2u;++i) for (auto b:poll) f.memory.write8(TX,b);
++            f.memory.write32(CTRL,0x201u);
++            require((f.memory.read32(STAT)>>16u) == (missingFirst ? 1u : 2u), "ACK error indexed connector instead of descriptor position");
++            (void)f.drain(10u);
++        }
++        f.memory.write32(CTRL,0x3BCu);
++        for (uint32_t i=0u;i<16u;++i)
++        {
++            f.memory.write32(Q+i*4u,descriptor(1u,5u,5u));
++            for (auto b:poll) f.memory.write8(TX,b);
++        }
++        f.memory.write32(CTRL,0x201u);
++        require(f.memory.read32(STAT)==0xFFFFD000u, "sixteen queue-slot ACK flags or queue wrap differs");
++        (void)f.drain(80u);
++    }
++
++    void queuePreflightRollsBackProtocol()
++    {
++        Fixture f; f.set(0u);
++        const std::array<uint8_t,5u> enter{1u,0x43u,0u,1u,0u};
++        const std::array<uint8_t,5u> bad{1u,0x99u,0u,0u,0u};
++        f.memory.write32(Q,descriptor(0u,5u,5u)); f.memory.write32(Q+4u,descriptor(0u,5u,5u));
++        for (auto b:enter) f.memory.write8(TX,b);
++        for (auto b:bad) f.memory.write8(TX,b);
++        throws([&] { f.memory.write32(CTRL,0x201u); });
++        require(f.memory.read32(FIFO)==10u && f.memory.read32(IRQ)==0u, "failed queue partially consumed TX or committed IRQ");
++        require(f.exchange(poll,5u)[1]==0x41u, "failed queue partially entered config mode");
++    }
++
++    void unsupportedModesStayStrict()
++    {
++        Fixture f; f.set(0u);
++        throws([&] { (void)f.command(0x45u); });
++        throws([&] { f.memory.write32(CTRL,0x40000000u); });
++        throws([&] { f.memory.write32(CTRL,2u); });
++        f.memory.write32(CTRL,0x3BCu); f.memory.write32(Q,descriptor(0u,5u,5u)|0x10u);
++        for (auto b:poll) f.memory.write8(TX,b);
++        throws([&] { f.memory.write32(CTRL,0x201u); });
++        require((f.memory.read32(FIFO)&0x1FFu)==5u, "unsupported DMA consumed PIO bytes");
++        (void)f.command(0x43u,1u);
++        throws([&] { (void)f.command(0x46u,2u); });
++        const std::array<uint8_t,9u> unknownMask{1u,0x4Fu,0u,3u};
++        throws([&] { (void)f.exchange(unknownMask); });
++        (void)f.command(0x43u);
++        require(f.exchange(poll,5u)[1]==0x41u, "unsupported response mask changed mode");
++    }
++
++    void fifoWidthsBoundsAndAliases()
++    {
++        Fixture f; f.set(0u,0xFFF7u); f.begin(poll,5u);
++        require(f.memory.read16(0x1F808264u)==0x41FFu && f.memory.read16(0x9F808264u)==0xF75Au &&
++                    f.memory.read8(RX)==0xFFu, "FIFO widths/physical aliases do not consume little-endian bytes");
++        throws([&] { (void)f.memory.read8(RX); });
++        throws([&] { f.memory.write16(TX,1u); });
++        f.memory.write32(Q-4u,0x12345678u);
++        throws([&] { f.memory.write16(Q-1u,0u); });
++        require(f.memory.read32(Q-4u)==0x12345678u, "unaligned device-boundary store partially wrote neighboring register");
++        std::array<uint8_t,256u> bytes{}; bytes[0]=1u; bytes[1]=0x42u;
++        f.begin(bytes,256u);
++        require(f.memory.read32(FIFO)==0x01000000u, "full FIFO size lost its ninth bit");
++        (void)f.drain(256u);
++        f.memory.write32(CTRL,0x3BCu);
++        for (size_t i=0u;i<256u;++i) f.memory.write8(TX,0u);
++        throws([&] { f.memory.write8(TX,0u); });
++        require(f.memory.read32(FIFO)==256u, "TX overflow changed queue size");
++    }
++
++    void invalidCountsAndUnreadRx()
++    {
++        Fixture f; f.set(0u);
++        f.memory.write32(Q,descriptor(0u,6u,5u));
++        for (auto b:poll) f.memory.write8(TX,b);
++        throws([&] { f.memory.write32(CTRL,0x201u); });
++        require(f.memory.read32(FIFO)==5u, "TX mismatch consumed data");
++        f.begin(poll,5u);
++        for (auto b:poll) f.memory.write8(TX,b);
++        throws([&] { f.memory.write32(CTRL,0x201u); });
++        require(f.memory.read32(FIFO)==0x00050005u, "unread RX was overwritten by another transaction");
++        (void)f.drain(5u);
++    }
++
++    void weakMemoryRouteLifetime()
++    {
++        IopMemory memory;
++        auto device=std::make_unique<IopSio2>(memory);
++        IopMemory staged=memory;
++        memory=staged;
++        memory.reset();
++        require(memory.read32(CTRL)==0u && staged.read32(STAT)==0x1000u, "staged RAM copy lost live device route");
++        device.reset();
++        throws([&] { (void)memory.read32(CTRL); });
++        throws([&] { (void)staged.read32(CTRL); });
++    }
++
++    void irqMasksPendingAndW1c()
++    {
++        Fixture f; f.set(0u); f.install(); f.begin(poll,5u,0u,1u);
++        require(f.executor.calls==0u, "guest handler ran inside a register store");
++        f.service(); require(f.executor.calls==0u, "device completion-enable gate ignored");
++        f.memory.write32(CTRL,0x200u); f.memory.setInterruptControl(0u);
++        f.service(); require(f.executor.calls==0u, "CPU interrupt suspend ignored");
++        f.memory.setInterruptControl(1u); f.memory.setInterruptMask(0u);
++        f.service(); require(f.executor.calls==0u, "live I_MASK ignored");
++        f.memory.setInterruptMask(1u<<17u); f.service();
++        require(f.executor.calls==1u && f.memory.read32(IRQ)==1u && f.memory.interruptStatus()==0u,
++                "pending IRQ was lost or duplicated through raw I_STAT");
++        f.service(); f.memory.write32(IRQ,0u); f.service();
++        require(f.executor.calls==1u && f.memory.read32(IRQ)==1u, "unacknowledged latch was redelivered or zero-write cleared it");
++        f.memory.write32(IRQ,1u); require(f.memory.read32(IRQ)==0u, "W1C did not acknowledge completion");
++        f.executor.ack=true; f.begin(poll,5u); f.service();
++        require(f.executor.calls==2u && f.memory.read32(IRQ)==0u, "next transfer failed to deliver after W1C");
++    }
++
++    void liveMaskOverridesStaleIntrmanBookkeeping()
++    {
++        Fixture f; f.set(0u); f.install(); f.import(7u); f.begin(poll,5u); f.service();
++        require(f.executor.calls==0u, "DisableIntr gate ignored");
++        f.memory.write32(0xBF801074u,1u<<17u); f.executor.ack=true; f.service();
++        require(f.executor.calls==1u, "stale EnableIntr bookkeeping shadowed direct hardware reenable");
++    }
++
++    void irqReentryAndFaultUnwind()
++    {
++        Fixture f; f.set(0u); f.install(); f.begin(poll,5u);
++        f.executor.callback=[&] { f.service(); }; f.executor.fail=true;
++        throws([&] { f.service(); });
++        require(f.executor.calls==1u && !f.intrman.inInterruptContext(), "nested IRQ or exception leaked interrupt context");
++        f.device.reset(); f.executor.fail=false; f.executor.ack=true;
++        f.begin(poll,5u); f.service();
++        require(f.executor.calls==2u && !f.intrman.inInterruptContext(), "reset did not restore post-failure interrupt delivery");
++    }
++
++    void concurrentHostSamplesAndReset()
++    {
++        Fixture f; f.set(0u); f.pressure();
++        ControllerState a; a.connected=true; a.buttons=0xFFF7u; a.rightX=0x11u; a.pressures.fill(0x22u);
++        ControllerState b=a; b.buttons=0xBFFFu; b.rightX=0x33u; b.pressures.fill(0x44u);
++        std::atomic<bool> stop=false;
++        std::jthread writer([&] { while (!stop.load()) { f.device.setControllerState(0u,a); f.device.setControllerState(0u,b); } });
++        try
++        {
++            const std::array<uint8_t,21u> bytes{1u,0x42u};
++            for (size_t i=0u;i<200u;++i)
++            {
++                const auto response=f.exchange(bytes,21u);
++                require((response[3]==0xF7u && response[4]==0xFFu && response[5]==0x11u &&
++                             std::all_of(response.begin()+9, response.end(), [](auto x) { return x==0x22u; })) ||
++                            (response[3]==0xFFu && response[4]==0xBFu && response[5]==0x33u &&
++                             std::all_of(response.begin()+9, response.end(), [](auto x) { return x==0x44u; })) ||
++                            (response[3]==0xFFu && response[4]==0xFFu && response[5]==0x80u &&
++                             std::all_of(response.begin()+9, response.end(), [](auto x) { return x==0u; })),
++                        "transaction contains fields from different host samples");
++            }
++            for (size_t i=0u;i<200u;++i) f.device.reset();
++        }
++        catch (...) { stop=true; writer.join(); throw; }
++        stop=true; writer.join(); f.device.setControllerState(0u,a);
++        require(f.exchange(poll,5u)[3]==0xF7u, "host sample channel failed after concurrent resets");
++    }
++
++    void publicApiResetAndRuntimeIsolation()
++    {
++        iop_test::Host firstHost,secondHost;
++        IopSubsystem first(firstHost),second(secondHost);
++        ControllerState firstState; firstState.connected=true; firstState.buttons=0xFFF7u;
++        ControllerState secondState; secondState.connected=true;
++        first.setControllerState(0u,firstState); second.setControllerState(0u,secondState);
++        first.reset();
++        require(executeTransfer(first,1u)[1]==0xF75A41FFu, "public host input disappeared on IOP reset");
++        require(executeTransfer(second,1u)[1]==0xFF5A41FFu, "one runtime's input leaked into another");
++        throws([&] { first.setControllerState(2u,firstState); });
++        require(iop_test::metric(first,"sio2_device","pio_transfers")==1u &&
++                    iop_test::metric(first,"sio2_device","irq_callbacks")==1u,
++                "public debug service does not report genuine bus/IRQ work");
++    }
++#endif
++}
++
++int main()
++{
++    const iop_test::Test tests[]{
++        {"authored MIPS Start through physical FIFO and original-style IRQ17", originalInstructionPathStart},
++        {"authored MIPS physical card selection returns no ACK without HLE", originalInstructionPathAbsentCard},
++#ifndef PS2X_SIO2_BASELINE_ONLY
++        {"digital press and release wire masks",digitalPressAndRelease},
++        {"one immutable host sample per transaction",transactionSamplesOnce},
++        {"configuration transaction IDs and analog mode",configurationIdsAndAnalog},
++        {"pressure mode masks and byte ordering",pressureOrderAndResponseMask},
++        {"controller capability queries and actuator mapping",configurationQueriesAndMapping},
++        {"port input and mode isolation",portsAreIndependent},
++        {"device and RAM reset preserve host samples",resetPreservesSamples},
++        {"reconnection resets only one protocol lifetime",reconnectResetsOnlyThatPad},
++        {"absent controller and physical card remain distinct",absentDevicesAndCardAreDistinct},
++        {"ACK error bits identify descriptor slots including slot15",descriptorErrorsUseQueueIndex},
++        {"failed queue preflight rolls back negotiation",queuePreflightRollsBackProtocol},
++        {"unsupported DMA/control/protocol modes stay strict",unsupportedModesStayStrict},
++        {"FIFO widths capacity and memory aliases",fifoWidthsBoundsAndAliases},
++        {"invalid TX counts and unread RX are preserved",invalidCountsAndUnreadRx},
++        {"weak device routing survives RAM staging but not device destruction",weakMemoryRouteLifetime},
++        {"IRQ live gates pending latch W1C and no duplicate COP0 path",irqMasksPendingAndW1c},
++        {"direct I_MASK reenabling owns IRQ delivery",liveMaskOverridesStaleIntrmanBookkeeping},
++        {"IRQ reentry and exception unwind",irqReentryAndFaultUnwind},
++        {"concurrent input samples and reset lifetime",concurrentHostSamplesAndReset},
++        {"public per-runtime API reset and diagnostics",publicApiResetAndRuntimeIsolation},
++#endif
++    };
++    return iop_test::run(tests);
++}
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -389,6 +389,7 @@
+     src/lib/ps2_rom_device.cpp
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
++    src/lib/ps2_controller.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+diff --git a/ps2xRuntime/include/runtime/ps2_controller.h b/ps2xRuntime/include/runtime/ps2_controller.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_controller.h
+@@ -0,0 +1,12 @@
++#pragma once
++
++#include "ps2x/iop/iop_controller.h"
++
++class PS2Runtime;
++
++namespace ps2x::iop
++{
++    // Safe to update from the host input thread while the IOP runs or resets.
++    // Device negotiation is owned by the IOP; this never writes guest pad RAM.
++    void setControllerState(PS2Runtime &runtime, uint32_t port, const ControllerState &state);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_controller.cpp b/ps2xRuntime/src/lib/ps2_controller.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_controller.cpp
+@@ -0,0 +1,15 @@
++#include "runtime/ps2_controller.h"
++#include "ps2_iop_transport.h"
++
++#include <stdexcept>
++
++namespace ps2x::iop
++{
++    void setControllerState(PS2Runtime &runtime, uint32_t port, const ControllerState &state)
++    {
++        auto *const subsystem = PS2IopTransport::subsystem(&runtime);
++        if (!subsystem)
++            throw std::logic_error("Controller input requires a live IOP subsystem");
++        subsystem->setControllerState(port, state);
++    }
++}

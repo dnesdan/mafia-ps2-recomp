@@ -7,12 +7,15 @@
 #include "mafia/verified_elf.hpp"
 #include "mafia/guest_executor.hpp"
 #include "mafia/gs_capture.hpp"
+#include "mafia/controller_input.hpp"
 #include "mafia_build_profile.hpp"
 #include "ps2_runtime.h"
 #include "ps2_host_backend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_controller.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -37,6 +40,7 @@ using Clock = std::chrono::steady_clock;
 struct Options {
     fs::path elf, iso, data_root, save_root, report, capture_frame;
     std::uint64_t timeout_ms = 10000;
+    std::vector<mafia::PadEvent> pad_events;
     bool headless = false, validate_only = false, help = false;
 };
 
@@ -56,6 +60,11 @@ Options parse_options(int argc, char **argv) {
             else if (arg == "--save-root") options.save_root = value;
             else if (arg == "--report") options.report = value;
             else if (arg == "--capture-frame") options.capture_frame = value;
+            else if (arg == "--pad-event") {
+                if (options.pad_events.size() >= 256)
+                    throw std::runtime_error("At most 256 --pad-event pulses are supported per run");
+                options.pad_events.push_back(mafia::parse_pad_event(value));
+            }
             else if (arg == "--timeout-ms") {
                 const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.timeout_ms);
                 if (error != std::errc{} || end != value.data() + value.size() || options.timeout_ms > 86400000)
@@ -64,6 +73,8 @@ Options parse_options(int argc, char **argv) {
         }
     }
     if (options.help) return options;
+    if (!options.pad_events.empty() && (!options.headless || options.validate_only))
+        throw std::runtime_error("--pad-event requires --headless guest execution");
     if (options.elf.empty()) throw std::runtime_error("Pass --elf with the original executable matching this build");
     options.elf = fs::absolute(options.elf);
     if (options.data_root.empty()) options.data_root = options.elf.parent_path();
@@ -163,6 +174,7 @@ struct Report {
     std::string iop_error;
     std::string latest_sce_open_request = "null", sce_open_request_error;
     std::string capture_status = "not-executed", capture_error, capture_sha256;
+    std::uint64_t controller_samples = 0;
     mafia::GsFrameCapture capture;
 };
 
@@ -224,6 +236,14 @@ std::string ee_json(const Report &report) {
 
 void emit_report(const Options &options, const Report &report) {
     const auto boolean = [](bool value) { return value ? "true" : "false"; };
+    std::string pad_events = "[";
+    for (const auto &event : options.pad_events) {
+        if (pad_events.size() != 1) pad_events += ", ";
+        pad_events += "{\"at_ms\": " + std::to_string(event.at_ms) +
+            ", \"duration_ms\": " + std::to_string(event.duration_ms) +
+            ", \"button_mask\": " + std::to_string(event.button) + "}";
+    }
+    pad_events += "]";
     std::string io_json = "{";
     for (const auto &[name, value] : report.io_registers) {
         if (io_json.size() != 1) io_json += ", ";
@@ -236,12 +256,30 @@ void emit_report(const Options &options, const Report &report) {
         iop_diagnostics += mafia::json_string(diagnostic);
     }
     iop_diagnostics += "]";
+    std::string iop_services = "[";
+    for (const auto &service : report.iop.services) {
+        if (iop_services.size() != 1) iop_services += ", ";
+        std::string sids = "[", metrics = "{";
+        for (const auto sid : service.sids) {
+            if (sids.size() != 1) sids += ", ";
+            sids += std::to_string(sid);
+        }
+        for (const auto &metric : service.metrics) {
+            if (metrics.size() != 1) metrics += ", ";
+            metrics += mafia::json_string(metric.name) + ": " + std::to_string(metric.value);
+        }
+        iop_services += "{\"name\": " + mafia::json_string(service.name) +
+            ", \"active\": " + boolean(service.active) + ", \"sids\": " + sids +
+            "], \"metrics\": " + metrics + "}}";
+    }
+    iop_services += "]";
     const std::string iop_json = !report.iop_metrics_available ? "null" :
         "{\n    \"cycles\": " + std::to_string(report.iop.emulatorCycles) +
         ",\n    \"instructions\": " + std::to_string(report.iop.emulatorInstructions) +
         ",\n    \"loaded_guest_modules\": " + std::to_string(report.iop.emulatorLoadedModules) +
         ",\n    \"guest_threads\": " + std::to_string(report.iop.emulatorThreads) +
         ",\n    \"guest_rpc_servers\": " + std::to_string(report.iop.emulatorRpcServers) +
+        ",\n    \"services\": " + iop_services +
         ",\n    \"diagnostics\": " + iop_diagnostics + "\n  }";
     const auto &frame = report.capture;
     const std::string capture_json = options.capture_frame.empty() ? "null" :
@@ -280,6 +318,10 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"gameplay_verified\": false,\n  \"game_frame_verified\": false" +
         ",\n  \"ffmpeg_enabled\": " + boolean(mafia::build::ffmpeg_enabled) +
         ",\n  \"presentations\": " + std::to_string(report.presentations) +
+        ",\n  \"controller_input\": {\"route\": \"iop-sio2\", \"port\": 0, \"source\": " +
+            mafia::json_string(options.headless ? "headless-timeline" : "window-backend") +
+            ", \"host_samples\": " + std::to_string(report.controller_samples) +
+            ", \"time_base\": \"host-elapsed-ms\", \"events\": " + pad_events + "}" +
         ",\n  \"dma_starts\": " + std::to_string(report.dma) +
         ",\n  \"gif_copies\": " + std::to_string(report.gif) +
         ",\n  \"gs_writes\": " + std::to_string(report.gs) +
@@ -547,6 +589,31 @@ void collect(PS2Runtime &runtime, Report &report) {
     }
     collect_sce_open_request(runtime, report);
 }
+
+void sample_controller(PS2Runtime &runtime, const Options &options,
+                       std::uint64_t elapsed_ms, Report &report) {
+    ps2x::iop::ControllerState state;
+    state.connected = true;
+    if (options.headless) {
+        state.buttons = mafia::pad_buttons_at(options.pad_events, elapsed_ms);
+    } else {
+        // Raylib input belongs to the window thread. Only a synchronized device
+        // snapshot crosses to the executor; the original PADMAN polls SIO2.
+        std::array<std::uint8_t, 32> data{};
+        if (!runtime.padBackend().readState(0, 0, data.data(), data.size()))
+            throw std::runtime_error("Cannot sample the native controller backend");
+        state.buttons = static_cast<std::uint16_t>(data[2] | (std::uint16_t{data[3]} << 8));
+        state.rightX = data[4]; state.rightY = data[5];
+        state.leftX = data[6]; state.leftY = data[7];
+    }
+    constexpr std::array<std::uint16_t, 12> pressure_masks{
+        0x0020, 0x0080, 0x0010, 0x0040, 0x1000, 0x2000,
+        0x4000, 0x8000, 0x0400, 0x0800, 0x0100, 0x0200};
+    for (std::size_t i = 0; i < pressure_masks.size(); ++i)
+        state.pressures[i] = (state.buttons & pressure_masks[i]) ? 0 : 255;
+    ps2x::iop::setControllerState(runtime, 0, state);
+    ++report.controller_samples;
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -561,8 +628,11 @@ int main(int argc, char **argv) {
             std::cout << "MafiaNative --elf PATH [--data-root PATH] [--iso PATH] [--save-root PATH]\n"
                          "  [--headless] [--validate-only] [--timeout-ms 10000] [--report PATH]\n"
                          "  [--capture-frame NEW-PATH.ppm]\n"
+                         "  [--headless --pad-event AT_MS:BUTTON:DURATION_MS ...]\n"
                          "Capture saves the unscaled GS surface after execution stops, including in headless mode.\n"
                          "No image is written if the guest did not configure a display surface.\n"
+                         "Pad events sample controller port 1 over SIO2; times are elapsed host milliseconds.\n"
+                         "Keyboard: Enter START, X/Space Cross, C Circle, arrows/WASD directions.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;
         }
@@ -609,6 +679,7 @@ int main(int argc, char **argv) {
             throw std::runtime_error("Cannot install original-entry execution observation");
         report.stage = "guest-execution";
         const auto started = Clock::now();
+        sample_controller(*runtime, options, 0, report);
         bool timeout = false, closed = false;
         {
             mafia::GuestExecutor executor(*runtime);
@@ -616,11 +687,13 @@ int main(int argc, char **argv) {
             std::exception_ptr host_error;
             try {
                 while (!executor.done() && !runtime->isStopRequested()) {
-                    if (options.timeout_ms && Clock::now() - started >= std::chrono::milliseconds(options.timeout_ms)) {
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+                    if (options.timeout_ms && elapsed >= std::chrono::milliseconds(options.timeout_ms)) {
                         timeout = true;
                         runtime->requestStop();
                         break;
                     }
+                    sample_controller(*runtime, options, static_cast<std::uint64_t>(elapsed.count()), report);
                     if (options.headless) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     } else {

@@ -122,6 +122,8 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
     check(validation["ee"] is None and validation["io_registers"] is None,
           "ELF-only validation invented EE or device execution state")
     check(validation["ee_final_context"] is None, "ELF-only validation invented a guest context")
+    check(validation["controller_input"]["host_samples"] == 0,
+          "ELF-only validation sampled a controller device")
     check(validation["symbol"] == "synthetic_entry" and validation["symbol_address"] == 0x100000
           and validation["symbol_offset"] == 0 and validation["symbol_source"] == "verified-elf"
           and validation["symbol_lookup_error"] == "", "Verified entry symbol was not resolved")
@@ -152,6 +154,21 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
           and execution["iop"]["loaded_guest_modules"] == 0
           and execution["iop"]["guest_rpc_servers"] == 0,
           "EE-only fixture incorrectly claimed IOP guest module execution")
+    check(execution["controller_input"]["route"] == "iop-sio2"
+          and execution["controller_input"]["host_samples"] >= 1
+          and execution["controller_input"]["events"] == [],
+          "Headless execution lost its neutral serial-controller source")
+    sio2 = next(service for service in execution["iop"]["services"]
+                if service["name"] == "sio2_device")
+    check(sio2["metrics"]["pio_transfers"] == 0 and sio2["metrics"]["controller_packets"] == 0,
+          "Host sampling was falsely counted as original IOP controller traffic")
+    code, pulse = run("scheduled-controller", fixture, "--pad-event", "0:start:10",
+                      "--pad-event", "5:cross:20")
+    check(code == 1 and pulse["status"] == "missing-dispatch"
+          and pulse["controller_input"]["events"] == [
+              {"at_ms": 0, "duration_ms": 10, "button_mask": 8},
+              {"at_ms": 5, "duration_ms": 20, "button_mask": 16384}],
+          "Scheduled controller input concealed the guest result or lost its reproducible timeline")
 
     capture = work / "no-surface.ppm"
     capture.unlink(missing_ok=True)
