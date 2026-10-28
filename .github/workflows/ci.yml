@@ -75,7 +75,7 @@ jobs:
             ps2_iop_alarm_tests ps2_iop_alarm_state_tests \
             ps2_iop_ioman_file_tests ps2_iop_mailbox_tests ps2_iop_ioman_devctl_tests \
             ps2_iop_cdvd_clock_tests ps2_iop_cdvd_tray_tests ps2_iop_dmacman_tests ps2_iop_modload_policy_tests \
-            ps2_iop_cdvd_memory_tests ps2_iop_cdvd_callback_tests ps2_iop_cdvd_search_tests \
+            ps2_iop_cdvd_memory_tests ps2_iop_cdvd_callback_tests ps2_iop_cdvd_search_tests ps2_iop_cdvd_ncmd_tests \
             ps2_iop_boot_image_tests ps2_iop_strict_loader_tests \
             ps2_iop_emulator_tests ps2_iop_import_tests ps2_iop_compatibility_tests \
             ps2_iop_import_version_tests ps2_iop_sio2_tests

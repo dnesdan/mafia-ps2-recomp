@@ -1,0 +1,872 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -54,6 +54,11 @@
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_cdvd_ncmd_tests tests/iop_cdvd_ncmd_tests.cpp)
++    target_link_libraries(ps2_iop_cdvd_ncmd_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_cdvd_ncmd_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_cdvd_ncmd_tests COMMAND ps2_iop_cdvd_ncmd_tests)
++
+     add_executable(ps2_iop_alarm_tests tests/iop_alarm_tests.cpp)
+     target_link_libraries(ps2_iop_alarm_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_alarm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_cdvd.h"
++#include "iop_intrman.h"
+ 
+ #include "../core/iop_cpu.h"
+ #include "../core/iop_kernel.h"
+@@ -45,6 +46,10 @@
+         constexpr uint32_t kCdvdStreamTimeout = 5000u;
+         constexpr uint32_t kCdvdSyncTimeout = 15000u;
+         constexpr uint32_t kCdvdmanVersion = 0x0226u;
++        constexpr uint32_t kCdvdIrq = 2u;
++        // Bounded modeled NCMD latency, not a claim about a mechanical drive.
++        // Completion stays asynchronous and counts on the IOP execution clock.
++        constexpr uint64_t kNcmdCompletionCycles = 128u;
+         // Capacity of the modeled CDVDMAN service's persistent FSV workspace.
+         // Public PS2SDK cdvdman.c declares g_cdvdman_fsvrbuf[42128] and returns
+         // its address from sceGetFsvRbuf. This is not an original game's address
+@@ -219,19 +224,27 @@
+             virtualIsoBuilt = false;
+             virtualIsoValid = false;
+             completionCallback.reset();
++            ncmdDeadline.reset();
++            ncmdInterruptPending = false;
++            servicingNcmd = false;
+             nodes.clear();
+             metadataSectors.clear();
+             imageHandle = 0u;
++            // Modeled CDVDMAN startup owns/enables the CDVD line once. Guest
++            // DisableIntr/direct I_MASK changes remain live until full reset.
++            memory.setInterruptMask(memory.interruptMask() | (1u << kCdvdIrq));
+         }
+ 
+         uint8_t controllerReady() const noexcept
+         {
+             // READY describes command-controller availability, not the presence
+-            // of a disc or a completed read. This model executes sector reads
+-            // synchronously and has no outstanding command between calls.
++            // of a disc or a completed read. Sector reads remain synchronous;
++            // the modeled NCMD below completes on a later IOP checkpoint.
++            // A completed NCMD may still await masked kernel IRQ delivery;
++            // controller READY and the driver's wait state are distinct.
+             // Port definitions: PS2SDK dev5_mmio_hwport.h; READY/BUSY bits:
+             // https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVD_internal.h
+-            return static_cast<uint8_t>((readActive ? kControllerBusy : kControllerReady) |
++            return static_cast<uint8_t>(((readActive || ncmdDeadline) ? kControllerBusy : kControllerReady) |
+                                         (controllerReadError ? kControllerError : 0u));
+         }
+ 
+@@ -304,7 +317,7 @@
+             return address;
+         }
+ 
+-        bool dispatchImport(uint16_t ordinal, IopCpuState &cpu)
++        bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+             const uint32_t a1 = cpu.gpr[5];
+@@ -313,6 +326,8 @@
+             switch (ordinal)
+             {
+             case 4: // sceCdInit
++                if (ncmdBusy())
++                    return false; // Reinitialization while a command waits is not modeled.
+                 initialized = a0 != kCdvdInitExit;
+                 if (initialized)
+                 {
+@@ -325,6 +340,8 @@
+                 return true;
+ 
+             case 5: // sceCdStandby
++                if (ncmdBusy())
++                    return false;
+                 controllerReadError = false;
+                 cpu.gpr[2] = 1u;
+                 return true;
+@@ -336,6 +353,11 @@
+                 // https://ps2dev.github.io/ps2sdk/cdvdman_8c_source.html (cdvdman_intr_cb)
+                 if (streamFlag != 0u)
+                     return false;
++                if (ncmdBusy())
++                {
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
+                 if (readSectors(a0, a1, a2))
+                 {
+                     signalCommandComplete();
+@@ -356,6 +378,11 @@
+             case 7: // sceCdSeek
+                 if (streamFlag != 0u)
+                     return false;
++                if (ncmdBusy())
++                {
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
+                 currentLsn = a0;
+                 lastError = kCdvdErrorNone;
+                 controllerReadError = false;
+@@ -380,6 +407,13 @@
+                 return true;
+ 
+             case 11: // sceCdSync
++                if (a0 == 1u || a0 == 17u)
++                {
++                    cpu.gpr[2] = ncmdBusy() || (a0 == 17u && streamFlag != 0u) ? 1u : 0u;
++                    return true;
++                }
++                if (ncmdBusy() || (a0 == 16u && streamFlag != 0u))
++                    return false; // Do not report an unimplemented blocking wait as completed.
+                 cpu.gpr[2] = 0u;
+                 return true;
+ 
+@@ -391,7 +425,7 @@
+                 // PS2SDK's mode 8 returns the raw controller READY byte. Other
+                 // modes retain this service's initialized-media requirement.
+                 cpu.gpr[2] = a0 == 8u ? controllerReady() :
+-                    !readActive && initialized && mediaAvailable() ? kCdvdReadyComplete : 6u;
++                    !readActive && !ncmdDeadline && initialized && mediaAvailable() ? kCdvdReadyComplete : 6u;
+                 return true;
+ 
+             case 14: // sceCdTrayReq(SCECdTrayCheck, u32 *change)
+@@ -414,11 +448,22 @@
+ 
+             case 37: // sceCdCallback
+             {
++                if (ncmdBusy())
++                {
++                    cpu.gpr[2] = 0u;
++                    return true;
++                }
+                 const uint32_t previous = callback.address;
+                 callback = {a0, cpu.gpr[28]};
+                 cpu.gpr[2] = previous;
+                 return true;
+             }
++
++            case 46: // sceCdNop: NCMD0 has no payload and no ordinary callback reason.
++                if (streamFlag == 1u)
++                    return false; // Stream0 registration/delivery remains unsupported.
++                cpu.gpr[2] = beginNop(currentCycle) ? 1u : 0u;
++                return true;
+ 
+             case 47: // sceGetFsvRbuf(void)
+                 cpu.gpr[2] = getFsvReadBuffer();
+@@ -514,7 +559,71 @@
+             return stream1Callback;
+         }
+ 
++        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
++        {
++            if (ncmdDeadline && *ncmdDeadline <= currentCycle)
++            {
++                ncmdDeadline.reset();
++                ncmdInterruptPending = true;
++            }
++            if (!ncmdInterruptPending || servicingNcmd || intrman.inInterruptContext() ||
++                memory.interruptControl() == 0u || (memory.interruptMask() & (1u << kCdvdIrq)) == 0u)
++                return;
++            // Raw CDVD command/IRQ-ack ports are not implemented. A supplied
++            // IRQ owner cannot be composed with this private driver's wait
++            // state; fail before either path runs rather than duplicate them.
++            if (intrman.hasRegisteredInterrupt(static_cast<int>(kCdvdIrq)))
++                throw std::runtime_error("IOP CDVD NCMD completion cannot replace a supplied raw IRQ2 owner");
++            if (streamFlag == 1u)
++                throw std::runtime_error("IOP CDVD NCMD completion requires unsupported stream0 delivery");
++            const int event = ensureInterruptEventFlag();
++            struct Scope
++            {
++                bool &active;
++                explicit Scope(bool &value) : active(value) { active = true; }
++                ~Scope() { active = false; }
++            } scope(servicingNcmd);
++            ncmdInterruptPending = false;
++            // The driver's wait flag/event are ready before its stream callback
++            // submits another command. Resolve the live slot/GP at delivery.
++            if (!kernel.setInternalEventFlag(event, kCdvdInterruptReadyBits))
++                throw std::runtime_error("IOP CDVD NCMD lost its live completion event");
++            const RegisteredCallback selected = streamFlag == 2u ? stream1Callback : RegisteredCallback{};
++            if (selected.address != 0u)
++                (void)intrman.executeInterruptCallback(selected.address, 1u, selected.gp, executor);
++            // Private IRQ boundary only: do not additionally assert raw I_STAT.
++            // NCMD0 cmdfunc is zero, so it never creates a user37 completion.
++        }
++
++        uint64_t nextEventCycle(uint64_t fallback) const noexcept
++        {
++            // A masked, already-pending IRQ must not spin the idle scheduler.
++            return ncmdDeadline ? std::min(fallback, *ncmdDeadline) : fallback;
++        }
++
+     private:
++        bool ncmdBusy() const noexcept
++        {
++            return ncmdDeadline.has_value() || ncmdInterruptPending;
++        }
++
++        bool beginNop(uint64_t currentCycle)
++        {
++            if (readActive || ncmdBusy())
++                return false;
++            if (currentCycle > std::numeric_limits<uint64_t>::max() - kNcmdCompletionCycles)
++                throw std::runtime_error("IOP CDVD NCMD deadline exceeds the execution clock");
++            IopCpuState clear{};
++            clear.gpr[4] = static_cast<uint32_t>(ensureInterruptEventFlag());
++            clear.gpr[5] = ~1u;
++            if (!kernel.dispatchEventImport(8u, clear) || clear.gpr[2] != 0u)
++                throw std::runtime_error("IOP CDVD NCMD could not clear its live completion event");
++            lastError = kCdvdErrorNone;
++            controllerReadError = false;
++            ncmdDeadline = currentCycle + kNcmdCompletionCycles;
++            return true;
++        }
++
+         void checkTrayChange(uint32_t destination)
+         {
+             const uint32_t segment = destination & 0xE0000000u;
+@@ -1159,6 +1268,9 @@
+         Callback callback;
+         RegisteredCallback stream1Callback;
+         std::optional<CompletionCallback> completionCallback;
++        std::optional<uint64_t> ncmdDeadline;
++        bool ncmdInterruptPending = false;
++        bool servicingNcmd = false;
+         bool initialized = false;
+         bool trayChangePending = true;
+         bool readActive = false;
+@@ -1183,6 +1295,7 @@
+         : m_impl(std::make_shared<Impl>(host, memory, kernel, std::move(clockSource)))
+     {
+         memory.bindCdvdRegisters(m_impl);
++        m_impl->reset();
+     }
+ 
+     IopCdvd::~IopCdvd() = default;
+@@ -1202,9 +1315,19 @@
+         return m_impl->interruptEventFlag();
+     }
+ 
+-    bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
++    bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+     {
+-        return m_impl->dispatchImport(ordinal, cpu);
++        return m_impl->dispatchImport(ordinal, cpu, currentCycle);
++    }
++
++    void IopCdvd::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
++    {
++        m_impl->serviceDue(currentCycle, executor, intrman);
++    }
++
++    uint64_t IopCdvd::nextEventCycle(uint64_t fallback) const noexcept
++    {
++        return m_impl->nextEventCycle(fallback);
+     }
+ 
+     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.h b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.h
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.h
+@@ -16,6 +16,8 @@
+     struct IopCpuState;
+     class IopKernel;
+     class IopMemory;
++    class IopGuestExecutor;
++    class IopIntrman;
+ 
+     class IopCdvd
+     {
+@@ -52,10 +54,12 @@
+         // The same live kernel event exposed by sceCdSC(-11). Reading its ID
+         // does not signal power-off or alter an existing event's bits.
+         [[nodiscard]] int interruptEventFlag();
+-        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle = 0u);
++        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman);
++        [[nodiscard]] uint64_t nextEventCycle(uint64_t fallback) const noexcept;
+         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;
+-        // A live registration, not a completion event. Future stream IRQ
+-        // delivery must resolve this slot then, so replacement/null/reset do
++        // A live registration, not a completion event. NCMD IRQ delivery
++        // resolves this slot then, so replacement/null/reset do
+         // not leave a captured stale function in the ordinary callback queue.
+         [[nodiscard]] RegisteredCallback registeredStream1Callback() const noexcept;
+ 
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -684,10 +684,11 @@
+             // Supplied query/setter exports own their device state. New
+             // search/stream fallbacks are limited to the compatible 1.x ABI.
+             if (iequals(call.library, "cdvdman") &&
+-                ((call.ordinal != 14u && call.ordinal != 49u && call.ordinal != 10u && call.ordinal != 84u) ||
++                ((call.ordinal != 14u && call.ordinal != 49u && call.ordinal != 10u && call.ordinal != 84u &&
++                  call.ordinal != 46u) ||
+                     (imports.resolve(call.library, call.ordinal, call.version) == 0u &&
+                      (call.ordinal == 14u || (call.version >> 8u) == 1u))) &&
+-                cdvd.dispatchImport(call.ordinal, cpu))
++                cdvd.dispatchImport(call.ordinal, cpu, totalCycles))
+             {
+                 if (const auto callback = cdvd.takeCompletionCallback())
+                 {
+@@ -916,6 +917,7 @@
+                     serviceVblankCallbacks();
+                     serviceAlarmCallbacks();
+                     serviceSio2Interrupt();
++                    serviceCdvdCommands();
+                     if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                         servicePendingDmaInterrupts();
+                     if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+@@ -1059,6 +1061,27 @@
+             sio2.serviceInterrupt(intrman, *this);
+         }
+ 
++        void serviceCdvdCommands()
++        {
++            const RestoreValue strictGuard(strictExecution, true);
++            try
++            {
++                cdvd.serviceDue(totalCycles, *this, intrman);
++            }
++            catch (const std::exception &error)
++            {
++                // Retain ownership/device faults even from an idle checkpoint,
++                // before runCycles' non-throwing outer boundary unwinds.
++                rememberExecutionFailure(std::string("Strict IOP CDVD completion: ") + error.what());
++                throw;
++            }
++            catch (...)
++            {
++                rememberExecutionFailure("Strict IOP CDVD completion: unknown callback exception");
++                throw;
++            }
++        }
++
+         // Not that good to use exception handling for control flow but will do for now
+         void servicePendingDmaInterrupts()
+         {
+@@ -1144,6 +1167,7 @@
+                     serviceVblankCallbacks();
+                     serviceAlarmCallbacks();
+                     serviceSio2Interrupt();
++                    serviceCdvdCommands();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this, intrman);
+@@ -1162,6 +1186,7 @@
+                         nextWake = timrman.nextEventCycle(nextWake);
+                         nextWake = alarms.nextEventCycle(totalCycles, nextWake);
+                         nextWake = vblank.nextEventCycle(nextWake);
++                        nextWake = cdvd.nextEventCycle(nextWake);
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+                     }
+@@ -1565,7 +1590,7 @@
+         checkExecutionFailure();
+         IopCpuState cpu{};
+         cpu.gpr[4] = a0;
+-        if (!m_impl->cdvd.dispatchImport(ordinal, cpu))
++        if (!m_impl->cdvd.dispatchImport(ordinal, cpu, m_impl->totalCycles))
+             throw std::runtime_error("Unsupported IOP CDVD import " + std::to_string(ordinal));
+         return cpu.gpr[2];
+     }
+diff --git a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+@@ -0,0 +1,486 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_cdvd.h"
++#include "emulator/imports/iop_intrman.h"
++#include "emulator/services/iop_rpc.h"
++#include "iop_vblank_fixtures.h"
++
++#include <functional>
++#include <limits>
++
++namespace
++{
++    using namespace ps2x::iop;
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++
++    class NoIoHost final : public IopHost
++    {
++    public:
++        mutable size_t accesses = 0u;
++        bool readGuest(uint32_t, void *, size_t) const override { ++accesses; return false; }
++        bool writeGuest(uint32_t, const void *, size_t) override { ++accesses; return false; }
++        bool zeroGuest(uint32_t, size_t) override { ++accesses; return false; }
++        bool normalizeGuestAddress(uint32_t, uint32_t &) const override { ++accesses; return false; }
++        uint32_t allocateIopHandle(IopHandleKind) override { ++accesses; return 1u; }
++        uint32_t allocateGuest(uint32_t, uint32_t) override { ++accesses; return 0u; }
++        void freeGuest(uint32_t) override { ++accesses; }
++        void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override { ++accesses; }
++        std::string hostPath(HostPathKind) const override { ++accesses; return {}; }
++        std::string translateGuestPath(std::string_view) const override { ++accesses; return {}; }
++        uint64_t openHostFile(std::string_view) override { ++accesses; return 0u; }
++        bool hostFileSize(uint64_t, uint64_t &) const override { ++accesses; return false; }
++        bool readHostFile(uint64_t, uint64_t, void *, size_t, size_t &) override { ++accesses; return false; }
++        void closeHostFile(uint64_t) override { ++accesses; }
++        int32_t memoryCard(const MemoryCardRequest &) override { ++accesses; return 0; }
++        bool hasGuestFunction(uint32_t) const override { ++accesses; return false; }
++        bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override
++        { ++accesses; return false; }
++        void log(LogLevel, std::string_view) override {}
++    };
++
++    // The same authored tests compile against the preceding implementation,
++    // where ordinal46 is unresolved and there is no asynchronous NCMD API.
++    template <typename Device> bool dispatch(Device &device, uint16_t ordinal, IopCpuState &cpu, uint64_t now)
++    {
++        if constexpr (requires { device.dispatchImport(ordinal, cpu, now); })
++            return device.dispatchImport(ordinal, cpu, now);
++        else
++            return device.dispatchImport(ordinal, cpu);
++    }
++    template <typename Device> void service(Device &device, uint64_t now, IopGuestExecutor &executor, IopIntrman &intrman)
++    {
++        if constexpr (requires { device.serviceDue(now, executor, intrman); })
++            device.serviceDue(now, executor, intrman);
++    }
++    template <typename Device> uint64_t next(const Device &device, uint64_t fallback)
++    {
++        if constexpr (requires { device.nextEventCycle(fallback); })
++            return device.nextEventCycle(fallback);
++        else
++            return fallback;
++    }
++
++    struct Call { uint32_t function, argument, gp; bool interrupt; };
++    struct Executor final : IopGuestExecutor
++    {
++        IopIntrman &intrman;
++        std::vector<Call> calls;
++        std::function<void(const Call &)> action;
++        explicit Executor(IopIntrman &value) : intrman(value) {}
++        uint32_t executeGuestFunction(uint32_t function, uint32_t a0, uint32_t, uint32_t, uint32_t, uint32_t gp) override
++        {
++            const Call call{function, a0, gp, intrman.inInterruptContext()};
++            calls.push_back(call);
++            if (action) action(call);
++            return 0u;
++        }
++    };
++    struct Fixture
++    {
++        NoIoHost host;
++        IopMemory memory;
++        IopKernel kernel{memory};
++        IopIntrman intrman{memory};
++        IopCdvd cdvd{host, memory, kernel};
++        Executor executor{intrman};
++        uint64_t now = 100u;
++
++        uint32_t call(uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u, uint32_t a2 = 0u, uint32_t gp = 0u)
++        {
++            IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu;
++            cpu.gpr[4] = a0; cpu.gpr[5] = a1; cpu.gpr[6] = a2; cpu.gpr[7] = 0xFFFFFFFFu; cpu.gpr[28] = gp;
++            require(dispatch(cdvd, ordinal, cpu, now), "authored CDVD NCMD import unresolved");
++            return cpu.gpr[2];
++        }
++        uint64_t deadline()
++        {
++            const uint64_t value = next(cdvd, std::numeric_limits<uint64_t>::max());
++            require(value > now && value < std::numeric_limits<uint64_t>::max(), "accepted NCMD has no future completion deadline");
++            return value;
++        }
++        void due(uint64_t value) { now = value; service(cdvd, value, executor, intrman); }
++        void stream(uint32_t address = 0x10000u, uint32_t gp = 0x12345678u)
++        { require(call(49u, address, 0u, 0u, gp) == 0u && call(50u, 2u) == 2u, "stream registration setup failed"); }
++        int32_t poll(uint32_t bits)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = static_cast<uint32_t>(cdvd.interruptEventFlag()); cpu.gpr[5] = bits;
++            require(kernel.dispatchEventImport(11u, cpu), "CDVD completion event poll unresolved");
++            return static_cast<int32_t>(cpu.gpr[2]);
++        }
++        void intr(uint16_t ordinal, uint32_t a0 = 0u, uint32_t a1 = 0u, uint32_t a2 = 0u)
++        {
++            IopCpuState cpu{}; cpu.gpr[4] = a0; cpu.gpr[5] = a1; cpu.gpr[6] = a2;
++            require(intrman.dispatchImport(ordinal, cpu, executor), "authored intrman setup unresolved");
++        }
++    };
++    void rejects(const std::function<void()> &body, std::string_view expected)
++    {
++        try { body(); }
++        catch (const std::runtime_error &error)
++        {
++            require(std::string_view(error.what()).find(expected) != std::string_view::npos,
++                    "NCMD strict failure lost its concrete cause");
++            return;
++        }
++        throw std::runtime_error("unsupported NCMD operation silently succeeded");
++    }
++
++    void acceptanceHasNoPayloadAndCompletionIsDeferred()
++    {
++        Fixture f;
++        require((f.memory.interruptMask() & 4u) != 0u && f.poll(0x29u) == 0,
++                "modeled CDVD startup did not provide its IRQ line and ready event");
++        require(f.call(37u, 0x18000u, 0u, 0u, 0xABCDEF01u) == 0u, "ordinary user registration failed");
++        f.memory.write32(0x2000u, 0x12u); require(f.call(50u, uint32_t(-2), 0x2000u) == 0x12u, "error seed failed");
++        const std::vector<uint8_t> ram(f.memory.ram().begin(), f.memory.ram().end());
++        require(f.call(46u, 0xFFFFFFFFu, 0x1F808260u, 0xFFFFFFFFu) == 1u && f.call(8u) == 0u,
++                "accepted Nop did not clear the command error or dereferenced unused arguments");
++        const uint64_t due = f.deadline();
++        require(f.poll(1u) == -418 && f.poll(0x28u) == 0 && f.call(11u, 1u) == 1u &&
++                    f.call(11u, 17u) == 1u && (f.call(13u, 8u) & 0xC0u) == 0x80u &&
++                    f.executor.calls.empty() && !f.cdvd.takeCompletionCallback(),
++                "Nop reported completion or queued the ordinary user callback at acceptance");
++        f.due(due - 1u); require(f.call(11u, 1u) == 1u, "Nop completed before its IOP deadline");
++        f.due(due); f.due(due + 1000u);
++        require(f.poll(0x29u) == 0 && f.call(11u, 1u) == 0u && f.call(11u, 17u) == 0u &&
++                    (f.call(13u, 8u) & 0xC0u) == 0x40u && f.executor.calls.empty() &&
++                    !f.cdvd.takeCompletionCallback() && f.call(37u, 0u) == 0x18000u,
++                "NCMD0 completion fabricated a user reason or failed to restore driver/controller readiness");
++        require(f.host.accesses == 0u && f.memory.interruptStatus() == 0u && !f.memory.takeDmaStart() &&
++                    std::equal(ram.begin(), ram.end(), f.memory.ram().begin()),
++                "Nop performed payload I/O, raw IRQ assertion, DMA or a guest-memory write");
++        require(f.call(37u, 0x19000u, 0u, 0u, 0x11223344u) == 0u && f.call(7u, 5u) == 1u &&
++                    f.call(46u) == 1u, "pending normal-completion control failed");
++        const auto ordinary = f.cdvd.takeCompletionCallback();
++        require(ordinary && ordinary->address == 0x19000u && ordinary->gp == 0x11223344u && ordinary->reason == 4u,
++                "Nop acceptance consumed or replaced an already pending ordinary seek completion");
++        f.due(f.deadline());
++        require(!f.cdvd.takeCompletionCallback() && f.executor.calls.empty(),
++                "finishing Nop duplicated the preceding ordinary completion");
++    }
++
++    void busyAndBlockingQueriesCannotFabricateCompletion()
++    {
++        Fixture f; require(f.call(37u, 0x18000u) == 0u && f.call(46u) == 1u, "busy setup failed");
++        const uint64_t due = f.deadline();
++        require(f.call(46u) == 0u && next(f.cdvd, due + 100u) == due &&
++                    f.call(37u, 0x19000u) == 0u && f.call(6u, 0u, 1u, 0xFFFFFFFFu) == 0u &&
++                    f.call(7u, 0x123u) == 0u,
++                "busy commands replaced the active deadline, user callback or issued a read");
++        for (const auto [ordinal, a0] : {std::pair<uint16_t, uint32_t>{11u, 0u}, {11u, 16u}, {4u, 1u}, {5u, 0u}})
++        {
++            IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu; cpu.gpr[4] = a0;
++            require(!dispatch(f.cdvd, ordinal, cpu, f.now) && cpu.gpr[2] == 0xDEADBEEFu,
++                    "unimplemented blocking wait/reinitialization claimed success while NCMD remained pending");
++        }
++        require(f.poll(1u) == -418 && f.host.accesses == 0u, "busy refusal signaled the event or touched the host");
++        f.due(due);
++        require(f.call(37u, 0u) == 0x18000u && f.call(11u, 0u) == 0u && f.call(46u) == 1u,
++                "completion did not release the next command or preserve the old user callback");
++    }
++
++    void completionUsesCurrentStreamSlotAndMode()
++    {
++        for (unsigned change = 0u; change < 4u; ++change)
++        {
++            Fixture f; f.stream(); require(f.call(46u) == 1u, "live-slot setup failed");
++            const uint64_t due = f.deadline();
++            if (change == 0u) require(f.call(49u, 0x12000u, 0u, 0u, 0xAABBCCDDu) == 0u, "replace failed");
++            if (change == 1u) require(f.call(49u, 0u) == 0u, "unregister failed");
++            if (change == 2u) require(f.call(50u, 0u) == 0u, "stream stop failed");
++            if (change == 3u)
++            {
++                require(f.call(50u, 1u) == 1u, "unsupported stream0 setup failed");
++                rejects([&] { f.due(due); }, "unsupported stream0 delivery");
++                require(f.executor.calls.empty() && f.call(11u, 1u) == 1u && f.poll(1u) == -418,
++                        "unsupported live mode was silently completed");
++                require(f.call(50u, 2u) == 2u, "restore live mode failed");
++            }
++            f.due(due); f.due(due + 1000u);
++            const size_t expected = change == 0u || change == 3u ? 1u : 0u;
++            require(f.executor.calls.size() == expected && f.call(11u, 1u) == 0u,
++                    "replacement/null/SC0 did not control the current completion");
++            if (expected)
++                require(f.executor.calls[0].function == (change == 0u ? 0x12000u : 0x10000u) &&
++                            f.executor.calls[0].gp == (change == 0u ? 0xAABBCCDDu : 0x12345678u) &&
++                            f.executor.calls[0].argument == 1u && f.executor.calls[0].interrupt &&
++                            !f.intrman.inInterruptContext(), "stream callback lost its argument, saved GP or interrupt scope");
++            require(f.call(11u, 17u) == (change == 2u ? 0u : 1u), "Sync17 ignored the still-selected stream mode");
++        }
++    }
++
++    void maskedCompletionRetainsDriverWaitButNotHardwareBusy()
++    {
++        for (unsigned gates = 1u; gates < 4u; ++gates)
++        {
++            Fixture f; f.stream();
++            if (gates & 1u) f.intr(8u);
++            if (gates & 2u) f.intr(7u, 2u);
++            require(f.call(46u) == 1u, "masked acceptance failed");
++            const uint64_t due = f.deadline(); f.due(due + 1000u);
++            require(f.executor.calls.empty() && f.call(11u, 1u) == 1u && f.poll(1u) == -418 &&
++                        (f.call(13u, 8u) & 0xC0u) == 0x40u && next(f.cdvd, due + 2000u) == due + 2000u,
++                    "masked pending completion was lost, reported as driver-ready or retained a past idle deadline");
++            f.memory.write32(0xBF801074u, f.memory.interruptMask() | 4u); // No EnableIntr bookkeeping.
++            if (gates & 1u)
++            {
++                f.due(due + 1001u); require(f.executor.calls.empty(), "I_MASK bypassed suspended CPU interrupts");
++                f.intr(18u, 1u);
++            }
++            f.due(due + 1002u); f.due(due + 1003u);
++            require(f.executor.calls.size() == 1u && f.call(11u, 1u) == 0u && f.memory.interruptStatus() == 0u,
++                    "live direct-mask/resume gates did not deliver exactly one private completion");
++        }
++    }
++
++    void callbackCanSubmitNextCommandWithoutRecursiveDelivery()
++    {
++        Fixture f; f.stream(); require(f.call(46u) == 1u, "resubmission setup failed");
++        const uint64_t first = f.deadline(); uint64_t second = 0u;
++        f.executor.action = [&](const Call &)
++        {
++            require(f.call(11u, 1u) == 0u && f.poll(0x29u) == 0,
++                    "driver wait/event were not completed before original stream code ran");
++            if (f.executor.calls.size() == 1u)
++            {
++                require(f.call(49u, 0x12000u, 0u, 0u, 0x55556666u) == 0u && f.call(46u) == 1u,
++                        "original stream callback could not submit its successor");
++                second = f.deadline(); f.due(second + 1000u);
++                require(f.executor.calls.size() == 1u && f.call(11u, 1u) == 1u,
++                        "a nested executor checkpoint recursively dispatched the next completion");
++            }
++        };
++        f.due(first); f.due(second + 1001u);
++        require(f.executor.calls.size() == 2u && f.executor.calls[1].function == 0x12000u &&
++                    f.executor.calls[1].gp == 0x55556666u && f.call(11u, 1u) == 0u,
++                "deferred successor lost its current registration or completed more than once");
++    }
++
++    void resetAndCallbackExceptionsDoNotRetainOldCommands()
++    {
++        Fixture f, other; f.stream(); other.stream(0x13000u, 0xBEEFu);
++        require(f.call(46u) == 1u && other.call(46u) == 1u, "per-instance setup failed");
++        const uint64_t due = f.deadline();
++        f.memory.setInterruptMask(f.memory.interruptMask() & ~4u);
++        f.due(due); f.cdvd.reset(); f.due(due + 100u); other.due(due);
++        require(f.executor.calls.empty() && other.executor.calls.size() == 1u &&
++                    f.cdvd.registeredStream1Callback().address == 0u && f.call(11u, 1u) == 0u &&
++                    (f.memory.interruptMask() & 4u) != 0u,
++                "reset retained a masked pending callback or affected another device instance");
++        f.stream(); require(f.call(46u) == 1u, "post-reset setup failed");
++        f.executor.action = [](const Call &) { throw std::runtime_error("authored NCMD callback fault"); };
++        rejects([&] { f.due(f.deadline()); }, "authored NCMD callback fault");
++        require(!f.intrman.inInterruptContext(), "callback exception leaked interrupt scope");
++        f.executor.action = {}; require(f.call(46u) == 1u, "callback exception leaked reentrancy state");
++        f.due(f.deadline()); require(f.executor.calls.size() == 2u, "a later valid direct-device command was lost");
++    }
++
++    void rawIrqOwnerAndDeletedEventFailBeforeEitherCallback()
++    {
++        for (const bool masked : {false, true})
++        {
++            Fixture f; f.stream(); f.intr(4u, 2u, 1u, 0x14000u);
++            if (masked) f.intr(7u, 2u);
++            require(f.call(46u) == 1u, "raw-owner setup failed"); const uint64_t due = f.deadline();
++            if (masked)
++            {
++                f.due(due); require(f.executor.calls.empty(), "disabled raw owner was invoked");
++                f.memory.setInterruptMask(f.memory.interruptMask() | 4u);
++            }
++            rejects([&] { f.due(due); }, "supplied raw IRQ2 owner");
++            require(f.executor.calls.empty() && f.poll(1u) == -418 && f.call(11u, 1u) == 1u,
++                    "ownership failure executed one path or silently released driver wait");
++        }
++        Fixture f; f.stream(); require(f.call(46u) == 1u, "deleted-event setup failed");
++        const uint64_t due = f.deadline();
++        IopCpuState erased{}; erased.gpr[4] = static_cast<uint32_t>(f.cdvd.interruptEventFlag());
++        require(f.kernel.dispatchEventImport(5u, erased) && erased.gpr[2] == 0u, "could not delete authored event");
++        rejects([&] { f.due(due); }, "event flag was deleted");
++        require(f.executor.calls.empty() && f.call(11u, 1u) == 1u, "deleted event allowed stale completion");
++    }
++
++    void unsupportedReadsAndClockOverflowRemainStrict()
++    {
++        Fixture f; f.stream();
++        for (uint16_t ordinal : {6u, 7u, 48u, 62u, 63u, 114u})
++        {
++            IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu; cpu.gpr[4] = 0xFFFFFFFFu;
++            require(!dispatch(f.cdvd, ordinal, cpu, f.now) && cpu.gpr[2] == 0xDEADBEEFu,
++                    "Nop support accidentally modeled an unsupported stream operation");
++        }
++        require(f.call(50u, 1u) == 1u, "stream0 selection failed");
++        IopCpuState cpu{}; cpu.gpr[2] = 0xDEADBEEFu;
++        require(!dispatch(f.cdvd, 46u, cpu, f.now) && cpu.gpr[2] == 0xDEADBEEFu,
++                "unsupported stream0 Nop lost its strict boundary");
++        require(f.call(50u, 0u) == 0u && f.poll(0x29u) == 0, "overflow fixture setup failed");
++        f.now = std::numeric_limits<uint64_t>::max();
++        rejects([&] { (void)f.call(46u); }, "deadline exceeds the execution clock");
++        require(f.poll(0x29u) == 0 && f.call(11u, 1u) == 0u && f.host.accesses == 0u,
++                "overflow changed driver/event state or performed I/O");
++    }
++
++    struct NcmdProgram : iop_vblank_test::Program
++    {
++        explicit NcmdProgram(uint32_t address = 0x10000u) : Program(address)
++        {
++            imports(0x1000u, "cdvdman", {46u, 49u, 50u, 11u, 37u, 114u});
++            imports(0x1300u, "thbase", {35u, 36u, 37u, 38u});
++            image.words(0x2020u, {5000u, 0u});
++        }
++        void cd(uint32_t index, uint32_t a0 = 0u, uint32_t a1 = 0u, uint32_t a2 = 0u)
++        { constant(4u, a0); constant(5u, a1); constant(6u, a2); call(stub(0x1000u, index)); }
++        void stream(uint32_t callback = 0x800u, uint32_t gp = 0x12345678u)
++        { constant(28u, gp); cd(1u, base + callback); cd(2u, 2u); }
++        void marker(uint32_t value, uint32_t address) { constant(8u, value); store(8u, address); }
++    };
++    using iop_vblank_test::advance;
++    using iop_vblank_test::start;
++    using iop_vblank_test::word;
++
++    void originalInstructionsObserveDeferredInterruptCompletion()
++    {
++        iop_test::Host host; IopEmulator iop(host); NcmdProgram p;
++        p.begin(); p.cd(4u, p.base + 0xA00u); p.stream(); p.constant(28u, 0x87654321u);
++        p.cd(0u, 0xFFFFFFFFu, 0x1F808260u, 0xFFFFFFFFu); p.store(2u, p.data(0x40u));
++        p.cd(3u, 1u); p.store(2u, p.data(0x44u)); p.store(28u, p.data(0x48u)); p.finish();
++        p.recordingHandler(0x800u, 0u);
++        p.begin(0xA00u); p.marker(1u, p.data(0x60u)); p.finish();
++        start(iop, p);
++        require(word(iop, p.data()) == 0u && word(iop, p.data(0x40u)) == 1u &&
++                    word(iop, p.data(0x44u)) == 1u && word(iop, p.data(0x48u)) == 0x87654321u,
++                "original Nop/Sync imports completed synchronously or changed caller GP");
++        advance(iop, 10000u); advance(iop, 10000u);
++        require(word(iop, p.data()) == 1u && word(iop, p.data(0x100u)) == 1u &&
++                    word(iop, p.data(0x104u)) == 0x12345678u && word(iop, p.data(0x108u)) == 1u &&
++                    word(iop, p.data(0x60u)) == 0u && host.guestWrites == 0u,
++                "original stream callback did not receive one IRQ-scoped call or Nop fabricated a user callback");
++    }
++
++    void runningThreadReceivesNcmdAndKeepsItsContinuation()
++    {
++        iop_test::Host host; IopEmulator iop(host); NcmdProgram p;
++        p.image.words(0x2500u, {0x02000000u, 0u, p.base + 0x600u, 0x800u, 40u});
++        p.begin(); p.constant(4u, p.data(0x500u)); p.call(p.stub(0x1200u));
++        p.move(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1200u, 1u)); p.finish();
++        p.begin(0x600u); p.stream(0x900u); p.cd(0u);
++        const uint32_t loop = p.cursor;
++        p.load(8u, p.data(0x60u)); p.emit(0x25080001u); p.store(8u, p.data(0x60u));
++        p.load(9u, p.data(0x64u));
++        const int32_t relative = (static_cast<int32_t>(loop) - static_cast<int32_t>(p.cursor + 4u)) / 4;
++        p.emit(0x11200000u | static_cast<uint16_t>(relative)); p.emit(0u);
++        p.marker(0xC001CAFEu, p.data(0x68u)); p.finish();
++        p.begin(0x900u); p.marker(1u, p.data(0x64u)); p.finish();
++        start(iop, p); advance(iop, 10000u);
++        require(word(iop, p.data(0x60u)) > 0u && word(iop, p.data(0x64u)) == 1u &&
++                    word(iop, p.data(0x68u)) == 0xC001CAFEu,
++                "NCMD was only serviced while idle or lost the suspended worker continuation");
++    }
++
++    void realMaskResumeAndResetControlPendingNcmd()
++    {
++        for (const bool reset : {false, true})
++        {
++            iop_test::Host host; IopEmulator iop(host); NcmdProgram p;
++            p.begin(); p.constant(4u, p.data(0x70u)); p.call(p.stub(0x1100u));
++            p.constant(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1100u, 4u));
++            p.stream(); p.cd(0u); p.finish(); p.recordingHandler(0x800u, 0u);
++            start(iop, p); advance(iop, 10000u);
++            require(word(iop, p.data()) == 0u, "masked original callback ran before resume");
++            if (reset)
++            {
++                iop.reset(); NcmdProgram empty; empty.begin(); empty.finish(); start(iop, empty);
++                advance(iop, 10000u); require(word(iop, empty.data()) == 0u, "full IOP reset retained old NCMD/registration");
++            }
++            else
++            {
++                NcmdProgram resume(0x20000u); resume.begin();
++                resume.load(8u, 0xBF801074u); resume.emit(0x35080004u); resume.store(8u, 0xBF801074u);
++                resume.constant(4u, 1u); resume.call(resume.stub(0x1100u, 1u)); resume.finish();
++                start(iop, resume); advance(iop, 1000u);
++                require(word(iop, p.data()) == 1u, "real direct I_MASK/CpuResumeIntr did not deliver retained completion");
++            }
++        }
++    }
++
++    void streamCallbackCanUseTheRealAlarmService()
++    {
++        iop_test::Host host; IopEmulator iop(host); NcmdProgram p;
++        p.begin(); p.stream(); p.cd(0u); p.store(2u, p.data(0x40u));
++        p.constant(4u, p.data(0x20u)); p.constant(5u, p.base + 0xB00u); p.constant(6u, 7u);
++        p.call(p.stub(0x1300u)); p.store(2u, p.data(0x44u)); p.finish();
++        p.begin(0x800u);
++        p.constant(4u, p.base + 0xB00u); p.constant(5u, 7u); p.call(p.stub(0x1300u, 3u));
++        p.store(2u, p.data(0x48u));
++        p.constant(4u, p.data(0x20u)); p.constant(5u, p.base + 0xC00u); p.constant(6u, 8u);
++        p.call(p.stub(0x1300u, 1u)); p.store(2u, p.data(0x4Cu));
++        p.marker(1u, p.data(0x50u)); p.finish();
++        p.begin(0xB00u); p.marker(1u, p.data(0x54u)); p.finish();
++        p.begin(0xC00u); p.marker(1u, p.data(0x58u)); p.finish();
++        start(iop, p); advance(iop, 15000u);
++        require(word(iop, p.data(0x40u)) == 1u && word(iop, p.data(0x44u)) == 0u &&
++                    word(iop, p.data(0x48u)) == 0u && word(iop, p.data(0x4Cu)) == 0u &&
++                    word(iop, p.data(0x50u)) == 1u && word(iop, p.data(0x54u)) == 0u &&
++                    word(iop, p.data(0x58u)) == 1u,
++                "deferred original stream code could not cancel its post-Nop timeout and set an interrupt-context alarm");
++    }
++
++    void suppliedNopExportsAndVersionRulesRemainAuthoritative()
++    {
++        for (const auto [provided, requested] : {std::pair<uint32_t, uint32_t>{0x0101u, 0x0101u},
++                                                {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++        {
++            iop_test::Host host; IopEmulator iop(host); NcmdProgram p;
++            p.image.words(0x1008u, {requested});
++            p.image.words(0x1800u, {0x41C00000u, 0u, provided, 0x64766463u, 0x006E616Du});
++            for (uint32_t slot = 0u; slot <= 46u; ++slot) p.image.words(0x1814u + slot * 4u, {p.base + 0x900u});
++            p.begin(); p.constant(4u, p.base + 0x1800u); p.call(p.stub(0x1500u));
++            p.cd(0u, 0xFFFFFFFFu, 0x1F808260u, 0xFFFFFFFFu); p.store(2u, p.data(0x40u)); p.finish();
++            p.begin(0x900u); p.marker(0xABCDEF01u, p.data()); p.finish(0x5A3u);
++            start(iop, p); advance(iop, 10000u);
++            require(word(iop, p.data()) == 0xABCDEF01u && word(iop, p.data(0x40u)) == 0x5A3u,
++                    "modeled Nop shadowed the actual compatible provider");
++        }
++        iop_test::Host host; IopEmulator iop(host); NcmdProgram missing;
++        missing.image.words(0x1008u, {0x0201u}); missing.begin(); missing.cd(0u); missing.finish();
++        rejects([&] { start(iop, missing); }, "missing import cdvdman:46");
++    }
++
++    void originalStreamReadFaultRemainsStickyAfterNop()
++    {
++        iop_test::Host host; IopEmulator iop(host); NcmdProgram p;
++        p.begin(); p.stream(); p.cd(0u); p.store(2u, p.data(0x40u)); p.finish();
++        p.begin(0x800u); p.cd(5u, 0u, 1u, p.data(0x500u)); p.marker(1u, p.data()); p.finish();
++        start(iop, p);
++        rejects([&] { advance(iop, 10000u); }, "missing import cdvdman:114");
++        const uint64_t instructions = iop.instructions(); iop.runEeCycles(80000u);
++        rejects([&] { iop.checkExecutionFailure(); }, "missing import cdvdman:114");
++        require(word(iop, p.data(0x40u)) == 1u && word(iop, p.data()) == 0u &&
++                    iop.instructions() == instructions && host.guestWrites == 0u,
++                "Nop fabricated stream data, swallowed the next strict gap or continued after callback failure");
++        iop.reset(); NcmdProgram clean; clean.begin(); clean.finish(); start(iop, clean); advance(iop, 10000u);
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Nop has no payload or user reason and completes only at a later IOP deadline", acceptanceHasNoPayloadAndCompletionIsDeferred},
++        {"Busy commands and unimplemented blocking waits preserve the pending command", busyAndBlockingQueriesCannotFabricateCompletion},
++        {"Completion resolves the current stream callback, GP and SC mode", completionUsesCurrentStreamSlotAndMode},
++        {"CPU and live IRQ masks retain driver wait without spinning idle deadlines", maskedCompletionRetainsDriverWaitButNotHardwareBusy},
++        {"Original stream callback can submit a successor without recursive completion", callbackCanSubmitNextCommandWithoutRecursiveDelivery},
++        {"Reset, per-device lifetime and callback exceptions preserve command ownership", resetAndCallbackExceptionsDoNotRetainOldCommands},
++        {"Raw IRQ replacement and deleted completion events fail before dispatch", rawIrqOwnerAndDeletedEventFailBeforeEitherCallback},
++        {"Unsupported stream reads, stream0 and overflowing deadlines remain strict", unsupportedReadsAndClockOverflowRemainStrict},
++        {"Authored original imports and callback observe asynchronous IRQ context", originalInstructionsObserveDeferredInterruptCompletion},
++        {"A running IOP thread receives Nop completion and resumes its own code", runningThreadReceivesNcmdAndKeepsItsContinuation},
++        {"Authored mask/resume and full IOP reset control the pending completion", realMaskResumeAndResetControlPendingNcmd},
++        {"Original stream callback cancels timeout and registers an interrupt alarm", streamCallbackCanUseTheRealAlarmService},
++        {"Supplied Nop exports retain compatible-provider and major-version precedence", suppliedNopExportsAndVersionRulesRemainAuthoritative},
++        {"Original later stream read reaches its own sticky strict boundary", originalStreamReadFaultRemainsStickyAfterNop},
++    };
++    return iop_test::run(tests);
++}
