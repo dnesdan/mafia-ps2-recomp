@@ -2,15 +2,17 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original frontend graphics and input work in a Linux window; main menu and gameplay remain unverified.** The complete translated program loads the original ELF, executes its startup and IOP service modules, and renders the original autosave caution screen and no-card dialog. In fresh runs, keyboard input travels through the original SIO2MAN and PADMAN modules: Cross dismisses the caution, Up selects Yes, and Cross confirms continuation without a memory card. The program then initializes the original streaming driver, receives the correct video-file location and size in EE memory, and enters stream start. The current stop is the original driver's `sceCdNop` command submission. Source, host and runtime regression tests also pass on ARM64 macOS through patch 0031; the complete original game corpus has not been run there. Read [the verified progress report](docs/PROGRESS.md) for execution evidence and remaining work.
+**Status: original frontend graphics and input verified on Linux; main menu and gameplay remain unverified.** The last recorded original-game run, through patch 0039, rendered the autosave caution and no-card dialog, consumed keyboard input through the original SIO2MAN/PADMAN drivers, and reached movie initialization with the correct video-file location and size in EE memory.
+
+Subsequent patches implement kernel alarms, deferred `sceCdNop` completion and owned asynchronous stream1 sector reads through `sceCdRE`. Patch 0043 passes all twenty IOP test programs locally with GCC, optimized Clang, and ASan/UBSan; these are constructed-input tests, not a new original-game run. The full Linux/macOS CI matrix passed through patch 0042. The original-game workspace is currently unavailable, so the newer streaming path still needs integration verification. Read [the progress report](docs/PROGRESS.md) for exact evidence and remaining limits.
 
 ![Original Mafia no-card dialog with Yes selected through the original controller drivers on Linux](docs/screenshots/mafia-linux-no-card.png)
 
-Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This patch-0035 window run reached the original no-card dialog, selected Yes through real keyboard input and closed cleanly after saving the frame. It documents the working dialog and selection; main-menu entry remains unverified. The earlier autosave and Gathering captures are retained in the progress report.
+Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This patch-0035 window run reached the original no-card dialog, selected Yes through real keyboard input and closed cleanly after saving the frame. It documents the working dialog and selection; main-menu entry remains unverified. No newer screenshot is claimed.
 
 ## Build from your own disc
 
-Requires Python 3.11+, CMake 3.24+, Git, a C++20 compiler and FFmpeg development libraries. The verified Linux host is x86-64; the Linux scripts also accept ARM64, which has not yet been exercised with the original game.
+Requires Python 3.11+, CMake 3.24+, Git, a C++20 compiler and FFmpeg development libraries. The verified original-game host is Linux x86-64; the Linux scripts also accept ARM64, which has not yet been exercised with the original game.
 
 On Ubuntu 24.04:
 
@@ -72,7 +74,7 @@ bash tools/test.sh
 
 `tools/recompile.sh` supports `--elf`, `--work`, `--upstream`, `--tools-build` and an optional external `--function-map`. By default it exports the retained function symbols plus reviewed boot-code boundaries. It uses PS2Recomp's CSV format without claiming that Ghidra was run. For a stripped executable, obtain reviewed boundaries with upstream's `ps2xRecomp/tools/ghidra/ExportPS2Functions.java` and create an exact build profile first.
 
-CI runs source-only Python/C++ tests and synthetic runtime contracts on Linux and ARM64 macOS. Its separate `MafiaHostContract.app` compiles the real native host with an authored test ELF and checks ARM64 architecture, bundle metadata, input verification and entry dispatch. It never downloads or uploads commercial fixtures. Game milestones require separate evidence from the original program.
+CI runs source-only Python/C++ tests, native-host contracts, the upstream runtime suite, all twenty IOP test programs and emitted-integer UBSan checks on Linux and ARM64 macOS. `MafiaHostContract.app` compiles the real native host with an authored test ELF; it is not a game build. CI retains verified public IOP sources and test logs for seven days. It never downloads or uploads commercial fixtures. Game milestones require separate evidence from the original program.
 
 ## Design and license
 

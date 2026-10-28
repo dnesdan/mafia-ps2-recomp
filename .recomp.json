@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "original-frontend-input-movie-initialization-in-progress",
+    "stage": "streaming-service-tests-passed-original-game-revalidation-pending",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -23,12 +23,19 @@
     "game_initialization_complete": false,
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
-      "subsystem": "CDVD command submission during original streaming start",
-      "status": "strict-missing-operation",
-      "original_stage": "Original video-file metadata reached EE memory; CDVDSTM selects stream1 and calls sceCdNop.",
-      "import": "cdvdman:46 version=0x0101",
+      "subsystem": "Fresh original-game integration of the current streaming services",
+      "status": "original-data-workspace-unavailable",
+      "description": "Kernel alarms, deferred Nop completion and stream1 sector reads pass constructed-input tests. The original ISO and generated game corpus are not available in the current source-only workspace for a new full-game run.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
+    },
+    "last_observed_original_blocker": {
+      "patch_set": "0001-0039",
+      "subsystem": "Original CDVDSTM stream start",
+      "import": "cdvdman:46 version=0x0101",
+      "iop_pc": "0x9D2B8",
+      "iop_ra": "0x9C188",
+      "description": "sceCdNop was unsupported in the last recorded original-game executable. Patch 0041 later implements it, but a newer original-game run remains unverified."
     },
     "macos_arm64_synthetic_host_verified": true,
     "first_game_frame_verified": false,
@@ -38,28 +45,40 @@
     "startup_graphics_kind": "Gathering publisher splash",
     "startup_screenshot": "docs/screenshots/mafia-linux-gathering.png",
     "menu_verified": false,
-    "macos_arm64_synthetic_host_verified_patch_set": "0001-0031",
+    "macos_arm64_synthetic_host_verified_patch_set": "0001-0042",
     "latest_runtime_patch_set": "0001-0039",
     "latest_runtime_platform": "linux-x86_64",
     "latest_runtime_binary_sha256": "457d2f9d80f5ad66c270a284b77e662490559d5f01bb080ffeba25167407bf92",
     "updated_macos_ci_verified": true,
     "linux_arm64_game_execution_verified": false,
-    "last_verified_ci_patch_set": "0001-0031",
+    "last_verified_ci_patch_set": "0001-0042",
+    "last_verified_ci_run": 40730476659,
     "original_frontend_screen_verified": true,
     "frontend_screenshot": "docs/screenshots/mafia-linux-no-card.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0040",
+    "latest_reviewed_patch_set": "0001-0043",
+    "latest_local_iop_test_patch_set": "0001-0043",
+    "latest_local_iop_tests": {
+      "programs_passed": 20,
+      "programs_failed": 0,
+      "gcc_version": "14.2.0",
+      "optimized_clang_version": "17.0.0",
+      "asan_ubsan_leak_detection_passed": true,
+      "ncmd_stream_cases_passed": 24,
+      "ncmd_stream_cases_total": 24,
+      "same_cases_passed_on_preceding_source": 15,
+      "original_game_execution": false
+    },
+    "patch_0043_ci_run": 40733776289,
+    "patch_0043_ci_verified": false,
     "original_memory_card_query_completed": true,
     "original_no_card_dialog_verified": true,
     "original_iop_controller_input_verified": true,
     "latest_runtime_evidence_kind": "original-full-game-window-xvfb-software-opengl",
-    "latest_runtime_patch_set_is_historical": false,
-    "latest_runtime_uses_current_reconstructed_patch_set": true,
-    "controller_input_verified_buttons_in_original_frontend": [
-      "Up",
-      "Cross"
-    ],
+    "latest_runtime_patch_set_is_historical": true,
+    "latest_runtime_uses_current_reconstructed_patch_set": false,
+    "controller_input_verified_buttons_in_original_frontend": ["Up", "Cross"],
     "original_movie_initialization_entered": true,
     "original_cdvdstm_startup_completed": true,
     "original_cdvdstm_stream_initialization_completed": true,
@@ -74,24 +93,18 @@
   "commercial_inputs_in_repository": false,
   "generated_game_code_in_repository": false,
   "targets": [
-    {
-      "os": "macOS",
-      "architecture": "arm64",
-      "application": "MafiaNative.app"
-    },
-    {
-      "os": "Linux",
-      "architectures": [
-        "x86_64",
-        "arm64"
-      ],
-      "application": "MafiaNative"
-    }
+    {"os": "macOS", "architecture": "arm64", "application": "MafiaNative.app"},
+    {"os": "Linux", "architectures": ["x86_64", "arm64"], "application": "MafiaNative"}
   ],
   "retained_local_inputs": {
-    "complete_installation": true,
+    "complete_installation": false,
+    "complete_iso_retained": false,
+    "workspace_status": "Current workspace has verified public IOP sources only; the preceding original-data workspace is unreachable."
+  },
+  "last_verified_original_installation": {
     "files": 281,
     "bytes": 4126918314,
-    "complete_iso_retained": true
+    "complete_installation_verified": true,
+    "available_in_current_workspace": false
   }
 }
