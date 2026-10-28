@@ -1,0 +1,1369 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -19,6 +19,7 @@
+     src/emulator/core/iop_sio2.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
++    src/emulator/imports/iop_alarm.cpp
+     src/emulator/imports/iop_cdvd.cpp
+     src/emulator/imports/iop_dmacman.cpp
+     src/emulator/imports/iop_heaplib.cpp
+@@ -53,6 +54,16 @@
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_alarm_tests tests/iop_alarm_tests.cpp)
++    target_link_libraries(ps2_iop_alarm_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_alarm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_alarm_tests COMMAND ps2_iop_alarm_tests)
++
++    add_executable(ps2_iop_alarm_state_tests tests/iop_alarm_state_tests.cpp)
++    target_link_libraries(ps2_iop_alarm_state_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_alarm_state_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_alarm_state_tests COMMAND ps2_iop_alarm_state_tests)
++
+     add_executable(ps2_iop_cdvd_search_tests tests/iop_cdvd_search_tests.cpp)
+     target_link_libraries(ps2_iop_cdvd_search_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_cdvd_search_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -338,12 +338,7 @@
+             m_memory.write32(cpu.gpr[4] + 4u, static_cast<uint32_t>(currentCycle >> 32u));
+             setV0(0);
+             return true;
+-        case 35:
+-        case 36:
+-        case 37:
+-        case 38:
+-            setV0(0);
+-            return true;
++        // Alarm35-38 are owned by the modeled system-timer service.
+         case 39: // USec2SysClock
+         {
+             const uint64_t cycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz) / 1'000'000ull;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -51,6 +51,7 @@
+         m_interruptStatus = 0;
+         m_interruptMask = 0;
+         m_interruptControl = 1;
++        m_kernelAlarmTimerBase = 0u;
+         m_dmaStart.reset();
+         // Device ownership is outside RAM. Preserve the weak binding through a
+         // memory reset and through the strict loader's staged copy/commit.
+@@ -64,6 +65,23 @@
+     void IopMemory::bindSio2Registers(const std::shared_ptr<IopSio2Registers> &registers) noexcept
+     {
+         m_sio2Registers = registers;
++    }
++
++    void IopMemory::reserveKernelAlarmTimerRegisters(uint32_t address)
++    {
++        const uint32_t physical = physicalAddress(address);
++        if (physical != 0x1F801480u && physical != 0x1F801490u && physical != 0x1F8014A0u)
++            throw std::logic_error("IOP kernel alarm reservation requires a32-bit timer");
++        if (m_kernelAlarmTimerBase != 0u && m_kernelAlarmTimerBase != physical)
++            throw std::runtime_error("IOP kernel alarm timer ownership cannot change without RAM reset");
++        m_kernelAlarmTimerBase = physical;
++    }
++
++    void IopMemory::guardKernelAlarmTimerRegisters(uint32_t physical, uint32_t width) const
++    {
++        if (m_kernelAlarmTimerBase != 0u && physical < m_kernelAlarmTimerBase + 12u &&
++            uint64_t(physical) + width > m_kernelAlarmTimerBase)
++            throw std::runtime_error("Unsupported IOP reserved system-alarm timer MMIO access");
+     }
+ 
+     uint32_t IopMemory::readSio2(uint32_t physical, uint32_t width) const
+@@ -101,6 +119,7 @@
+     uint8_t IopMemory::read8(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        guardKernelAlarmTimerRegisters(phys, 1u);
+         if (phys >= Sio2Base && phys < Sio2End)
+             return static_cast<uint8_t>(readSio2(phys, 1u));
+         if (phys < RamSize)
+@@ -116,6 +135,7 @@
+     uint16_t IopMemory::read16(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        guardKernelAlarmTimerRegisters(phys, 2u);
+         if (uint64_t(phys) < Sio2End && uint64_t(phys) + 2u > Sio2Base)
+             return static_cast<uint16_t>(readSio2(phys, 2u));
+         if (phys + 1u < RamSize)
+@@ -132,6 +152,7 @@
+     uint32_t IopMemory::read32(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        guardKernelAlarmTimerRegisters(phys, 4u);
+         if (uint64_t(phys) < Sio2End && uint64_t(phys) + 4u > Sio2Base)
+             return readSio2(phys, 4u);
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+@@ -158,6 +179,7 @@
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        guardKernelAlarmTimerRegisters(phys, 1u);
+         if (phys >= Sio2Base && phys < Sio2End)
+         {
+             writeSio2(phys, 1u, value);
+@@ -186,6 +208,7 @@
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        guardKernelAlarmTimerRegisters(phys, 2u);
+         if (uint64_t(phys) < Sio2End && uint64_t(phys) + 2u > Sio2Base)
+         {
+             writeSio2(phys, 2u, value);
+@@ -206,6 +229,7 @@
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        guardKernelAlarmTimerRegisters(phys, 4u);
+         if (uint64_t(phys) < Sio2End && uint64_t(phys) + 4u > Sio2Base)
+         {
+             writeSio2(phys, 4u, value);
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -66,6 +66,9 @@
+         void reset();
+         void bindCdvdRegisters(const std::shared_ptr<IopCdvdRegisters> &registers) noexcept;
+         void bindSio2Registers(const std::shared_ptr<IopSio2Registers> &registers) noexcept;
++        // Only modeled threadman startup binds its private system-timer span.
++        // Raw guest register accesses require a real timer implementation.
++        void reserveKernelAlarmTimerRegisters(uint32_t address);
+ 
+         [[nodiscard]] uint8_t read8(uint32_t address) const;
+         [[nodiscard]] uint16_t read16(uint32_t address) const;
+@@ -108,6 +111,7 @@
+         void writeSio2(uint32_t physical, uint32_t width, uint32_t value);
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
++        void guardKernelAlarmTimerRegisters(uint32_t physical, uint32_t width) const;
+         void markOwned(uint32_t address, size_t size);
+ 
+         std::vector<uint8_t> m_ram;
+@@ -121,6 +125,7 @@
+         uint32_t m_interruptStatus = 0;
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
++        uint32_t m_kernelAlarmTimerBase = 0u;
+         std::optional<DmaStart> m_dmaStart;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/imports/iop_alarm.cpp b/ps2xIOP/src/emulator/imports/iop_alarm.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_alarm.cpp
+@@ -0,0 +1,243 @@
++#include "iop_alarm.h"
++#include "iop_intrman.h"
++#include "iop_timrman.h"
++
++#include "../core/iop_cpu.h"
++#include "../core/iop_memory.h"
++#include "../services/iop_rpc.h"
++
++#include <algorithm>
++#include <limits>
++#include <new>
++#include <stdexcept>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        // PS2SDK iop/system/threadman/src/{thbase,thcommon}.c:
++        // 100us, converted with floor(usec *4608 /125) at normal IOP clock.
++        constexpr uint64_t kMinimumTicks = 3686u;
++        constexpr uint64_t kMaximumClock = std::numeric_limits<int64_t>::max();
++        constexpr int32_t kIllegalContext = -100;
++        constexpr int32_t kFoundHandler = -104;
++        constexpr int32_t kNotFoundHandler = -105;
++        constexpr int32_t kNoMemory = -400;
++        // The O32 kernel alarm record occupies32 bytes. The built-in pool is
++        // private modeled kernel state; overflow records consume IOP heap.
++        constexpr uint32_t kRecordBytes = 32u;
++    }
++
++    IopAlarms::IopAlarms(IopMemory &memory, IopTimrman &timrman) noexcept
++        : m_memory(memory), m_timrman(timrman)
++    {
++    }
++
++    IopAlarms::~IopAlarms()
++    {
++        for (const Alarm &alarm : m_alarms)
++            releaseRecord(alarm);
++    }
++
++    void IopAlarms::reset()
++    {
++        if (m_generation == std::numeric_limits<uint64_t>::max())
++            throw std::runtime_error("IOP alarm lifetime identity exhausted");
++        for (const Alarm &alarm : m_alarms)
++            releaseRecord(alarm);
++        m_alarms.clear();
++        m_pool.fill(false);
++        ++m_generation;
++        m_servicing = false;
++        m_irq = m_timrman.reserveKernelAlarmTimer(m_memory);
++        // Kernel startup installs/enables this dispatcher once. Subsequent
++        // DisableIntr, I_MASK and CpuSuspendIntr changes remain authoritative.
++        m_memory.setInterruptMask(m_memory.interruptMask() | (1u << m_irq));
++    }
++
++    bool IopAlarms::ownedSpan(uint32_t address, size_t bytes) const
++    {
++        const uint32_t segment = address & 0xE0000000u;
++        const uint32_t physical = IopMemory::physicalAddress(address);
++        return address != 0u && (segment == 0u || segment == 0x80000000u || segment == 0xA0000000u) &&
++            physical < IopMemory::RamSize && bytes <= IopMemory::RamSize - physical &&
++            m_memory.ownsRamRange(address, bytes);
++    }
++
++    void IopAlarms::validateCallback(const Alarm &alarm) const
++    {
++        if ((alarm.callback & 3u) != 0u || !ownedSpan(alarm.callback, 4u))
++            throw std::runtime_error("IOP alarm callback is outside aligned complete owned RAM");
++        if (alarm.codeAllocationIdentity != 0u)
++        {
++            const auto allocation = m_memory.allocationContaining(IopMemory::physicalAddress(alarm.callback));
++            if (!allocation || allocation->identity != alarm.codeAllocationIdentity)
++                throw std::runtime_error("IOP alarm callback allocation lifetime has ended");
++        }
++    }
++
++    bool IopAlarms::acquireRecord(Alarm &alarm)
++    {
++        const auto slot = std::find(m_pool.begin(), m_pool.end(), false);
++        if (slot != m_pool.end())
++        {
++            alarm.poolSlot = static_cast<size_t>(slot - m_pool.begin());
++            *slot = true;
++            return true;
++        }
++        alarm.allocation = m_memory.allocate(kRecordBytes);
++        if (alarm.allocation == 0u)
++            return false;
++        const auto allocation = m_memory.allocationContaining(alarm.allocation);
++        if (!allocation)
++            throw std::logic_error("IOP alarm record allocation has no lifetime");
++        alarm.allocationIdentity = allocation->identity;
++        return true;
++    }
++
++    void IopAlarms::releaseRecord(const Alarm &alarm) noexcept
++    {
++        if (alarm.generation == m_generation && alarm.poolSlot < PoolSize)
++            m_pool[alarm.poolSlot] = false;
++        if (alarm.allocation != 0u)
++            (void)m_memory.freeAllocation(alarm.allocation, alarm.allocationIdentity);
++    }
++
++    std::list<IopAlarms::Alarm>::iterator IopAlarms::insertionPoint(uint64_t deadline)
++    {
++        // Equal deadlines remain FIFO, including a callback's reinserted node.
++        return std::find_if(m_alarms.begin(), m_alarms.end(),
++                           [&](const Alarm &alarm) { return alarm.deadline > deadline; });
++    }
++
++    bool IopAlarms::dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle,
++                                   const IopIntrman &intrman)
++    {
++        if (ordinal < 35u || ordinal > 38u)
++            return false;
++        const auto result = [&](int32_t value) { cpu.gpr[2] = static_cast<uint32_t>(value); };
++        const bool interruptOnly = ordinal == 36u || ordinal == 38u;
++        if (intrman.inInterruptContext() != interruptOnly)
++        {
++            result(kIllegalContext);
++            return true;
++        }
++        const bool setting = ordinal == 35u || ordinal == 36u;
++        const uint32_t callback = cpu.gpr[setting ? 5u : 4u];
++        const uint32_t argument = cpu.gpr[setting ? 6u : 5u];
++        const auto existing = std::find_if(m_alarms.begin(), m_alarms.end(), [&](const Alarm &alarm)
++        { return alarm.callback == callback && alarm.argument == argument; });
++        if (!setting)
++        {
++            if (existing == m_alarms.end())
++                result(kNotFoundHandler);
++            else
++            {
++                releaseRecord(*existing);
++                m_alarms.erase(existing);
++                result(0);
++            }
++            return true;
++        }
++        if (existing != m_alarms.end())
++        {
++            result(kFoundHandler);
++            return true;
++        }
++
++        const uint32_t clock = cpu.gpr[4];
++        if ((clock & 3u) != 0u || !ownedSpan(clock, 8u))
++            throw std::runtime_error("IOP alarm clock is outside aligned complete owned RAM");
++        Alarm alarm;
++        alarm.generation = m_generation;
++        alarm.callback = callback;
++        alarm.argument = argument; // Opaque value: the API does not dereference it.
++        alarm.gp = cpu.gpr[28];
++        validateCallback(alarm);
++        if (const auto allocation = m_memory.allocationContaining(IopMemory::physicalAddress(callback)))
++            alarm.codeAllocationIdentity = allocation->identity;
++        const uint64_t requested = uint64_t(m_memory.read32(clock)) |
++                                   (uint64_t(m_memory.read32(clock + 4u)) << 32u);
++        const uint64_t delay = std::max(requested, kMinimumTicks);
++        // The primary queue compares signed64 clocks. Values outside that
++        // monotonic horizon, and overflowing additions, have no modeled time.
++        if (currentCycle > kMaximumClock || delay > kMaximumClock - currentCycle)
++            throw std::runtime_error("IOP alarm deadline exceeds the supported clock horizon");
++        alarm.deadline = currentCycle + delay;
++        try
++        {
++            if (!acquireRecord(alarm))
++            {
++                result(kNoMemory);
++                return true;
++            }
++            m_alarms.insert(insertionPoint(alarm.deadline), alarm);
++        }
++        catch (const std::bad_alloc &)
++        {
++            releaseRecord(alarm);
++            result(kNoMemory);
++            return true;
++        }
++        // Publish the documented clamp only once the complete registration
++        // has succeeded. Errors and duplicates never alter the caller's clock.
++        if (requested < kMinimumTicks)
++            m_memory.write32(clock, static_cast<uint32_t>(kMinimumTicks));
++        result(0);
++        return true;
++    }
++
++    void IopAlarms::serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman)
++    {
++        if (m_servicing || intrman.inInterruptContext() || m_alarms.empty() ||
++            m_alarms.front().deadline > currentCycle || m_memory.interruptControl() == 0u ||
++            (m_memory.interruptMask() & (1u << m_irq)) == 0u)
++            return;
++        if (currentCycle > kMaximumClock)
++            throw std::runtime_error("IOP alarm delivery exceeds the supported clock horizon");
++        if (intrman.hasRegisteredInterrupt(static_cast<int>(m_irq)))
++            throw std::runtime_error("IOP alarm delivery cannot bypass a supplied raw system-timer IRQ handler");
++
++        // Unlink before calling guest code, exactly as threadman's timer IRQ.
++        // The callback may cancel/register other alarms, or reset the owner.
++        // Keep this node independently alive and reinsert without allocation.
++        std::list<Alarm> active;
++        active.splice(active.begin(), m_alarms, m_alarms.begin());
++        Alarm &alarm = active.front();
++        m_servicing = true;
++        struct Guard
++        {
++            IopAlarms &owner;
++            Alarm &alarm;
++            bool ownsRecord = true;
++            ~Guard()
++            {
++                if (ownsRecord) owner.releaseRecord(alarm);
++                owner.m_servicing = false;
++            }
++        } guard{*this, alarm};
++        validateCallback(alarm);
++        const uint32_t next = intrman.executeInterruptCallback(alarm.callback, alarm.argument, alarm.gp, executor);
++        if (alarm.generation != m_generation || next == 0u)
++            return;
++        const uint64_t interval = std::max<uint64_t>(next, kMinimumTicks);
++        if (interval > kMaximumClock - alarm.deadline)
++            throw std::runtime_error("IOP alarm rearm exceeds the supported clock horizon");
++        alarm.deadline += interval; // Relative to its previous scheduled expiry.
++        m_alarms.splice(insertionPoint(alarm.deadline), active, active.begin());
++        guard.ownsRecord = false;
++    }
++
++    uint64_t IopAlarms::nextEventCycle(uint64_t currentCycle, uint64_t fallback) const noexcept
++    {
++        if (m_alarms.empty())
++            return fallback;
++        const uint64_t deadline = m_alarms.front().deadline;
++        // An already pending masked alarm cannot wake an idle CPU every tick.
++        // It remains queued and is checked again at the next real event/pump.
++        if (deadline <= currentCycle && (m_memory.interruptControl() == 0u ||
++                                        (m_memory.interruptMask() & (1u << m_irq)) == 0u))
++            return fallback;
++        return std::min(fallback, deadline);
++    }
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_alarm.h b/ps2xIOP/src/emulator/imports/iop_alarm.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/src/emulator/imports/iop_alarm.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <list>
++
++namespace ps2x::iop::detail
++{
++    struct IopCpuState;
++    class IopGuestExecutor;
++    class IopIntrman;
++    class IopMemory;
++    class IopTimrman;
++
++    // The modeled thread manager owns the system timer and its alarm queue.
++    // No guest-visible alarm handle or record layout is invented by this API.
++    class IopAlarms
++    {
++    public:
++        IopAlarms(IopMemory &memory, IopTimrman &timrman) noexcept;
++        ~IopAlarms();
++        IopAlarms(const IopAlarms &) = delete;
++        IopAlarms &operator=(const IopAlarms &) = delete;
++
++        void reset();
++        [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle,
++                                          const IopIntrman &intrman);
++        void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman);
++        [[nodiscard]] uint64_t nextEventCycle(uint64_t currentCycle, uint64_t fallback) const noexcept;
++
++    private:
++        // PS2SDK thcommon.c initializes ids2..33 after the internal id1 clock
++        // alarm; alarm_free retains only ids<33, leaving31 reusable records.
++        static constexpr size_t PoolSize = 31u;
++        struct Alarm
++        {
++            uint64_t deadline = 0u;
++            uint64_t generation = 0u;
++            uint32_t callback = 0u;
++            uint32_t argument = 0u;
++            uint32_t gp = 0u;
++            uint64_t codeAllocationIdentity = 0u;
++            size_t poolSlot = PoolSize;
++            uint32_t allocation = 0u;
++            uint64_t allocationIdentity = 0u;
++        };
++
++        [[nodiscard]] bool ownedSpan(uint32_t address, size_t bytes) const;
++        void validateCallback(const Alarm &alarm) const;
++        [[nodiscard]] bool acquireRecord(Alarm &alarm);
++        void releaseRecord(const Alarm &alarm) noexcept;
++        [[nodiscard]] std::list<Alarm>::iterator insertionPoint(uint64_t deadline);
++
++        IopMemory &m_memory;
++        IopTimrman &m_timrman;
++        std::list<Alarm> m_alarms;
++        std::array<bool, PoolSize> m_pool{};
++        uint64_t m_generation = 0u;
++        uint32_t m_irq = 16u;
++        bool m_servicing = false;
++    };
++}
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.cpp b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.cpp
+@@ -114,6 +114,12 @@
+         return true;
+     }
+ 
++    bool IopIntrman::hasRegisteredInterrupt(int irq) const noexcept
++    {
++        const auto handler = m_handlers.find(irq);
++        return handler != m_handlers.end() && handler->second.function != 0u;
++    }
++
+     uint32_t IopIntrman::executeInterruptCallback(uint32_t function, uint32_t argument,
+                                                  uint32_t gp, IopGuestExecutor &executor) const
+     {
+diff --git a/ps2xIOP/src/emulator/imports/iop_intrman.h b/ps2xIOP/src/emulator/imports/iop_intrman.h
+--- a/ps2xIOP/src/emulator/imports/iop_intrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_intrman.h
+@@ -20,6 +20,7 @@
+         // For modeled devices which already checked the live I_CTRL/I_MASK.
+         // Direct guest mask writes must not be shadowed by EnableIntr bookkeeping.
+         [[nodiscard]] bool dispatchRegisteredInterrupt(int irq, IopGuestExecutor &executor) const;
++        [[nodiscard]] bool hasRegisteredInterrupt(int irq) const noexcept;
+         [[nodiscard]] bool inInterruptContext() const noexcept { return m_interruptDepth != 0u; }
+         // Hard-timer callbacks execute through the same interrupt context as
+         // registered hardware IRQ handlers.
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.cpp b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.cpp
+@@ -2,11 +2,13 @@
+ #include "iop_intrman.h"
+ 
+ #include "../core/iop_cpu.h"
++#include "../core/iop_memory.h"
+ #include "../services/iop_rpc.h"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <limits>
++#include <stdexcept>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -64,6 +66,29 @@
+         return (static_cast<uint32_t>(index + 1u) << 28u) | (kAddresses[index] >> 4u);
+     }
+ 
++    uint32_t IopTimrman::reserveKernelAlarmTimer(IopMemory &memory)
++    {
++        for (const Timer &timer : m_timers)
++            if (timer.kernelOwned)
++            {
++                memory.reserveKernelAlarmTimerRegisters(timer.address);
++                return timer.irq;
++            }
++        // PS2SDK threadman init_timer: AllocHardTimer(1,32,1). Reserve only
++        // in actual modeled-kernel startup, never in standalone timrman reset.
++        for (const size_t index : kAllocationOrder)
++        {
++            Timer &timer = m_timers[index];
++            if (timer.users != 0u || (timer.sources & 1u) == 0u || timer.width != 32u)
++                continue;
++            memory.reserveKernelAlarmTimerRegisters(timer.address);
++            timer.users = 1u;
++            timer.kernelOwned = true;
++            return timer.irq;
++        }
++        throw std::runtime_error("IOP kernel cannot reserve its system alarm timer");
++    }
++
+     IopTimrman::Timer *IopTimrman::timerFromId(uint32_t id) noexcept
+     {
+         const uint32_t encoded = id >> 28u;
+@@ -162,6 +187,15 @@
+         const uint32_t a3 = cpu.gpr[7];
+         const auto setV0 = [&](uint32_t value) { cpu.gpr[2] = value; };
+ 
++        // Raw programming/readback of the modeled kernel's private timer is
++        // outside this service boundary. Never let a second timer owner alter
++        // its apparent counter while threadman's alarm clock keeps running.
++        if ((ordinal >= 6u && ordinal <= 12u) || (ordinal >= 16u && ordinal <= 18u) ||
++            (ordinal >= 20u && ordinal <= 24u))
++            for (size_t index = 0u; index < m_timers.size(); ++index)
++                if (m_timers[index].kernelOwned && a0 == timerId(index))
++                    throw std::runtime_error("IOP system alarm timer is reserved by the modeled kernel");
++
+         switch (ordinal)
+         {
+         case 3: // GetTimersTable
+@@ -186,7 +220,7 @@
+             for (size_t index = 0u; index < m_timers.size(); ++index)
+             {
+                 Timer &timer = m_timers[index];
+-                if (timer.users == 0u || timer.liveMode == 0u || (timer.sources & a0) == 0u ||
++                if (timer.kernelOwned || timer.users == 0u || timer.liveMode == 0u || (timer.sources & a0) == 0u ||
+                     timer.width != a1 || (timer.liveMode & a3) != a2)
+                     continue;
+                 ++timer.users;
+diff --git a/ps2xIOP/src/emulator/imports/iop_timrman.h b/ps2xIOP/src/emulator/imports/iop_timrman.h
+--- a/ps2xIOP/src/emulator/imports/iop_timrman.h
++++ b/ps2xIOP/src/emulator/imports/iop_timrman.h
+@@ -9,11 +9,16 @@
+     struct IopCpuState;
+     class IopGuestExecutor;
+     class IopIntrman;
++    class IopMemory;
+ 
+     class IopTimrman
+     {
+     public:
+         void reset() noexcept;
++
++        // Modeled threadman startup owns the first compatible32-bit timer.
++        // Standalone timrman users retain the ordinary empty table after reset.
++        [[nodiscard]] uint32_t reserveKernelAlarmTimer(IopMemory &memory);
+ 
+         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
+         void serviceDue(uint64_t currentCycle, IopGuestExecutor &executor, const IopIntrman &intrman);
+@@ -47,6 +52,7 @@
+             uint64_t overflowCycle = UINT64_MAX;
+             bool configured = false;
+             bool running = false;
++            bool kernelOwned = false;
+ 
+             Callback compareCallback;
+             Callback overflowCallback;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,4 +1,5 @@
+ #include "iop_emulator.h"
++#include "imports/iop_alarm.h"
+ #include "imports/iop_cdvd.h"
+ #include "imports/iop_dmacman.h"
+ #include "core/iop_cpu.h"
+@@ -355,6 +356,7 @@
+               heaplib(memory),
+               intrman(memory),
+               timrman(),
++              alarms(memory, timrman),
+               ioman(host, memory, cdvd),
+               cpuCore(memory),
+               imports(memory),
+@@ -382,6 +384,7 @@
+             vblank.reset();
+             sio2.reset();
+             timrman.reset();
++            alarms.reset();
+             ioman.reset();
+             pendingDmaInterrupts.clear();
+             pendingGuestCallbacks.clear();
+@@ -704,9 +707,19 @@
+ 
+             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+             {
+-                return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                if (call.ordinal >= 35u && call.ordinal <= 38u)
++                {
++                    // Compatible supplied alarm exports own their kernel state
++                    // and must see their arguments before modeled validation.
++                    if (imports.resolve(call.library, call.ordinal, call.version) == 0u)
++                        return (call.version >> 8u) == 1u &&
++                                   alarms.dispatchImport(call.ordinal, cpu, totalCycles, intrman)
++                                   ? ImportDisposition::Handled : ImportDisposition::Missing;
++                }
++                else
++                    return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
++                               ? ImportDisposition::Handled
++                               : ImportDisposition::Missing;
+             }
+             if (iequals(call.library, "thsemap"))
+             {
+@@ -901,6 +914,7 @@
+                     if (!step(cpu))
+                         break;
+                     serviceVblankCallbacks();
++                    serviceAlarmCallbacks();
+                     serviceSio2Interrupt();
+                     if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                         servicePendingDmaInterrupts();
+@@ -1020,6 +1034,25 @@
+             vblank.serviceDue(totalCycles, *this, intrman);
+         }
+ 
++        void serviceAlarmCallbacks()
++        {
++            const RestoreValue strictGuard(strictExecution, true);
++            try
++            {
++                alarms.serviceDue(totalCycles, *this, intrman);
++            }
++            catch (const std::exception &error)
++            {
++                rememberExecutionFailure(std::string("Strict IOP execution: ") + error.what());
++                throw;
++            }
++            catch (...)
++            {
++                rememberExecutionFailure("Strict IOP execution: unknown alarm callback exception");
++                throw;
++            }
++        }
++
+         void serviceSio2Interrupt()
+         {
+             const RestoreValue strictGuard(strictExecution, true);
+@@ -1109,6 +1142,7 @@
+                 while (totalCycles < target)
+                 {
+                     serviceVblankCallbacks();
++                    serviceAlarmCallbacks();
+                     serviceSio2Interrupt();
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+@@ -1126,6 +1160,7 @@
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        nextWake = alarms.nextEventCycle(totalCycles, nextWake);
+                         nextWake = vblank.nextEventCycle(nextWake);
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+@@ -1450,6 +1485,7 @@
+         IopHeaplib heaplib;
+         IopIntrman intrman;
+         IopTimrman timrman;
++        IopAlarms alarms;
+         IopIoman ioman;
+         IopCpuCore cpuCore;
+         IopImportRegistry imports;
+diff --git a/ps2xIOP/tests/iop_alarm_state_tests.cpp b/ps2xIOP/tests/iop_alarm_state_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_alarm_state_tests.cpp
+@@ -0,0 +1,426 @@
++#include "emulator/core/iop_cpu.h"
++#include "emulator/core/iop_memory.h"
++#include "emulator/imports/iop_alarm.h"
++#include "emulator/imports/iop_intrman.h"
++#include "emulator/imports/iop_timrman.h"
++#include "emulator/services/iop_rpc.h"
++#include "iop_compat_test_support.h"
++
++#include <functional>
++#include <limits>
++
++namespace
++{
++    using namespace ps2x::iop::detail;
++    using iop_test::require;
++    constexpr uint32_t clockAddress = 0x2000u, callbackAddress = 0x3000u;
++
++    struct Call { uint32_t function, argument, gp; bool interrupt; };
++    struct Executor final : IopGuestExecutor
++    {
++        IopIntrman &intrman;
++        std::vector<Call> calls;
++        std::function<uint32_t(const Call &)> action;
++        explicit Executor(IopIntrman &value) : intrman(value) {}
++        uint32_t executeGuestFunction(uint32_t function, uint32_t a0, uint32_t, uint32_t,
++                                       uint32_t, uint32_t gp) override
++        {
++            const Call call{function, a0, gp, intrman.inInterruptContext()};
++            calls.push_back(call);
++            return action ? action(call) : 0u;
++        }
++    };
++    struct Fixture
++    {
++        IopMemory memory;
++        IopTimrman timers;
++        IopIntrman intrman{memory};
++        IopAlarms alarms{memory, timers};
++        Executor executor{intrman};
++        Fixture()
++        {
++            timers.reset(); alarms.reset();
++            memory.write32(callbackAddress, 0x03E00008u);
++            clock(10000u);
++        }
++        void clock(uint64_t value, uint32_t address = clockAddress)
++        {
++            memory.write32(address, static_cast<uint32_t>(value));
++            memory.write32(address + 4u, static_cast<uint32_t>(value >> 32u));
++        }
++        int32_t call(uint16_t ordinal, uint32_t a0, uint32_t a1, uint32_t a2 = 0u,
++                     uint64_t now = 0u, uint32_t gp = 0x12345678u)
++        {
++            IopCpuState cpu{}; cpu.gpr[4] = a0; cpu.gpr[5] = a1; cpu.gpr[6] = a2; cpu.gpr[28] = gp;
++            require(alarms.dispatchImport(ordinal, cpu, now, intrman), "alarm ordinal unresolved");
++            return static_cast<int32_t>(cpu.gpr[2]);
++        }
++        int32_t set(uint32_t argument = 0u, uint64_t now = 0u, uint32_t callback = callbackAddress)
++        { return call(35u, clockAddress, callback, argument, now); }
++        void irq(const std::function<void()> &body)
++        {
++            Executor scope(intrman);
++            scope.action = [&](const Call &) { body(); return 0u; };
++            (void)intrman.executeInterruptCallback(callbackAddress, 0u, 0u, scope);
++        }
++        void due(uint64_t now) { alarms.serviceDue(now, executor, intrman); }
++    };
++    void rejects(const std::function<void()> &body, std::string_view expected)
++    {
++        try { body(); }
++        catch (const std::runtime_error &error)
++        {
++            require(std::string_view(error.what()).find(expected) != std::string_view::npos,
++                    "alarm fault lost its concrete cause");
++            return;
++        }
++        throw std::runtime_error("unsupported alarm operation silently succeeded");
++    }
++
++    void clockClampAndOneShotContext()
++    {
++        Fixture f; f.clock(1u);
++        require(f.set(0xDEADBEEFu, 100u) == 0 && f.memory.read32(clockAddress) == 3686u &&
++                    f.memory.read32(clockAddress + 4u) == 0u,
++                "SetAlarm did not publish the100us minimum clock");
++        f.due(3785u); require(f.executor.calls.empty(), "alarm fired before its deadline");
++        f.due(3786u); f.due(100000u);
++        require(f.executor.calls.size() == 1u && f.executor.calls[0].function == callbackAddress &&
++                    f.executor.calls[0].argument == 0xDEADBEEFu && f.executor.calls[0].gp == 0x12345678u &&
++                    f.executor.calls[0].interrupt && !f.intrman.inInterruptContext(),
++                "one-shot argument, GP, interrupt scope or removal was lost");
++        require(f.alarms.nextEventCycle(100000u, 120000u) == 120000u, "one-shot retained a deadline");
++    }
++
++    void exactPairErrorsAndFifo()
++    {
++        Fixture f;
++        require(f.set(1u) == 0 && f.set(2u) == 0 && f.set(3u) == 0, "independent pairs rejected");
++        require(f.call(35u, 0x1F801074u, callbackAddress, 2u) == -104,
++                "duplicate inspected the clock or replaced a registration");
++        require(f.call(37u, callbackAddress, 1u) == 0 && f.call(37u, callbackAddress, 1u) == -105 &&
++                    f.call(37u, 0xFFFFFFFFu, 0u) == -105,
++                "cancellation did not use the exact opaque callback/argument pair");
++        f.due(10000u); f.due(10000u); f.due(10000u);
++        require(f.executor.calls.size() == 2u && f.executor.calls[0].argument == 2u &&
++                    f.executor.calls[1].argument == 3u, "equal-deadline FIFO or cancellation was lost");
++        f.clock(10000u);
++        require(f.set(4u, 0u, 0x80000000u | callbackAddress) == 0 && f.set(4u) == 0,
++                "raw callback aliases incorrectly merged distinct primary pointer pairs");
++        require(f.call(37u, callbackAddress, 4u) == 0, "physical pair did not cancel exactly");
++        f.due(10000u);
++        require(f.executor.calls.back().function == (0x80000000u | callbackAddress),
++                "canceling one callback alias removed a different raw pointer pair");
++    }
++
++    void contextErrorsPrecedePointerReads()
++    {
++        Fixture f;
++        require(f.call(36u, 0xFFFFFFFFu, 0u) == -100 && f.call(38u, 0u, 0u) == -100,
++                "interrupt-only alarm calls succeeded outside an interrupt");
++        f.irq([&]
++        {
++            require(f.call(35u, 0xFFFFFFFFu, 0u) == -100 && f.call(37u, 0u, 0u) == -100,
++                    "thread-only alarm calls ran in interrupt context");
++            require(f.call(36u, clockAddress, callbackAddress, 5u) == 0 &&
++                        f.call(38u, callbackAddress, 5u) == 0 && f.call(38u, callbackAddress, 5u) == -105,
++                    "iSetAlarm/iCancelAlarm have different valid-context semantics");
++        });
++        f.due(10000u); require(f.executor.calls.empty(), "canceled interrupt registration fired");
++    }
++
++    void nonzeroReturnsUsePreviousDeadline()
++    {
++        Fixture f; require(f.set() == 0, "repeat setup failed");
++        f.executor.action = [&](const Call &) { return f.executor.calls.size() == 1u ? 1u :
++                                                       f.executor.calls.size() == 2u ? 5000u : 0u; };
++        f.due(15000u);
++        require(f.alarms.nextEventCycle(15000u, 30000u) == 13686u,
++                "return1 did not rearm from the prior deadline with the minimum interval");
++        f.due(15000u);
++        require(f.alarms.nextEventCycle(15000u, 30000u) == 18686u,
++                "rearm drifted relative to host callback delivery time");
++        f.due(18685u); require(f.executor.calls.size() == 2u, "repeat fired early");
++        f.due(18686u); f.due(30000u); require(f.executor.calls.size() == 3u, "return0 failed to end repeats");
++    }
++
++    void callbacksCanCancelAndReplaceAfterUnlink()
++    {
++        Fixture f; require(f.set(1u) == 0 && f.set(2u) == 0, "replacement setup failed");
++        f.executor.action = [&](const Call &call)
++        {
++            if (call.argument == 1u)
++            {
++                require(f.call(38u, callbackAddress, 1u) == -105,
++                        "executing alarm remained in the cancelable active list");
++                require(f.call(38u, callbackAddress, 2u) == 0, "callback could not cancel another alarm");
++                f.clock(8000u);
++                require(f.call(36u, clockAddress, callbackAddress, 3u, 10000u) == 0,
++                        "callback could not schedule its successor");
++                f.due(100000u); // Must not nest even when passed an overdue clock.
++            }
++            return 0u;
++        };
++        f.due(10000u);
++        require(f.executor.calls.size() == 1u && f.alarms.nextEventCycle(10000u, 30000u) == 18000u,
++                "callback mutation invalidated the queue or nested an alarm");
++        f.due(18000u);
++        require(f.executor.calls.size() == 2u && f.executor.calls.back().argument == 3u,
++                "manually replaced callback did not run");
++    }
++
++    void selfRegistrationAndNonzeroReturnStayIndependent()
++    {
++        Fixture f; require(f.set(7u) == 0, "self registration setup failed");
++        f.executor.action = [&](const Call &)
++        {
++            if (f.executor.calls.size() == 1u)
++            {
++                f.clock(8000u);
++                require(f.call(36u, clockAddress, callbackAddress, 7u, 10000u) == 0,
++                        "unlinked callback was incorrectly considered a duplicate");
++                return 5000u;
++            }
++            return 0u;
++        };
++        f.due(10000u); f.due(15000u); f.due(18000u);
++        require(f.executor.calls.size() == 3u,
++                "automatic rearm silently replaced a separately registered successor");
++    }
++
++    void resetDuringCallbackCannotResurrectOldLifetime()
++    {
++        Fixture f; require(f.set(1u) == 0 && f.set(2u) == 0, "reset setup failed");
++        f.executor.action = [&](const Call &call)
++        {
++            if (call.argument == 1u)
++            {
++                f.alarms.reset(); f.clock(5000u);
++                require(f.call(36u, clockAddress, callbackAddress, 3u, 10000u) == 0,
++                        "post-reset callback registration failed");
++                return 1u;
++            }
++            return 0u;
++        };
++        f.due(10000u);
++        const uint32_t free = f.memory.totalFreeMemory();
++        for (uint32_t arg = 100u; arg < 130u; ++arg)
++            require(f.set(arg, 10000u) == 0, "fresh pool registration failed after reset");
++        require(f.set(1000u, 10000u) == 0 && f.memory.totalFreeMemory() == free - 32u,
++                "stale callback cleanup freed a fresh registration's pool slot");
++        for (uint32_t arg = 100u; arg < 130u; ++arg)
++            require(f.call(37u, callbackAddress, arg) == 0, "fresh pool cancellation failed");
++        require(f.call(37u, callbackAddress, 1000u) == 0, "fresh overflow cancellation failed");
++        f.due(15000u); f.due(50000u);
++        require(f.executor.calls.size() == 2u && f.executor.calls[1].argument == 3u,
++                "reset resurrected an in-flight or queued old callback");
++        // A stale callback guard must not free a fresh registration's pool slot.
++        require(f.alarms.nextEventCycle(50000u, 60000u) == 60000u, "reset left an old pending timer");
++    }
++
++    void guestPreflightAndClockOverflowAreAtomic()
++    {
++        for (unsigned variant = 0u; variant < 11u; ++variant)
++        {
++            Fixture f; uint32_t clock = clockAddress, callback = callbackAddress; uint64_t now = 0u;
++            switch (variant)
++            {
++            case 0u: clock = 0u; break;
++            case 1u: clock += 1u; break;
++            case 2u: clock = 0x20002000u; break;
++            case 3u: clock = 0x1F801074u; break;
++            case 4u: clock = IopMemory::RamSize - 4u; f.memory.write32(clock, 1u); break;
++            case 5u: callback = 0u; break;
++            case 6u: callback += 1u; break;
++            case 7u: callback = 0x20003000u; break;
++            case 8u: callback = 0x4000u; break;
++            case 9u: f.clock(UINT64_MAX); break;
++            case 10u: now = uint64_t(INT64_MAX) - 100u; break;
++            }
++            const auto ram = f.memory.ram();
++            const std::vector<uint8_t> before(ram.begin(), ram.end());
++            const uint32_t free = f.memory.totalFreeMemory();
++            rejects([&] { (void)f.call(35u, clock, callback, 0u, now); }, "IOP alarm");
++            require(std::equal(before.begin(), before.end(), f.memory.ram().begin()) &&
++                        f.memory.totalFreeMemory() == free && f.alarms.nextEventCycle(0u, 10000u) == 10000u,
++                    "failed alarm preflight mutated RAM, heap or queue");
++        }
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            Fixture f; f.clock(1u);
++            require(f.call(35u, alias | clockAddress, alias | callbackAddress, 0u) == 0 &&
++                        f.memory.read32(clockAddress) == 3686u, "valid alias did not share the original clock bytes");
++        }
++        Fixture high; high.clock(0x100000000ull + 123u); require(high.set() == 0, "64-bit delay was truncated");
++        high.due(0xFFFFFFFFull); require(high.executor.calls.empty(), "high-word alarm fired in low32 range");
++        high.due(0x100000000ull + 123u); require(high.executor.calls.size() == 1u, "high-word deadline was lost");
++    }
++
++    void callbackAndRecordLeasesRejectReuse()
++    {
++        Fixture f;
++        const uint32_t code = f.memory.allocate(16u);
++        f.memory.write32(code, 0x03E00008u); require(f.set(1u, 0u, code) == 0, "owned code setup failed");
++        require(f.memory.freeAllocation(code), "could not retire authored code");
++        require(f.memory.allocate(16u) == code, "allocator did not reuse the tested hole");
++        f.memory.write32(code, 0x03E00008u);
++        rejects([&] { f.due(10000u); }, "callback allocation lifetime");
++        require(f.executor.calls.empty(), "stale callback invoked a new allocation lifetime");
++
++        Fixture records;
++        for (uint32_t arg = 0u; arg < 32u; ++arg) require(records.set(arg) == 0, "record setup failed");
++        const uint32_t old = IopMemory::HeapBase;
++        require(records.memory.freeAllocation(old) && records.memory.allocate(32u) == old,
++                "could not replace the overflow record allocation");
++        const auto replacement = records.memory.allocationContaining(old);
++        require(replacement && records.call(37u, callbackAddress, 31u) == 0,
++                "overflow record cancellation failed");
++        const auto stillLive = records.memory.allocationContaining(old);
++        require(stillLive && stillLive->identity == replacement->identity,
++                "stale alarm cleanup freed an unrelated replacement allocation");
++    }
++
++    void poolOverflowUsesRealHeapAndPreservesErrors()
++    {
++        Fixture f;
++        for (uint32_t arg = 0u; arg < 31u; ++arg) require(f.set(arg) == 0, "kernel alarm pool unexpectedly exhausted");
++        const uint32_t available = f.memory.totalFreeMemory();
++        const uint32_t blocker = f.memory.allocate(available);
++        require(blocker != 0u, "could not fill the modeled heap"); f.clock(1u);
++        require(f.set(31u) == -400 && f.memory.read32(clockAddress) == 1u &&
++                    f.call(35u, 0u, callbackAddress, 0u) == -104,
++                "allocation failure or duplicate-before-allocation error ordering changed");
++        require(f.memory.freeAllocation(blocker) && f.set(31u) == 0 &&
++                    f.memory.totalFreeMemory() == available - 32u,
++                "overflow alarm did not consume a real bounded IOP record");
++        require(f.call(37u, callbackAddress, 31u) == 0 && f.memory.totalFreeMemory() == available,
++                "cancellation leaked the dynamic alarm record");
++        require(f.set(31u) == 0, "dynamic reallocation failed"); f.alarms.reset();
++        require(f.memory.totalFreeMemory() == available, "reset leaked a dynamic alarm record");
++    }
++
++    void liveInterruptGatesRetainPendingExpiry()
++    {
++        for (unsigned gate = 1u; gate <= 3u; ++gate)
++        {
++            Fixture f; require(f.set() == 0, "masked setup failed");
++            if (gate & 1u) f.memory.write32(0xBF801078u, 0u);
++            if (gate & 2u) f.memory.write32(0xBF801074u, f.memory.interruptMask() & ~(1u << 16u));
++            f.due(50000u);
++            require(f.executor.calls.empty() && f.alarms.nextEventCycle(50000u, 60000u) == 60000u,
++                    "masked expiry ran or forced an idle one-cycle spin");
++            f.memory.write32(0xBF801078u, 1u);
++            f.memory.write32(0xBF801074u, f.memory.interruptMask() | (1u << 16u));
++            f.due(50000u); f.due(60000u);
++            require(f.executor.calls.size() == 1u && f.memory.interruptStatus() == 0u,
++                    "resume dropped/replayed expiry or entered an unprovided raw vector");
++        }
++    }
++
++    void suppliedRawTimerHandlerCannotBeBypassed()
++    {
++        Fixture f; require(f.set() == 0, "raw handler setup failed");
++        IopCpuState cpu{}; cpu.gpr[4] = 16u; cpu.gpr[6] = callbackAddress;
++        require(f.intrman.dispatchImport(4u, cpu, f.executor), "raw handler registration failed");
++        rejects([&] { f.due(10000u); }, "cannot bypass a supplied raw system-timer IRQ handler");
++        require(f.executor.calls.empty(), "alarm ownership rejection invoked a raw or modeled callback");
++        require(f.intrman.dispatchImport(5u, cpu, f.executor), "raw handler release failed");
++        f.due(10000u); require(f.executor.calls.size() == 1u, "ownership rejection consumed the queued alarm");
++    }
++
++    void kernelReservationDoesNotChangeStandaloneTimers()
++    {
++        const auto allocate = [](IopTimrman &timers)
++        {
++            IopCpuState cpu{}; cpu.gpr[4] = 1u; cpu.gpr[5] = 32u; cpu.gpr[6] = 1u;
++            require(timers.dispatchImport(4u, cpu, 0u), "timer allocation unhandled"); return cpu.gpr[2];
++        };
++        IopTimrman standalone; standalone.reset();
++        require(allocate(standalone) == 0x6BF8014Au, "standalone timer allocation order changed");
++        Fixture f;
++        require(allocate(f.timers) == 0x5BF80149u && allocate(f.timers) == 0x4BF80148u &&
++                    allocate(f.timers) == uint32_t(-150), "kernel timer was allocated a second time");
++        for (uint16_t ordinal : {6u, 7u, 9u, 11u, 20u, 22u, 23u, 24u})
++        {
++            IopCpuState cpu{}; cpu.gpr[4] = 0x6BF8014Au;
++            rejects([&] { (void)f.timers.dispatchImport(ordinal, cpu, 0u); }, "reserved by the modeled kernel");
++        }
++        IopCpuState reference{}; reference.gpr[4] = 1u; reference.gpr[5] = 32u;
++        require(f.timers.dispatchImport(5u, reference, 0u) && reference.gpr[2] == uint32_t(-150),
++                "ReferHardTimer exposed the private system clock");
++    }
++
++    void faultsUnwindScopeAndCannotResurrect()
++    {
++        Fixture f; require(f.set(1u) == 0 && f.set(2u) == 0, "fault setup failed");
++        f.executor.action = [](const Call &) -> uint32_t { throw std::runtime_error("authored callback fault"); };
++        rejects([&] { f.due(10000u); }, "authored callback fault");
++        require(!f.intrman.inInterruptContext(), "throw leaked interrupt scope");
++        f.executor.action = {};
++        f.due(10000u); f.due(20000u);
++        require(f.executor.calls.size() == 2u && f.executor.calls[1].argument == 2u,
++                "exception resurrected its callback or left the service recursively locked");
++        Fixture overflow; overflow.clock(uint64_t(INT64_MAX)); require(overflow.set() == 0, "horizon setup failed");
++        overflow.executor.action = [](const Call &) { return 1u; };
++        rejects([&] { overflow.due(uint64_t(INT64_MAX)); }, "rearm exceeds");
++        require(!overflow.intrman.inInterruptContext(), "rearm overflow leaked interrupt context");
++        Fixture clock; require(clock.set() == 0, "unsupported clock setup failed");
++        rejects([&] { clock.due(UINT64_MAX); }, "delivery exceeds");
++        require(clock.executor.calls.empty(), "unsupported clock executed a callback");
++    }
++
++    void rawTimerRegistersRespectOwnershipAndAccessSpans()
++    {
++        IopMemory standalone;
++        standalone.write32(0xBF8014A4u, 0x12345678u);
++        require(standalone.read32(0xBF8014A4u) == 0x12345678u,
++                "standalone memory gained an unrequested kernel reservation");
++        Fixture f;
++        f.memory.write32(0xBF80149Cu, 0xAABBCCDDu);
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        {
++            const uint32_t base = alias | 0x1F8014A0u;
++            for (uint32_t offset : {0u, 4u, 8u})
++            {
++                rejects([&] { (void)f.memory.read8(base + offset); }, "reserved system-alarm timer MMIO");
++                rejects([&] { (void)f.memory.read16(base + offset); }, "reserved system-alarm timer MMIO");
++                rejects([&] { (void)f.memory.read32(base + offset); }, "reserved system-alarm timer MMIO");
++                rejects([&] { f.memory.write8(base + offset, 0u); }, "reserved system-alarm timer MMIO");
++                rejects([&] { f.memory.write16(base + offset, 0u); }, "reserved system-alarm timer MMIO");
++                rejects([&] { f.memory.write32(base + offset, 0u); }, "reserved system-alarm timer MMIO");
++            }
++            rejects([&] { f.memory.write16(base - 1u, 0u); }, "reserved system-alarm timer MMIO");
++            rejects([&] { f.memory.write32(base - 1u, 0u); }, "reserved system-alarm timer MMIO");
++            require(f.memory.read32(0xBF80149Cu) == 0xAABBCCDDu,
++                    "straddling unsupported timer access partially changed adjacent registers");
++        }
++        IopMemory staged = f.memory;
++        rejects([&] { staged.write32(0xBF8014A4u, 0u); }, "reserved system-alarm timer MMIO");
++        f.memory.reset(); f.memory.write32(0xBF8014A4u, 0xCAFEBABEu);
++        require(f.memory.read32(0xBF8014A4u) == 0xCAFEBABEu, "RAM reset retained a stale reservation");
++        f.timers.reset(); f.alarms.reset();
++        rejects([&] { f.memory.write32(0xBF8014A4u, 0u); }, "reserved system-alarm timer MMIO");
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Minimum clock, one-shot argument, GP and interrupt context", clockClampAndOneShotContext},
++        {"Exact raw pairs, duplicate/cancel errors and deadline FIFO", exactPairErrorsAndFifo},
++        {"Normal/i alarm context errors precede all pointer reads", contextErrorsPrecedePointerReads},
++        {"Nonzero callback intervals rearm from the previous deadline", nonzeroReturnsUsePreviousDeadline},
++        {"Callbacks cancel and register successors after unlink", callbacksCanCancelAndReplaceAfterUnlink},
++        {"Self registration remains independent of nonzero automatic rearm", selfRegistrationAndNonzeroReturnStayIndependent},
++        {"Reset during a callback cannot revive an old lifetime", resetDuringCallbackCannotResurrectOldLifetime},
++        {"Guest spans, aliases and64-bit deadline preflight are atomic", guestPreflightAndClockOverflowAreAtomic},
++        {"Stale callback and record allocation identities cannot affect replacements", callbackAndRecordLeasesRejectReuse},
++        {"Kernel pool overflow consumes bounded IOP heap and returns actual errors", poolOverflowUsesRealHeapAndPreservesErrors},
++        {"Live CPU/IRQ masks preserve pending expiry without idle spin", liveInterruptGatesRetainPendingExpiry},
++        {"A supplied raw timer IRQ cannot be silently bypassed", suppliedRawTimerHandlerCannotBeBypassed},
++        {"Kernel reservation preserves standalone timer allocation", kernelReservationDoesNotChangeStandaloneTimers},
++        {"Callback faults and rearm overflow unwind independent lifetimes", faultsUnwindScopeAndCannotResurrect},
++        {"Raw timer register aliases and straddling accesses preserve ownership", rawTimerRegistersRespectOwnershipAndAccessSpans},
++    };
++    return iop_test::run(tests);
++}
+diff --git a/ps2xIOP/tests/iop_alarm_tests.cpp b/ps2xIOP/tests/iop_alarm_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_alarm_tests.cpp
+@@ -0,0 +1,227 @@
++#include "iop_vblank_fixtures.h"
++
++namespace
++{
++    using namespace iop_vblank_test;
++    using ps2x::iop::detail::IopEmulator;
++
++    // The integration fixtures use only the pre-existing emulator interface.
++    // They compile unchanged against the old stubbed alarm implementation.
++    struct AlarmProgram : Program
++    {
++        explicit AlarmProgram(uint32_t address = 0x10000u) : Program(address)
++        {
++            imports(0x1000u, "thbase", {35u, 36u, 37u, 38u, 34u});
++            imports(0x1300u, "timrman", {4u, 16u});
++            image.words(0x2020u, {1u, 0u});
++        }
++        void set(uint32_t callback = 0x800u, uint32_t argument = 7u, bool irq = false,
++                 uint32_t gp = 0x1337ABCDu)
++        {
++            constant(4u, data(0x20u)); constant(5u, base + callback);
++            constant(6u, argument); constant(28u, gp); call(stub(0x1000u, irq ? 1u : 0u));
++        }
++        void cancel(uint32_t callback, uint32_t argument, bool irq)
++        {
++            constant(4u, base + callback); constant(5u, argument);
++            call(stub(0x1000u, irq ? 3u : 2u));
++        }
++        void marker(uint32_t value, uint32_t address)
++        { constant(8u, value); store(8u, address); }
++    };
++
++    void oneShotRunsOriginalCodeInInterruptContext()
++    {
++        Host host; IopEmulator iop(host); AlarmProgram p;
++        p.begin(); p.set(); p.store(2u, p.data(0x40u)); p.store(28u, p.data(0x44u)); p.finish();
++        p.recordingHandler(0x800u, 0u); start(iop, p);
++        require(word(iop, p.data(0x20u)) == 3686u && word(iop, p.data(0x40u)) == 0u &&
++                    word(iop, p.data(0x44u)) == 0x1337ABCDu && word(iop, p.data()) == 0u,
++                "alarm registration failed to clamp or altered the suspended CPU");
++        advance(iop, 5000u); advance(iop, 10000u);
++        require(word(iop, p.data()) == 1u && word(iop, p.data(0x100u)) == 7u &&
++                    word(iop, p.data(0x104u)) == 0x1337ABCDu && word(iop, p.data(0x108u)) == 1u &&
++                    host.guestWrites == 0u,
++                "the scheduled MIPS callback did not run once with argument, GP and interrupt context");
++    }
++
++    void busyManagedThreadStillReceivesAlarm()
++    {
++        Host host; IopEmulator iop(host); AlarmProgram p;
++        p.image.words(0x2500u, {0x02000000u, 0u, p.base + 0x600u, 0x800u, 40u});
++        p.begin(); p.constant(4u, p.data(0x500u)); p.call(p.stub(0x1200u));
++        p.move(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1200u, 1u)); p.finish();
++        p.begin(0x600u); p.set(0x900u, 0x42u);
++        const uint32_t loop = p.cursor;
++        p.load(8u, p.data(0x60u)); p.emit(0x25080001u); p.store(8u, p.data(0x60u));
++        p.load(9u, p.data(0x64u));
++        const int32_t relative = (static_cast<int32_t>(loop) - static_cast<int32_t>(p.cursor + 4u)) / 4;
++        p.emit(0x11200000u | static_cast<uint16_t>(relative)); p.emit(0u);
++        p.marker(0xC001CAFEu, p.data(0x68u)); p.finish();
++        p.begin(0x900u); p.marker(1u, p.data(0x64u)); p.finish(0u);
++        start(iop, p); advance(iop, 10000u);
++        require(word(iop, p.data(0x60u)) > 100u && word(iop, p.data(0x64u)) == 1u &&
++                    word(iop, p.data(0x68u)) == 0xC001CAFEu,
++                "alarm was serviced only while idle or damaged a suspended running thread");
++    }
++
++    void callbackUsesIAlarmsAndExactErrors()
++    {
++        Host host; IopEmulator iop(host); AlarmProgram p;
++        p.begin();
++        p.constant(4u, 0xFFFFFFFFu); p.constant(5u, 0u); p.call(p.stub(0x1000u, 1u)); p.store(2u, p.data(0x40u));
++        p.constant(4u, 0u); p.constant(5u, 0u); p.call(p.stub(0x1000u, 3u)); p.store(2u, p.data(0x44u));
++        p.set(); p.finish();
++        p.begin(0x800u);
++        p.set(0xC00u, 8u, false); p.store(2u, p.data(0x48u));
++        p.set(0xC00u, 8u, true); p.store(2u, p.data(0x4Cu));
++        p.set(0xC00u, 8u, true); p.store(2u, p.data(0x50u));
++        p.cancel(0xC00u, 8u, false); p.store(2u, p.data(0x54u));
++        p.cancel(0xC00u, 8u, true); p.store(2u, p.data(0x58u));
++        p.cancel(0xC00u, 8u, true); p.store(2u, p.data(0x5Cu));
++        p.marker(1u, p.data(0x60u)); p.finish(0u);
++        p.recordingHandler(0xC00u, 0u);
++        require(p.cursor < 0x1000u, "authored callback overlapped imports");
++        start(iop, p); advance(iop, 15000u);
++        const uint32_t expected[] = {uint32_t(-100), uint32_t(-100), uint32_t(-100), 0u,
++                                     uint32_t(-104), uint32_t(-100), 0u, uint32_t(-105)};
++        for (size_t index = 0u; index < std::size(expected); ++index)
++            require(word(iop, p.data(0x40u + static_cast<uint32_t>(index) * 4u)) == expected[index],
++                    "normal/i context, duplicate or cancellation return did not follow the primary ABI");
++        require(word(iop, p.data(0x60u)) == 1u && word(iop, p.data()) == 0u,
++                "iCancelAlarm did not prevent its real MIPS callback");
++    }
++
++    void hardwareMaskResumeAndReset()
++    {
++        for (bool reset : {false, true})
++        {
++            Host host; IopEmulator iop(host); AlarmProgram p;
++            p.begin();
++            p.constant(4u, p.data(0x40u)); p.call(p.stub(0x1100u));
++            p.constant(4u, 16u); p.constant(5u, 0u); p.call(p.stub(0x1100u, 4u));
++            p.set(); p.finish(); p.recordingHandler(0x800u, 0u);
++            start(iop, p); advance(iop, 15000u);
++            require(word(iop, p.data()) == 0u, "masked alarm ran before resume");
++            if (reset)
++            {
++                iop.reset(); AlarmProgram empty; empty.begin(); empty.finish(); start(iop, empty);
++                advance(iop, 15000u); require(word(iop, empty.data()) == 0u, "reset retained a stale pending alarm");
++            }
++            else
++            {
++                AlarmProgram resume(0x20000u); resume.begin();
++                resume.load(8u, 0xBF801074u); resume.constant(9u, 1u << 16u);
++                resume.emit(0x01094025u); resume.store(8u, 0xBF801074u);
++                resume.constant(4u, 1u); resume.call(resume.stub(0x1100u, 1u)); resume.finish();
++                start(iop, resume); advance(iop, 2000u);
++                require(word(iop, p.data()) == 1u,
++                        "direct I_MASK/CpuResumeIntr did not deliver the real pending alarm exactly once");
++            }
++        }
++    }
++
++    void suppliedExportsAndMajorVersions()
++    {
++        for (uint32_t ordinal = 35u; ordinal <= 38u; ++ordinal)
++        {
++            for (const auto [provided, requested] : {std::pair<uint32_t, uint32_t>{0x0101u, 0x0101u},
++                                                     {0x0106u, 0x0101u}, {0x0201u, 0x0201u}})
++            {
++                Host host; IopEmulator iop(host); AlarmProgram p;
++                p.image.words(0x1008u, {requested});
++                p.image.words(0x1800u, {0x41C00000u, 0u, provided, 0x61626874u, 0x00006573u});
++                for (uint32_t slot = 0u; slot <= 38u; ++slot) p.image.words(0x1814u + slot * 4u, {p.base + 0x900u});
++                p.begin(); p.constant(4u, p.base + 0x1800u); p.call(p.stub(0x1500u));
++                p.constant(4u, 0xFFFFFFFFu); p.constant(5u, 0u); p.constant(6u, 0xDEADBEEFu);
++                p.call(p.stub(0x1000u, ordinal - 35u)); p.store(2u, p.data(0x40u)); p.finish();
++                p.begin(0x900u); p.marker(0xABCDEF01u, p.data()); p.finish(0x5A3u);
++                start(iop, p);
++                require(word(iop, p.data()) == 0xABCDEF01u && word(iop, p.data(0x40u)) == 0x5A3u,
++                        "modeled alarm shadowed a compatible original export or pre-read its pointers");
++            }
++            Host host; IopEmulator iop(host); AlarmProgram missing;
++            missing.image.words(0x1008u, {0x0201u});
++            missing.begin(); missing.constant(4u, 0xFFFFFFFFu); missing.call(missing.stub(0x1000u, ordinal - 35u)); missing.finish();
++            rejects([&] { start(iop, missing); }, "missing import thbase:" + std::to_string(ordinal));
++        }
++    }
++
++    void invalidPointersAndCallbackFaultStayStrict()
++    {
++        for (bool badClock : {false, true})
++        {
++            Host host; IopEmulator iop(host); AlarmProgram p;
++            p.begin(); p.constant(4u, badClock ? 0x1F801074u : p.data(0x20u));
++            p.constant(5u, badClock ? p.base + 0x800u : 0x40000u); p.constant(6u, 0u);
++            p.call(p.stub(0x1000u)); p.marker(1u, p.data()); p.finish();
++            p.recordingHandler(0x800u, 0u);
++            rejects([&] { start(iop, p); }, badClock ? "IOP alarm clock" : "IOP alarm callback");
++            require(word(iop, p.data()) == 0u && word(iop, p.data(0x20u)) == 1u && host.guestWrites == 0u,
++                    "failed alarm pointer validation fabricated success or changed original bytes");
++        }
++        Host host; IopEmulator iop(host); AlarmProgram p;
++        p.begin(); p.set(); p.finish();
++        p.begin(0x800u); p.call(p.stub(0x1400u)); p.marker(1u, p.data()); p.finish();
++        start(iop, p);
++        rejects([&] { advance(iop, 5000u); }, "missing import absent:42");
++        const auto instructions = iop.instructions(); iop.runEeCycles(80000u);
++        rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:42");
++        require(iop.instructions() == instructions && word(iop, p.data()) == 0u,
++                "alarm callback fault was swallowed or ran beyond the strict stop");
++        iop.reset(); AlarmProgram clean; clean.begin(); clean.finish(); start(iop, clean); advance(iop, 10000u);
++    }
++
++    void kernelOwnsTimerBeforeAnyAlarmRegistration()
++    {
++        Host host; IopEmulator iop(host); AlarmProgram p;
++        p.begin(); p.constant(4u, 1u); p.constant(5u, 32u); p.constant(6u, 1u);
++        p.call(p.stub(0x1300u)); p.store(2u, p.data()); p.move(4u, 2u);
++        p.call(p.stub(0x1300u, 1u)); p.store(2u, p.data(4u)); p.finish(); start(iop, p);
++        require(word(iop, p.data()) == 0x5BF80149u && word(iop, p.data(4u)) == 15u,
++                "kernel startup failed to reserve timer5 before the first guest timer allocation");
++    }
++
++    void rawTimerReplacementRejectsBeforeEitherCallback()
++    {
++        Host host; IopEmulator iop(host); AlarmProgram p;
++        p.begin(); p.constant(4u, 16u); p.constant(5u, 1u); p.constant(6u, p.base + 0x900u);
++        p.constant(7u, 0u); p.call(p.stub(0x1100u, 5u)); p.set(); p.finish();
++        p.recordingHandler(0x800u, 0u);
++        p.begin(0x900u); p.marker(1u, p.data(0x60u)); p.finish(1u);
++        start(iop, p);
++        rejects([&] { advance(iop, 5000u); }, "cannot bypass a supplied raw system-timer IRQ handler");
++        require(word(iop, p.data()) == 0u && word(iop, p.data(0x60u)) == 0u,
++                "raw timer ownership error invoked a guest provider or modeled alarm anyway");
++    }
++
++    void rawTimerProgrammingDoesNotInventAnotherClock()
++    {
++        for (bool write : {false, true})
++        {
++            Host host; IopEmulator iop(host); AlarmProgram p;
++            p.begin();
++            if (write) p.marker(0u, 0xBF8014A4u);
++            else p.load(8u, 0xBF8014A0u);
++            p.marker(1u, p.data()); p.finish();
++            rejects([&] { start(iop, p); }, "reserved system-alarm timer MMIO");
++            require(word(iop, p.data()) == 0u, "unsupported raw timer access silently continued");
++        }
++    }
++}
++
++int main()
++{
++    const iop_test::Test tests[] = {
++        {"Authored MIPS alarm runs once with real interrupt context, GP and clock clamp", oneShotRunsOriginalCodeInInterruptContext},
++        {"Running managed MIPS thread receives and resumes after its alarm", busyManagedThreadStillReceivesAlarm},
++        {"Original MIPS callbacks use iSet/iCancel with exact primary error results", callbackUsesIAlarmsAndExactErrors},
++        {"Pending alarms obey live hardware gates and disappear on reset", hardwareMaskResumeAndReset},
++        {"Compatible supplied alarm exports precede validation; wrong majors stay strict", suppliedExportsAndMajorVersions},
++        {"Alarm preflight and real MIPS callback faults remain strict until reset", invalidPointersAndCallbackFaultStayStrict},
++        {"Modeled kernel startup owns its system timer before guest allocations", kernelOwnsTimerBeforeAnyAlarmRegistration},
++        {"Raw timer IRQ replacement stops before any callback invocation", rawTimerReplacementRejectsBeforeEitherCallback},
++        {"Original MIPS raw system-timer accesses remain explicit unsupported boundaries", rawTimerProgrammingDoesNotInventAnotherClock},
++    };
++    return iop_test::run(tests);
++}
