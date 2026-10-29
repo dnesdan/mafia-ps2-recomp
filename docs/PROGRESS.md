@@ -49,6 +49,12 @@ A later private diagnostic reached the original Game Over menu. Its captured cal
 
 The window backend passes physical gamepad axes through the original controller path. Patch 0053 maps keyboard WASD to the left analog stick, retains arrows for the D-pad, and maps left/right Ctrl to L3/R3; a connected gamepad still takes priority. Opposite keyboard directions cancel, and Escape closes the window. Headless runs can schedule left-stick byte values with `--pad-axis-event AT_MS:lx|ly:VALUE:DURATION_MS`, independently of digital button events. Focused backend, timeline and host-contract tests exercise neutral, opposing, simultaneous and overlapping input as well as validation. These synthetic tests establish input transport, not gameplay response.
 
+## GS subpixel offset correction
+
+Patch 0054 subtracts the full 12.4 `XYOFFSET` from vertex coordinates in the CPU rasterizer and uses the same coordinate calculation in the fullscreen-copy source heuristic. Previously the low four offset bits were discarded before subtraction. The isolated original backend/frontend fail three focused tests that pass with the correction: independent X/Y translations with clipping, a known footprint under the existing raster policy, and two boundary cases for preferred display-source detection. Points, lines, sprites and triangles are covered. The change retains the current rasterizer's coverage policy; it does not claim full hardware-accurate pixel coverage.
+
+A separate instrumented first-mission run found HUD triangles and a black background, while the sampled offsets had zero fractional bits. Thus this correction is not established as the cause of the missing 3D world. The investigation continues before GS rasterization, including scene object queues and VIF-buffer dispatch.
+
 ## Latest source checkpoint: patches 0048–0050
 
 Patch 0048 implements persistent ordinary raw cards below the original Sony SIO2MAN/MCMAN/MCSERV stack. The host mounts slot 1 before guest execution and reports its image and mount state. New images are exclusively created, all-FF and unformatted; exact-size existing images are reopened without rewriting. Reads, staged writes and erase operations validate complete commands, NAND bit transitions, checksums and bounds. Completed mutations use atomic replacement and file/directory synchronization. A separate lock prevents concurrent writers; malformed images, symlinks and storage failures fail explicitly. IOP reset keeps the mounted image and discards unfinished protocol state.
