@@ -59,7 +59,7 @@
     "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0054",
+    "latest_reviewed_patch_set": "0001-0055",
     "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
       "programs_passed": 21,
@@ -175,7 +175,7 @@
     "patch_0049_sha256": "9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff",
     "patch_0049_scope": "Rename only the memory-card test helper to avoid std::exchange ADL; all production sources and tested runtime identities are unchanged.",
     "latest_runtime_production_sources_match_current_patch_set": false,
-    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/7/checks",
+    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/8/checks",
     "patch_0050_sha256": "b8d48abbadc681202e7a37db5581c1a14c7de2de942a672939672555eaa94c76",
     "patch_0050_scope": "Runtime test only: distinguish the 32-tag per-submission limit from the 512-snapshot callback aggregate; verify exact acceptance and overflow rejection. Production sources unchanged.",
     "menu_verification_scope": "Exact original ELF on Linux x86-64, with an explicit no-animation lookup substitution before startup video; main menu and profile creation observed. Normal movie playback and gameplay remain unverified.",
@@ -230,6 +230,16 @@
       "fixed_passed": 3,
       "cases": 3,
       "world_black_cause_established": false
+    },
+    "patch_0055_sha256": "3ab204cfa96492b2b197c90ee11babbc5b7c4eb4fd95c15b715e2de5750d232c",
+    "dma_spr_ref_regression": {
+      "fixed_passed": 126,
+      "fixed_total": 126,
+      "original_passed": 54,
+      "fast_path_fixed_passed": 8,
+      "fast_path_total": 8,
+      "captured_mission_spr_tags": 0,
+      "scope": "REFE/REF/REFS payloads on VIF0, VIF1 and GIF; other DMA SPR address forms remain unsupported"
     }
   },
   "progress_report": "docs/PROGRESS.md",

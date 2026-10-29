@@ -1,0 +1,225 @@
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -198,6 +198,7 @@
+         uint16_t qwc = 0;
+         uint8_t id = 0;
+         bool irq = false;
++        bool spr = false;
+         uint32_t addr = 0;
+         uint32_t upper = 0;
+     };
+@@ -208,6 +209,7 @@
+         out.qwc = static_cast<uint16_t>(tag & 0xFFFFu);
+         out.id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
+         out.irq = ((tag >> 31u) & 0x1ull) != 0ull;
++        out.spr = ((tag >> 63u) & 0x1ull) != 0ull;
+         out.addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
+         out.upper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
+         return out;
+@@ -1471,7 +1473,9 @@
+                         switch (id)
+                         {
+                         case 0:
+-                            dataAddr = addr;
++                            dataAddr = (tag & (1ull << 63)) != 0u
++                                           ? PS2_SCRATCHPAD_BASE + (addr & 0x3FF0u)
++                                           : addr;
+                             tagAddr = tagAddr + 16;
+                             endChain = true;
+                             break;
+@@ -1485,7 +1489,9 @@
+                             break;
+                         case 3:
+                         case 4:
+-                            dataAddr = addr;
++                            dataAddr = (tag & (1ull << 63)) != 0u
++                                           ? PS2_SCRATCHPAD_BASE + (addr & 0x3FF0u)
++                                           : addr;
+                             tagAddr = tagAddr + 16;
+                             break;
+                         case 5:
+@@ -2182,6 +2188,10 @@
+     uint32_t lastTagUpper = payloadTag.upper;
+     if (payloadTag.id == 3u || payloadTag.id == 4u)
+     {
++        // The generic chain handles REF/REFS scratchpad wrapping. Never let
++        // this contiguous-RAM fast path consume an SPR-addressed payload.
++        if (payloadTag.spr)
++            return false;
+         imageDataAddr = payloadTag.addr;
+         const uint32_t terminalTagAddr = payloadTagAddr + 16u;
+         DmaTagView terminalTag{};
+--- a/ps2xRuntime/Readme.md
++++ b/ps2xRuntime/Readme.md
+@@ -50,6 +50,18 @@
+ ## Instruction Patching
+ You can patch specific instructions in the recompiled code to fix game issues or implement custom behavior.
+ 
++## DMA source-chain scope
++
++For VIF0, VIF1, and GIF source chains, REFE/REF/REFS payload addresses
++honor the DMAtag SPR bit, including scratchpad alignment and wrap. The
++native GIF image upload fast path falls back to generic DMA for such payloads.
++The existing untimed model does not implement REFS stall control.
++
++This does not yet implement the DMA SPR address bit for normal-mode MADR,
++initial SPR TADR, or NEXT/CALL/ASR tag traversal. Their interaction with the
++native GIF fast paths also remains unresolved. CPU address translation and
++FromSPR/ToSPR MADR are separate from these DMA source-chain addresses.
++
+ ## Limitations
+ 
+ * Graphics and sound output require external implementations
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -32,6 +32,7 @@
+     src/ps2_runtime_vif_interrupt_tests.cpp
+     src/ps2_vif_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
++    src/ps2_spr_ref_dma_tests.cpp
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -13,6 +13,7 @@
+ void register_ps2_runtime_vif_interrupt_tests();
+ void register_ps2_vif_interrupt_tests();
+ void register_ps2_memory_tests();
++void register_ps2_spr_ref_dma_tests();
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
+@@ -41,6 +42,7 @@
+     register_ps2_runtime_vif_interrupt_tests();
+     register_ps2_vif_interrupt_tests();
+     register_ps2_memory_tests();
++    register_ps2_spr_ref_dma_tests();
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
+--- /dev/null
++++ b/ps2xTest/src/ps2_spr_ref_dma_tests.cpp
+@@ -0,0 +1,122 @@
++#include "MiniTest.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/gs/gs_frontend.h"
++#include <cstdint>
++#include <cstring>
++#include <string>
++
++namespace {
++static uint32_t runSource(uint32_t channel, uint32_t id, bool spr, bool tte, uint32_t address) {
++    PS2Memory m;
++    if (!m.initialize()) return 0xffffffffu;
++    uint8_t *ram=m.getRDRAM(), *scratch=m.getScratchpad();
++    constexpr uint32_t tagAddress=0x1000;
++    const uint32_t scratchPayload[8]={0x6c010000u,0x11223344u,0x55667788u,0x99aabbccu,0xddeeff00u,0,0,0};
++    const uint32_t ramPayload[8]={0x6c010000u,0xdeadbeefu,0xdeadbeefu,0xdeadbeefu,0xdeadbeefu,0,0,0};
++    std::memcpy(ram+address,ramPayload,sizeof ramPayload);
++    const uint8_t* bytes=reinterpret_cast<const uint8_t*>(scratchPayload);
++    for (uint32_t i=0;i<sizeof scratchPayload;i++) scratch[((address&0x3ff0u)+i)&0x3fffu]=bytes[i];
++    uint32_t captured=0xffffffffu;
++    if (channel==0x1000a000u)
++        m.setGifPacketCallback([&](const uint8_t* data,uint32_t size) {
++            if (size >= 8) std::memcpy(&captured,data+4,4);
++        });
++    const uint64_t tag=2ull | (uint64_t(id)<<28) | (uint64_t(address | (spr ? 0x80000000u : 0u))<<32);
++    const uint64_t end=7ull<<28;
++    std::memcpy(ram+tagAddress,&tag,sizeof tag);
++    std::memset(ram+tagAddress+8,0,8);
++    const uint32_t mark=0x07003456u; // TTE must deliver this MARK to VIF only.
++    std::memcpy(ram+tagAddress+8,&mark,4);
++    std::memcpy(ram+tagAddress+16,&end,sizeof end);
++    std::memset(ram+tagAddress+24,0,8);
++    m.writeIORegister(channel+0x30u,tagAddress);
++    m.writeIORegister(channel,0x105u | (tte?0x40u:0u));
++    m.processPendingTransfers();
++    if (channel==0x1000a000u) return captured;
++    const auto& regs=channel==0x10008000u ? m.vif0_regs : m.vif1_regs;
++    if (regs.mark != (tte ? 0x3456u : 0u)) return 0xfffffffeu;
++    uint32_t value=0;
++    std::memcpy(&value,channel==0x10008000u ? m.getVU0Data() : m.getVU1Data(),4);
++    return value;
++}
++
++static void u64(uint8_t* mem, uint32_t addr, uint64_t v) { std::memcpy(mem+addr,&v,8); }
++static void tag(uint8_t* mem, uint32_t addr, uint64_t v) { std::memset(mem+addr,0,16); u64(mem,addr,v); }
++static bool runFast(bool spr, bool wrap, uint32_t kind) {
++    PS2Memory mem;
++    if (!mem.initialize()) return false;
++    GS gs;
++    gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
++    mem.setGifPacketCallback([&](const uint8_t *data,uint32_t bytes){ gs.processGIFPacket(data,bytes); });
++    uint8_t *ram=mem.getRDRAM(), *scratch=mem.getScratchpad();
++    constexpr uint32_t chain=0x28000;
++    const uint32_t src=wrap?0x3ff0:0x100, qwc=2;
++    const uint32_t ramPixel=0x80ff0000u, scratchPixel=0x800000ffu;
++    for (uint32_t i=0;i<qwc*4;i++) {
++        std::memcpy(ram+src+i*4,&ramPixel,4);
++        const uint32_t off=(src+i*4)&0x3fffu;
++        std::memcpy(scratch+off,&scratchPixel,4);
++    }
++    uint32_t p=chain;
++    tag(ram,p,5ull|(1ull<<28)); p+=16;
++    u64(ram,p,4ull|(1ull<<60)); u64(ram,p+8,0xe); p+=16;
++    u64(ram,p,1ull<<48); u64(ram,p+8,GS_REG_BITBLTBUF); p+=16;
++    u64(ram,p,0); u64(ram,p+8,GS_REG_TRXPOS); p+=16;
++    u64(ram,p,8ull|(1ull<<32)); u64(ram,p+8,GS_REG_TRXREG); p+=16;
++    u64(ram,p,0); u64(ram,p+8,GS_REG_TRXDIR); p+=16;
++    tag(ram,p,1ull|(1ull<<28)); p+=16;
++    u64(ram,p,qwc|(1ull<<15)|(2ull<<58)); u64(ram,p+8,0); p+=16;
++    const uint64_t address=src|(spr?0x80000000u:0u);
++    tag(ram,p,qwc|(uint64_t(kind)<<28)|(address<<32)); p+=16;
++    tag(ram,p,7ull<<28);
++    mem.writeIORegister(0x1000a030u,chain);
++    const auto beforeCount=gs.nativeImageUploadCount();
++    const auto beforeGif=mem.gifCopyCount();
++    const bool fast=mem.tryProcessNativeGifImageUploadChain(gs,chain,0x105u);
++    if (spr) {
++        // Decline without effects; the caller then executes the generic DMA.
++        if (fast || gs.nativeImageUploadCount()!=beforeCount || mem.gifCopyCount()!=beforeGif) return false;
++        mem.writeIORegister(0x1000a000u,0x105u);
++        mem.processPendingTransfers();
++    } else if (!fast || gs.nativeImageUploadCount()!=beforeCount+1) return false;
++    const uint32_t expect=spr?scratchPixel:ramPixel;
++    return gs.ReadVram(GS_PSM_CT32,0,1,0,0)==expect &&
++           gs.ReadVram(GS_PSM_CT32,0,1,4,0)==expect;
++}
++}
++
++void register_ps2_spr_ref_dma_tests()
++{
++    MiniTest::Case("PS2SprRefDma", [](TestCase &tests)
++    {
++        tests.Run("REFE REF REFS source SPR for VIF0 VIF1 and GIF", [](TestCase &t)
++        {
++            for (uint32_t channel : {0x10008000u, 0x10009000u, 0x1000a000u})
++              for (uint32_t id : {0u, 3u, 4u})
++                for (bool tte : {false, true})
++                  for (uint32_t address : {0x100u, 0x101u, 0x3ff0u, 0x143ff0u})
++                    for (bool spr : {false, true})
++                    {
++                        // RAM alignment behavior is outside this test.
++                        if (!spr && (address & 15u)) continue;
++                        const uint32_t expected = spr ? 0x11223344u : 0xdeadbeefu;
++                        const uint32_t actual = runSource(channel, id, spr, tte, address);
++                        const auto context = "channel=" + std::to_string(channel) +
++                            " tag=" + std::to_string(id) + " tte=" + std::to_string(tte) +
++                            " addr=" + std::to_string(address) + " spr=" + std::to_string(spr);
++                        t.Equals(actual, expected, context);
++                    }
++        });
++        tests.Run("SPR GIF image REF avoids fast path and falls back without side effects", [](TestCase &t)
++        {
++            for (bool spr : {false, true})
++              for (bool wrap : {false, true})
++                for (uint32_t kind : {3u, 4u})
++                {
++                    const auto context = "spr=" + std::to_string(spr) +
++                        " wrap=" + std::to_string(wrap) + " tag=" + std::to_string(kind);
++                    t.IsTrue(runFast(spr, wrap, kind), context);
++                }
++        });
++    });
++}
