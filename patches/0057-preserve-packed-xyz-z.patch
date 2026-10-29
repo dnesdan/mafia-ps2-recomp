@@ -1,0 +1,175 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 047fff0..9c5a9ad 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -968,7 +968,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1033,7 +1033,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
++        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 02759da..9d1334f 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -37,6 +37,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
+     src/ps2_gs_xyoffset_tests.cpp
++    src/ps2_gs_packed_z_tests.cpp
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 383f701..5b68848 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -18,6 +18,7 @@ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
+ void register_ps2_gs_xyoffset_tests();
++void register_ps2_gs_packed_z_tests();
+ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+@@ -47,6 +48,7 @@ int main()
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
+     register_ps2_gs_xyoffset_tests();
++    register_ps2_gs_packed_z_tests();
+     register_ps2_iop_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
+diff --git a/ps2xTest/src/ps2_gs_packed_z_tests.cpp b/ps2xTest/src/ps2_gs_packed_z_tests.cpp
+new file mode 100644
+index 0000000..fa68620
+--- /dev/null
++++ b/ps2xTest/src/ps2_gs_packed_z_tests.cpp
+@@ -0,0 +1,115 @@
++// PACKED XYZ2/XYZ3 must retain all 32 Z bits, just like direct registers.
++#include "MiniTest.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/gs/gs_frontend.h"
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <utility>
++#include <vector>
++
++namespace {
++struct CaptureBackend final : GSRasterBackend {
++    std::vector<GSPrimitiveBatch> batches;
++    void Initialize(uint8_t *, uint32_t) override {}
++    void Reset() override {}
++    void Submit(const GSPrimitiveBatch &batch) override { batches.push_back(batch); }
++    void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override {}
++    void BeginTransfer(const GSTransferCommand &) override {}
++    void UploadImage(const uint8_t *, uint32_t) override {}
++    void Flush() override {}
++    void TextureFlush() override {}
++    void Sync(GSSyncReason) override {}
++    PresentationFrame Present(const GSPresentationRequest &) override { return {}; }
++    bool ClearFramebuffer(const GSContext &, uint32_t) override { return false; }
++    uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override { return 0; }
++    uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0; }
++    void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
++    void SnapshotVram(std::vector<uint8_t> &out) const override { out.clear(); }
++    GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
++};
++void packedVertex(GS &gs, uint64_t reg, uint32_t z, bool adc = false) {
++    const uint64_t tagLo = 1ull | (1ull << 15) | (1ull << 60);
++    const uint64_t xy = 16ull | (16ull << 32);
++    uint8_t packet[32];
++    std::memcpy(packet, &tagLo, 8);
++    std::memcpy(packet + 8, &reg, 8);
++    std::memcpy(packet + 16, &xy, 8);
++    const uint64_t hi = uint64_t(z) | (uint64_t(adc) << 47);
++    std::memcpy(packet + 24, &hi, 8);
++    gs.processGIFPacket(packet, sizeof(packet));
++}
++void verifyVertex(TestCase &t, bool xyz3, uint32_t z) {
++    for (bool packed : {false, true}) {
++        std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++        GS gs;
++        gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++        auto backend = std::make_unique<CaptureBackend>();
++        auto *capture = backend.get();
++        gs.setRasterBackend(std::move(backend));
++        gs.writeRegister(GS_REG_PRMODECONT, 1);
++        gs.writeRegister(GS_REG_PRIM, xyz3 ? GS_PRIM_LINE : GS_PRIM_POINT);
++        if (packed) packedVertex(gs, xyz3 ? 0x0d : 0x05, z);
++        else gs.writeRegister(xyz3 ? GS_REG_XYZ3 : GS_REG_XYZ2,
++                              16ull | (16ull << 16) | (uint64_t(z) << 32));
++        if (xyz3) {
++            t.Equals(capture->batches.size(), size_t(0), "XYZ3 must not draw");
++            gs.writeRegister(GS_REG_XYZ2, 32ull | (16ull << 16));
++        }
++        t.Equals(capture->batches.size(), size_t(1), "one drawing kick expected");
++        if (!capture->batches.empty())
++            t.Equals(capture->batches[0].vertices[0].z, static_cast<double>(z),
++                     packed ? "PACKED Z is exact" : "direct Z is exact");
++    }
++}
++void verifyAdc(TestCase &t, uint32_t z) {
++    std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++    GS gs;
++    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++    auto backend = std::make_unique<CaptureBackend>();
++    auto *capture = backend.get();
++    gs.setRasterBackend(std::move(backend));
++    gs.writeRegister(GS_REG_PRMODECONT, 1);
++    gs.writeRegister(GS_REG_PRIM, GS_PRIM_LINE);
++    packedVertex(gs, 0x05, z, true);
++    t.Equals(capture->batches.size(), size_t(0), "XYZ2 ADC must not draw");
++    gs.writeRegister(GS_REG_XYZ2, 32ull | (16ull << 16));
++    t.Equals(capture->batches.size(), size_t(1), "second line vertex draws");
++    if (!capture->batches.empty())
++        t.Equals(capture->batches[0].vertices[0].z, static_cast<double>(z),
++                 "XYZ2 ADC retains exact Z as line's first vertex");
++}
++void verifyDepth(TestCase &t, bool packed, uint32_t z) {
++    std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++    GS gs;
++    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++    gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
++    gs.writeRegister(GS_REG_ZBUF_1, 1ull); // page 1, Z32, write enabled
++    gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
++    gs.writeRegister(GS_REG_XYOFFSET_1, 0);
++    gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (2ull << 17)); // GEQUAL
++    gs.writeRegister(GS_REG_PRMODECONT, 1);
++    gs.writeRegister(GS_REG_PRIM, GS_PRIM_POINT);
++    gs.writeRegister(GS_REG_RGBAQ, 0x800000ffull);
++    gs.WriteVram(GS_PSM_Z32, 32, 1, 1, 1, z);
++    if (packed) packedVertex(gs, 0x05, z);
++    else gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16) | (uint64_t(z) << 32));
++    t.Equals(gs.ReadVram(GS_PSM_CT32, 0, 1, 1, 1), 0x800000ffu, "equal depth must draw");
++    t.Equals(gs.ReadVram(GS_PSM_Z32, 32, 1, 1, 1), z, "draw must retain exact depth");
++}
++}
++void register_ps2_gs_packed_z_tests() {
++    MiniTest::Case("GSPackedZ", [](TestCase &tests) {
++        for (const auto &[label, z] : {std::pair{"01000001", 0x01000001u},
++                                       std::pair{"01000003", 0x01000003u},
++                                       std::pair{"ffffffff", 0xffffffffu}}) {
++            tests.Run(std::string("A XYZ3 vertex ") + label, [z](TestCase &t) { verifyVertex(t, true, z); });
++            tests.Run(std::string("B XYZ2 vertex ") + label, [z](TestCase &t) { verifyVertex(t, false, z); });
++            tests.Run(std::string("C XYZ2 ADC ") + label, [z](TestCase &t) { verifyAdc(t, z); });
++            tests.Run(std::string("D XYZ2 depth ") + label, [z](TestCase &t) {
++                verifyDepth(t, false, z);
++                verifyDepth(t, true, z);
++            });
++        }
++    });
++}
