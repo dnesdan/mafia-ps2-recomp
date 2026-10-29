@@ -1,18 +1,18 @@
 # Verified progress
 
-Updated **2026-10-28**. **Main-menu entry, movie playback and gameplay remain unverified.** The last published original-game execution uses patches 0001–0039. Newer constructed-input tests do not change that historical run's result.
+Updated **2026-10-29**. **Main-menu entry, movie playback and gameplay remain unverified.** The recovered exact-profile game has been regenerated, rebuilt and executed with patches 0001–0047 in bounded Linux REA captures. The newest run exits the frontend and times out in original MPEG start-code scanning; no successful movie, menu or save milestone is claimed.
 
-The [patch-0044 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/4af8b23c05a78e40dec0e0c46321c0b28520fbab/docs/PROGRESS.md) retains cancellation tests and earlier execution identities. The [patch-0043 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) and [earlier detailed history](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md) preserve their complete test and screenshot provenance.
+The [patch-0045 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/f3d55ea43c21e88f33a029bb26e7a26e0e771f23/docs/PROGRESS.md) retains the direct/external blocking-sync tests. The [patch-0044 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/4af8b23c05a78e40dec0e0c46321c0b28520fbab/docs/PROGRESS.md), [patch-0043 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) and [earlier detailed history](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md) preserve the preceding test and screenshot provenance.
 
-## Latest source checkpoint: patch 0045
+## Latest source checkpoint: patch 0047
 
-[Commit b945332](https://github.com/dnesdan/mafia-ps2-recomp/commit/b94533276b589fd217f95fc5f33c467461cd384e) implements pending `sceCdSync` (`cdvdman:11`) modes **0 and 5** for the existing command model. A managed IOP caller waits on the real shared completion event without losing its import PC, argument registers, GP, return address or stack. It retries the command condition after waking: a stream callback may have submitted another read before that thread runs again.
+[Patch 0046](https://github.com/dnesdan/mafia-ps2-recomp/commit/6c710ae1259a89a71562b40b478503e04cad0a80) extends pending `sceCdSync` (`cdvdman:11`) modes **0 and 5** to one synchronous guest driver invocation inside a running managed IOP thread. It pins the exact caller while its separate driver CPU/native frame waits, schedules peers and returns without redispatching the active IOMAN Devctl import. The earlier direct managed-import and external startup/RPC paths remain available. Caller/driver stacks and GP, thread identity, read errors, successor commands and sticky failures are covered by authored tests.
 
-External startup/RPC invocations use a different path. They keep their own CPU and native call stack while bounded IOP scheduling advances device completion, alarms and ready threads. Authored MIPS tests exercise this through an actual registered IOMAN Devctl callback with independent driver and caller stacks. Idle cycles count against that invocation's budget, so a permanently masked completion cannot hang the host indefinitely. This budget is a diagnostic execution bound, not an implementation of the guest's timed Sync modes.
+Independent review found that the native return path checked scheduling priority before promoting due `DelayThread` sleepers. A higher-priority peer whose delay expired on that iteration could therefore run after the lower-priority native caller. [Patch 0047 / PR #2](https://github.com/dnesdan/mafia-ps2-recomp/pull/2) promotes due delays before that decision. The regression uses actual guest driver dispatch and fails on the unchanged patch-0046 runtime.
 
-The importer gives compatible supplied `sceCdSync` exports precedence and restricts the modeled fallback to the compatible major version. Read errors remain read errors after synchronization. Deleted events, callback faults and retired device lifetimes cannot become successful completion; full reset discards sleeping callers.
+Pending waits recheck the shared command condition after waking because a callback can submit a successor command. Native-call owners reject destructive lifecycle/reset operations while their frames are pinned; independent concurrent native waits remain rejected because their frames cannot yet resume independently. The importer still gives compatible supplied exports precedence. Diagnostic execution budgets do not implement guest timed waits.
 
-**Scope remains limited.** Pending timed/stream-wide waits, waits in IRQ or CPU-interrupt-disabled context, and blocking synchronous host invocations nested inside a running managed thread remain explicit unsupported boundaries. In particular, an external driver callback is not evidence that every nested managed-thread call is now resumable. Stream0 and raw CDVD IRQ programming also remain outside the implemented service model.
+**Scope remains limited.** One nested managed guest driver wait is supported; independently resumable concurrent native waits are not. Pending timed/stream-wide waits, waits in IRQ or CPU-interrupt-disabled context, stream0 and raw CDVD IRQ programming remain outside the implemented service model.
 
 The source reference is pinned PS2SDK [CDVDMAN `sceCdSync`](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdman/src/cdvdman.c) and the [CDVDSTM stop/start flow](https://github.com/ps2dev/ps2sdk/blob/329e2bb43287e16af16c4dde1c614e2662c24468/iop/cdvd/cdvdstm/src/cdvdstm.c). This does not claim a PS2 firmware boot, cycle-exact drive timing or a verified complete movie-stop sequence.
 
@@ -20,25 +20,27 @@ The source reference is pinned PS2SDK [CDVDMAN `sceCdSync`](https://github.com/p
 
 | Check | Observed result |
 | --- | --- |
-| Complete IOP suite, GCC 14.2 Debug | 20/20 programs passed. |
-| Complete IOP suite, Clang 17, `-O2`, assertions and strict floating-point flags | 20/20 programs passed. |
-| Complete IOP suite, GCC ASan/UBSan with leak detection | 20/20 programs passed; no sanitizer findings. |
-| NCMD/read/abort/sync suite | 51/51 groups passed. |
-| Identical final tests on unchanged patch-0044 runtime | 37/51 passed: fourteen new regression groups fail; the unsupported-mode control and all thirty-six preceding groups pass. |
-| Negative-control source check | Only the test runner and added fixture differ from the 93-file patch-0044 baseline; runtime source is unchanged. |
-| Fresh patch application | All 94 IOP files byte-identical to the tested source. |
-| Full Linux and ARM64 macOS CI, patch 0044 | All four jobs passed in [run 20](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40757496945). |
-| Full CI, patch 0045 | [Run 22](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40762352805); `.recomp.json` records the latest confirmed checkpoint without assuming a queued job passed. |
-| New original-game execution, BIOS comparison or screenshot | Not performed. |
+| Source suite, patch 0047 | 118 Python tests and 2 CTest checks passed. |
+| Native host/runtime contracts, patch 0047 | 5/5 CTest checks passed. |
+| Complete IOP suite, GCC 14.2 Debug, patch 0047 | 20/20 programs passed. |
+| NCMD/read/abort/sync suite, patch 0047 | 64/64 groups passed. |
+| Identical final tests on unchanged patch-0046 runtime | 63/64 passed; only the new due-delay priority regression failed. |
+| Negative-control source check | The 95-file preceding IOP source was verified; only the two regression fixture files differ, with runtime source unchanged. |
+| Generated integer operations, patch 0047 | 68 arithmetic cases passed under UBSan. |
+| Full Linux and ARM64 macOS CI, patch 0045 | All four jobs passed in [run 22](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40762352805). |
+| Full Linux and ARM64 macOS CI, patch 0046 | All four jobs passed in [run 40837524243](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40837524243). |
+| Patch-0047 PR CI | All four jobs passed in [run 40841887834](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40841887834) at code commit `8682be884382ed67caf332482c1b99b6379563e6`. |
+| Current original-game execution | Two Linux headless REA captures: original autosave screen at 15 seconds, then frontend exit and MPEG scanning at the 90-second diagnostic limit. |
+| Firmware execution or BIOS comparison | Not performed. The native kernel remains modeled. |
 
-Tests cover read/Nop/abort waits, low-priority peer progress, masked IRQs, successor commands, one-cycle host slices, event deletion, reset, external driver stacks, supplied exports, callback faults and unsuccessful media reads. Review passes covered continuation ownership, wakeup races, failure lifetime and platform/regression coverage. These are self-review and executed tests, not new independent reviewers or an original-game run.
+These are constructed-input tests. The independent review and reproduced priority failure establish the specific source correction; they do not establish a movie-stop sequence or original-game menu entry. The older optimized Clang and ASan/UBSan results apply to preceding checkpoints and have not been rerun locally for patch 0047.
 
 | Source identity | SHA-256 |
 | --- | --- |
-| Patch 0045 | `b47c83411b5f7743a7198c4cb2ce4ee7ca8980524eb65e3b280e567c02889b30` |
-| Baseline patch-0044 CI source archive | `e1ba87010a970a434f5aaff408be77c342da4f8f1630005919e4ab75c97b4062` |
+| Patch 0046 | `4bdc2ad8c76d621a62adcd41d0b97209849c4a8e086916af1ca5ab4d57309369` |
+| Patch 0047 | `da9a393a32a9e5664309e35caad9b80088e03a2e394a3c4ec928600ac647df0e` |
 
-The baseline archive records upstream `e5636981a1c9de368f6b71e819c3dc188dfedbf4` plus patches 0001–0044. CI archives contain verified public IOP sources and test logs, not commercial inputs, generated game code, game executables or Git metadata. They expire after seven days.
+The dependency remains upstream `e5636981a1c9de368f6b71e819c3dc188dfedbf4` plus the reviewed patch stack. CI archives contain verified public IOP sources and test logs, not commercial inputs, generated game code, game executables or Git metadata. They expire after seven days.
 
 ### Preceding changes
 
@@ -46,7 +48,7 @@ Patch 0042 fixed Apple standard-library test portability while retaining concurr
 
 ## Original-game execution status
 
-The original-data workspace is still unreachable. Retried user-supplied shares and BIOS retrieval did not recover bytes in this environment; outbound downloads fail and the original machine's tunnel is inactive. The current workspace contains public IOP sources, not the original ISO, PC archive, extracted game files, BIOS or generated game corpus. No alternative commercial download was substituted. Private share links and passwords are not stored in this repository or its CI artifacts.
+The user-supplied PS2 archive was recovered, its RAR CRC passed, and its ISO and ELF hashes exactly match the existing profile. All 281 disc files are extracted locally. The supplied 4 MiB BIOS is also available, but no firmware execution or BIOS comparison has been performed. A fresh original corpus was generated with the current verified patch stack; the native game build and two bounded executions completed. Private input files, share links and passwords are not stored in this repository or its CI artifacts.
 
 | Milestone | Historical evidence and remaining limit |
 | --- | --- |
@@ -59,11 +61,31 @@ The original-data workspace is still unreachable. Retried user-supplied shares a
 | Movie playback, main menu, missions and save/load | Not verified. |
 | Complete original game on macOS ARM64 or Linux ARM64 | Not verified. macOS CI uses constructed input, not the game corpus. |
 
-### Last recorded original run: patch 0039
+### Latest original run: patch 0047
+
+The current executable uses GCC 14.2, generated-code `-O1 -g0 -UNDEBUG`, strict floating-point flags and unity batches of 32. The regenerated source manifest is byte-identical to the historical corpus. REA **6.8.0** ran the actual executable through `capture_process_scenario`; it did not emulate or replay the game.
+
+- **15-second control:** no input pulses. Original autosave caution is visible on the 640×448 GS capture, with 220,652 nonblack pixels and VBlank 258. The exact-ELF snapshot identifies `autosave-caution`.
+- **90-second frontend flow:** Cross at 25 seconds, Up at 35 seconds and Cross at 42 seconds, each held for 800 host milliseconds through SIO2. The final menu chain is empty; 12 original IOP modules are loaded, with 9,650,165 IOP instructions and 688 SIO2 transfers. The final 640×448 GS capture is black at VBlank 685.
+- **Observed end:** diagnostic timeout, exit 124, EE PC `0x003c3914`, `_nextStartCode + 92`, with branch context `_peepBit`. No strict unsupported-import error was reported. This is a bounded observation, not proof of an infinite loop or its cause. Movie playback, main-menu entry, gameplay and saves remain unverified.
+
+Both REA captures report untruncated observations, quiesced settlement, verified owned-process cleanup and removed temporary roots. Process sampling, prelaunch executable identity, inherited environment and unobserved network activity retain REA's stated limitations. Local complete reports, capture Evidence and image bytes are retained outside the source repository; private share credentials are not included.
+
+| Current-run identity | SHA-256 / Evidence ID |
+| --- | --- |
+| Native executable | `98de4944215cc5b99dacd93cd5086588e3ccc7d3c2908bab66727f15a966ad4c` |
+| 15-second runtime report | `afe5fd01172b2d5b6124d798d10eea831ba76cf2b199296a497229c52e91127a` |
+| 90-second runtime report | `8d3af3641263ca28ee72fa3ddd75743870ed4aae13820e6db96e67ff6211a2e5` |
+| Autosave PPM | `fe1033ac946a2a5f8cb7a5cb3a2404320ceda20e75a3f8cbb58ba8e184c512ec` |
+| Final black PPM | `00c470b9619bb218650748690cd9de4a6d885656deaf8d573a1468b394f3db4a` |
+| Autosave REA Evidence | `ev_0ebeef2535c1230b5b1fbac93178f3512084d0bc131e28293c4ecf10c286b799` |
+| Frontend-flow REA Evidence | `ev_1af817d09fc94fa30ab4dd40adbf9a90a337618c8a00586240b83fe8416547a0` |
+
+### Historical original run: patch 0039
 
 The Linux window run lasted 90.861 seconds and recorded 644 presentations, 674 SIO2 transfers, 10,300,542 IOP instructions and 12 loaded modules. Original `FileInfo` at EE address `0x1FFF920` contains trailer LSN **1,269,101** and size **68,435,972 bytes**, matching the independently checked original ISO.
 
-Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return address `0x9C188`: original CDVDSTM's `sceCdNop` after selecting stream1. The final GS image was black with no active frontend menu. Later patches implement this service and related operations, but no newer full-game trace is available here to establish the next actual stop.
+Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return address `0x9C188`: original CDVDSTM's `sceCdNop` after selecting stream1. The final GS image was black with no active frontend menu. Later patches implement this service and related operations. The newer bounded patch-0047 trace above records a different end position, without establishing complete streaming correctness.
 
 | Run identity | SHA-256 |
 | --- | --- |
@@ -74,7 +96,7 @@ Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return add
 
 ![Original no-card dialog with Yes selected through the original controller drivers](screenshots/mafia-linux-no-card.png)
 
-This is the actual **patch-0035** capture, not a patch-0045 image. Cross dismissed the caution, Up selected Yes, and capture occurred after keys were released and the EE worker joined. The exact-ELF snapshot identified the original no-card class and selection, both controller records in mode `0x79`, and zero grace/settling counters. The surface is **640×448**, VBlank 664, with 221,360 nonblack pixels. PNG encoding preserves its RGB bytes.
+This is the actual **patch-0035** capture, not a current-patch image. Cross dismissed the caution, Up selected Yes, and capture occurred after keys were released and the EE worker joined. The exact-ELF snapshot identified the original no-card class and selection, both controller records in mode `0x79`, and zero grace/settling counters. The surface is **640×448**, VBlank 664, with 221,360 nonblack pixels. PNG encoding preserves its RGB bytes.
 
 | Capture identity | SHA-256 |
 | --- | --- |
@@ -87,9 +109,9 @@ Earlier [autosave caution](screenshots/mafia-linux-autosave.png) and [Gathering 
 
 ## Original input and translation
 
-The historical complete disc is MAFIA, **SLUS-20671 / VER 1.01 / NTSC**, with 281 extracted files totaling 4,126,918,314 bytes. It is not assumed present in the current workspace.
+The recovered complete disc is MAFIA, **SLUS-20671 / VER 1.01 / NTSC**, with 281 extracted files totaling 4,126,918,314 bytes. ISO and ELF identities were freshly verified against the existing profile on 2026-10-29.
 
-| Identity | Verified historical value |
+| Identity | Verified value |
 | --- | --- |
 | ISO bytes / sectors | 4,128,538,624 / 2,015,888 × 2,048 bytes |
 | ISO SHA-256 | `2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0` |
@@ -98,12 +120,13 @@ The historical complete disc is MAFIA, **SLUS-20671 / VER 1.01 / NTSC**, with 28
 | Original functions translated | 7,791, including reviewed `_start`, `_exit` and `_root` ranges |
 | Explicit stubs / skipped functions / instruction patches | 0 / 0 / 0 |
 | Generated manifest SHA-256 | `ae9f147aedbf649ab7f0dc4b862269a9d3085dd960724c3ed6938dbaaa8056a9` |
+| Supplied BIOS bytes / SHA-256 | 4,194,304 / `6d23d001daf2a0fa8b381a5d49f51753c36e3622d0f04be46af1a0c548be4744` |
 
-The original functions previously compiled into 245 Linux game objects with assertions and strict floating-point flags. Runtime-only updates through patch 0039 reran the actual generator and verified byte-identical generated sources. Later patches have not been relinked with that corpus here. The 2,506 indirect-control-flow warnings still require runtime/differential validation.
+Fresh generation produced 7,792 C++ units for 7,791 original functions, with zero unresolved source lines and no stubs or instruction patches. Its source manifest is byte-identical to the historical value above. The current corpus compiled and linked with the verified runtime, then executed in the bounded captures described above. The 2,506 historical indirect-control-flow warnings still require broader runtime/differential validation.
 
 ## Reproduce and continue
 
-Full original-game commands are in [README](../README.md). A new diagnostic run needs the matching ISO/extracted files, verified current dependencies and genuinely regenerated metadata. Retain a new report, log, executable hash and actual GS capture for each run.
+Full original-game commands are in [README](../README.md). The matching ISO, complete extraction and freshly regenerated corpus are now available locally. Retain a new report, log, executable hash and actual GS capture for each new run.
 
 To exercise IOP without commercial input:
 
@@ -118,4 +141,4 @@ ctest --test-dir build/iop-only --output-on-failure --no-tests=error
 
 The observed Linux GCC sanitizer build uses `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie` in C++ flags and `-fsanitize=address,undefined -no-pie` in executable linker flags, with `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1`. The non-PIE flags are Linux test configuration, not macOS build requirements.
 
-Next integration work is to recover the complete original-data workspace, rebuild the current patch set and repeat the real Up/Cross frontend flow through stream reads, cancellation and synchronization. Trace any remaining unsupported call before extending its contract. Only mark main-menu entry after the original menu is visible and navigable. Broader timed/nested synchronization, PCSX2 comparisons, saves, missions, audio and performance remain separate milestones.
+Next integration work is to trace MPEG `_nextStartCode` / `_peepBit` and its media-feed path, distinguish slow progress from a persistent wait, and validate original stream reads, cancellation and synchronization. Only mark main-menu entry after the original menu is visible and navigable. The missing physical memory-card path, independently resumable concurrent native waits, broader timed synchronization, PCSX2 comparisons, saves, missions, audio and performance remain separate milestones.

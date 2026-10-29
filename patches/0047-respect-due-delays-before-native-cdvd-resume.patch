@@ -1,0 +1,156 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -792,12 +792,16 @@
+         thread.waitResultAddress = 0u;
+     }
+ 
+-    bool IopKernel::nativeCallerCanResume(const NativeWaitToken &token) const noexcept
++    bool IopKernel::nativeCallerCanResume(const NativeWaitToken &token, uint64_t currentCycle)
+     {
+         const auto found = m_threads.find(token.threadId);
+         if (found == m_threads.end() || !found->second.nativeWait ||
+             found->second.state != IopThreadState::Ready || m_memory.interruptControl() == 0u)
+             return false;
++        // Device IRQ callbacks advance the guest clock. Promote delays they
++        // crossed before comparing native completion with runnable peers, just
++        // as the normal scheduler does before selecting its next continuation.
++        wakeDelayedThreads(currentCycle);
+         const IopThread &owner = found->second;
+         for (const auto &[id, peer] : m_threads)
+         {
+@@ -882,13 +886,18 @@
+         return false;
+     }
+ 
+-    IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
++    void IopKernel::wakeDelayedThreads(uint64_t currentCycle)
+     {
+         for (auto &[id, thread] : m_threads)
+         {
+             if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+                 makeReady(thread);
+         }
++    }
++
++    IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
++    {
++        wakeDelayedThreads(currentCycle);
+ 
+         IopThread *running = nullptr;
+         IopThread *next = nullptr;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -82,7 +82,7 @@
+         [[nodiscard]] NativeWaitToken parkNativeCaller(int eventId);
+         void rearmNativeCaller(const NativeWaitToken &token, int eventId);
+         void restoreNativeCaller(const NativeWaitToken &token) noexcept;
+-        [[nodiscard]] bool nativeCallerCanResume(const NativeWaitToken &token) const noexcept;
++        [[nodiscard]] bool nativeCallerCanResume(const NativeWaitToken &token, uint64_t currentCycle);
+         [[nodiscard]] bool hasNativeWaits() const noexcept { return m_nativeWaitCount != 0u; }
+ 
+         void sleepCurrent(IopCpuState &cpu);
+@@ -129,6 +129,7 @@
+         };
+ 
+         void makeReady(IopThread &thread);
++        void wakeDelayedThreads(uint64_t currentCycle);
+         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
+         void wakeOneSemaphore(int id);
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -587,7 +587,7 @@
+                 owner.token = kernel.parkNativeCaller(wait.eventId);
+             const InvocationBudget budget = *activeInvocationBudget;
+             while (!cdvd.syncWaitComplete(wait) ||
+-                   (owner.token && !kernel.nativeCallerCanResume(*owner.token)))
++                   (owner.token && !kernel.nativeCallerCanResume(*owner.token, totalCycles)))
+             {
+                 if (totalCycles >= budget.cycleLimit ||
+                     totalInstructions - budget.instructionStart >= budget.instructions)
+@@ -991,7 +991,7 @@
+                     if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                         servicePendingGuestCallbacks();
+                     if (nativeOwner && cdvd.syncWaitComplete(*nativeSync) &&
+-                        kernel.nativeCallerCanResume(*nativeOwner))
++                        kernel.nativeCallerCanResume(*nativeOwner, totalCycles))
+                         break;
+                     if (kernel.shouldReschedule(cpu))
+                         break;
+@@ -1251,7 +1251,7 @@
+                     // budget and may already have consumed its final cycles.
+                     if (totalCycles >= target ||
+                         (nativeOwner && cdvd.syncWaitComplete(*nativeSync) &&
+-                         kernel.nativeCallerCanResume(*nativeOwner)))
++                         kernel.nativeCallerCanResume(*nativeOwner, totalCycles)))
+                         break;
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+diff --git a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+--- a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
++++ b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+@@ -472,6 +472,7 @@
+ int main()
+ {
+     const iop_test::Test tests[] = {
++        {"Due delayed peers enter priority queues before native sync resumes", iop_cdvd_nested_sync_test::dueDelaysPrecedeNativeResume},
+         {"Native completion respects priority and same-priority continuations", iop_cdvd_nested_sync_test::nativeResumeRespectsPriorityAndRunningPeers},
+         {"Managed Devctl sync preserves caller and driver CPUs", iop_cdvd_nested_sync_test::managedDriverPreservesBothCpus},
+         {"Nested driver waits schedule peers without redispatching their owner", iop_cdvd_nested_sync_test::maskedDriverWaitRunsPeersWithoutReenteringOwner},
+diff --git a/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h b/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h
+--- a/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h
++++ b/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h
+@@ -201,6 +201,50 @@
+         require(word(iop, p.data(0xC0u)) == 1u && host.reads == 1u,
+                 "forced event wake redispatched the active native caller");
+     }
++    void dueDelaysPrecedeNativeResume()
++    {
++        for (bool busyPeer : {false, true})
++        for (uint32_t peerPriority : {10u, 20u, 60u})
++        for (uint64_t chunk : {1u, 17u, 10000u})
++        {
++            DiscHost host; IopEmulator iop(host); NestedProgram p;
++            p.imports(0x1A00u, "thbase", {34u}); // GetSystemTime.
++            p.begin(); p.driver(); p.thread(0x400u, 0x2500u, 20u, 0x70u);
++            p.thread(0x800u, 0x2540u, peerPriority, 0x74u);
++            if (busyPeer) p.thread(0xC00u, 0x2580u, 80u, 0x78u);
++            p.finish();
++            p.caller();
++            p.begin(0x600u); p.load(8u, p.data(0xC0u)); p.emit(0x25080001u); p.store(8u, p.data(0xC0u));
++            p.stream(); p.read(); p.sync();
++            // Observe inside the driver: the next outer host slice could wake
++            // the delayed peer and hide an incorrect native return order.
++            p.load(8u, p.data(0xD0u)); p.store(8u, p.data(0xD8u)); p.finish(0x456u);
++            p.begin(0x800u); p.constant(4u, p.data(0xE0u)); p.call(p.stub(0x1A00u));
++            p.delay(20u); p.mark(1u, 0xD0u); p.finish();
++            // This real guest IRQ spans the sleeping peer's deadline. Cover
++            // completion both with idle CPUs and within a running peer's slice.
++            p.begin(0xA00u); p.constant(8u, 512u);
++            p.emit(0x2508FFFFu); p.emit(0x1500FFFEu); p.emit(0u); // Counted MIPS loop.
++            p.constant(4u, p.data(0xE8u)); p.call(p.stub(0x1A00u));
++            p.mark(1u, 0u); p.finish();
++            if (busyPeer)
++            {
++                p.begin(0xC00u); p.constant(8u, 1024u);
++                p.emit(0x2508FFFFu); p.emit(0x1500FFFEu); p.emit(0u); p.finish();
++            }
++            prepare(iop); start(iop, p);
++            for (uint64_t elapsed = 0u; elapsed < 10000u; elapsed += chunk) advance(iop, chunk);
++            returned(iop, p); continued(iop, p); matches(iop, host);
++            require(word(iop, p.data(0xE8u)) > word(iop, p.data(0xE0u)) + 1000u &&
++                        word(iop, p.data(0xD0u)) == 1u,
++                    "authored IRQ did not cross the delayed peer's deadline");
++            require(word(iop, p.data(0xD8u)) == (peerPriority < 20u ? 1u : 0u),
++                    "native sync resumed before a due higher-priority peer or behind a later equal/lower-priority peer");
++            require(word(iop, p.data(0xC0u)) == 1u && host.reads == 1u,
++                    "due-delay handoff redispatched the active driver import");
++        }
++    }
++
+     void nativeResumeRespectsPriorityAndRunningPeers()
+     {
+         for (uint32_t peerPriority : {10u, 20u, 60u})
