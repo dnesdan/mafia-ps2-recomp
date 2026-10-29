@@ -126,9 +126,18 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
     check(validation["ee_final_context"] is None, "ELF-only validation invented a guest context")
     check(validation["controller_input"]["host_samples"] == 0,
           "ELF-only validation sampled a controller device")
+    check(validation["skip_intro"] == {"requested": False, "substitutions": 0},
+          "Validation reported an unrequested intro skip")
     check(validation["symbol"] == "synthetic_entry" and validation["symbol_address"] == 0x100000
           and validation["symbol_offset"] == 0 and validation["symbol_source"] == "verified-elf"
           and validation["symbol_lookup_error"] == "", "Verified entry symbol was not resolved")
+
+    code, unsupported_skip = run("skip-intro-wrong-profile", fixture, "--skip-intro")
+    check(code == 1 and unsupported_skip["elf_verified"] and not unsupported_skip["elf_loaded"]
+          and not unsupported_skip["entry_executed"]
+          and unsupported_skip["skip_intro"] == {"requested": True, "substitutions": 0}
+          and "only supported for the verified SLUS-20671 profile" in unsupported_skip["error"],
+          "Intro skip was not rejected before guest execution for a different verified profile")
 
     code, execution = run("strict-return", fixture)
     check(code == 1 and execution["status"] == "missing-dispatch", "Root zero return did not fail closed")
@@ -150,8 +159,12 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
           and len(context["stack"]["bytes_hex"]) == 32,
           "Final context lost the actual guest stack pointer or read past the end of RAM")
     check(execution["io_snapshot_error"] == "" and execution["io_registers"]["vif1_stat"] == 0
-          and execution["io_registers"]["vif1_dma_chcr"] == 0,
-          "EE-only fixture invented VIF or DMA state")
+          and execution["io_registers"]["vif1_dma_chcr"] == 0
+          and all(execution["io_registers"][key] == 0 for key in
+                  ("ipu_cmd_data", "ipu_cmd_high", "ipu_ctrl", "ipu_bp", "ipu_top",
+                   "ipu_from_chcr", "ipu_from_madr", "ipu_from_qwc",
+                   "ipu_to_chcr", "ipu_to_madr", "ipu_to_qwc", "ipu_to_tadr")),
+          "EE-only fixture invented VIF, IPU or DMA state")
     check(execution["iop_snapshot_error"] == "" and execution["iop"]["instructions"] == 0
           and execution["iop"]["loaded_guest_modules"] == 0
           and execution["iop"]["guest_rpc_servers"] == 0,
