@@ -2,6 +2,7 @@
 // Emit a host test from the actual upstream instruction translator.
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <array>
 #include <cstdint>
@@ -45,6 +46,26 @@ struct TrapRuntime {
     emit("addi64_negative", OPCODE_DADDI, 0, -1);
     emit("addiu64", OPCODE_DADDIU, 0, 1);
     emit("addiu64_negative", OPCODE_DADDIU, 0, -1);
+    R5900Decoder decoder;
+    struct SqrtCase { const char* name; uint32_t opcode; };
+    // Real game instruction plus separate, src/dest aliases and all-distinct encodings.
+    constexpr std::array<SqrtCase, 5> sqrts{{
+        {"sqrt_game", 0x460100c4}, // fd=3, ft=1, fs=0 (Mafia GetScale)
+        {"sqrt_alias", 0x46020084}, // fd=ft=2, fs=0 (Mafia SetDir3)
+        {"sqrt_fd_fs", 0x460518c4}, // fd=fs=3, ft=5
+        {"sqrt_zero", 0x46003804}, // fd=0, ft=0, fs=7
+        {"sqrt_distinct", 0x46135304}, // fd=12, ft=19, fs=10
+    }};
+    for (const auto& entry : sqrts) {
+        const Instruction inst = decoder.decodeInstruction(0x1000, entry.opcode, false);
+        if (inst.opcode != OPCODE_COP1 || inst.rs != COP1_S || inst.function != COP1_S_SQRT ||
+            inst.rt != ((entry.opcode >> 16) & 31) ||
+            inst.rd != ((entry.opcode >> 11) & 31) ||
+            inst.sa != ((entry.opcode >> 6) & 31))
+            throw std::runtime_error("SQRT decode mismatch");
+        std::cout << "void " << entry.name << "(R5900Context *ctx) {\n"
+                  << generator.translateInstruction(inst) << "\n}\n";
+    }
     struct Branch { const char *name; uint32_t opcode, rt, comparison; };
     const std::array<Branch, 12> branches{{
         {"blez", OPCODE_BLEZ, 0, 0}, {"blezl", OPCODE_BLEZL, 0, 0},
@@ -93,6 +114,23 @@ void check(Op op, uint64_t a, uint64_t b, int destination, uint64_t expected, bo
     }
 }
 int main() {
+    struct SqrtCase { const char* name; void (*fn)(R5900Context*); unsigned ft, fs, fd; };
+    const std::array<SqrtCase,5> sqrt_cases{{
+        {"game", sqrt_game, 1,0,3}, {"alias", sqrt_alias,2,0,2},
+        {"fd_fs", sqrt_fd_fs,5,3,3}, {"zero", sqrt_zero,0,7,0},
+        {"distinct",sqrt_distinct,19,10,12}
+    }};
+    unsigned sqrt_failures=0;
+    for (const auto& c : sqrt_cases) {
+        R5900Context ctx{};
+        for (unsigned i=0;i<32;++i) ctx.f[i]=81.0f;
+        ctx.f[c.fs]=0.00000001f;
+        ctx.f[c.ft]=9.0f;
+        c.fn(&ctx);
+        if(ctx.f[c.fd]!=3.0f) { std::cerr << "SQRT " << c.name << " expected 3 got " << ctx.f[c.fd] << '\n'; ++sqrt_failures; }
+    }
+    if(sqrt_failures) { std::cerr << sqrt_failures << " of 5 SQRT operand cases failed\n"; return 1; }
+    std::cout << "5 actual decoded SQRT operand/alias cases passed\n";
     constexpr uint64_t high = 0x7fffffffffffffffull;
     constexpr uint64_t low = 0x8000000000000000ull;
     constexpr uint64_t minus1 = 0xffffffffffffffffull;
