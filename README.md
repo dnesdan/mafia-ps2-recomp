@@ -6,7 +6,7 @@ Static recompilation of the original PlayStation 2 **Mafia** executable for Linu
 
 A patch-0048 original-game run accepted the formatted card, left the frontend after Cross and reached movie initialization. Its 60-second diagnostic limit expired in `_waitIpuIdle64` with a black surface. Movie playback remains under investigation. Linux and ARM64 macOS CI passed through patch 0050; current checks and detailed provenance are in [the progress report](docs/PROGRESS.md).
 
-An isolated diagnostic build substituted the first animation lookup so the original game followed its no-animation branch, then original controller input created a profile and reached the main menu. Video playback and gameplay have not been established. The normal [autosave caution](docs/screenshots/mafia-linux-card-autosave.png) appears before the game queries the card.
+An isolated diagnostic build used original no-animation branches for the startup and New Game movies, then continued past the earlier card autosave error with the scoped metadata budget in patch 0052. It subsequently reached another first-mission movie and timed out in the unimplemented IPU path. Video playback and gameplay have not been established. The normal [autosave caution](docs/screenshots/mafia-linux-card-autosave.png) appears before the game queries the card.
 
 ## Build from your own disc
 

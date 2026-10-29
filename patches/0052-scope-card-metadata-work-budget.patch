@@ -1,0 +1,214 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -647,7 +647,14 @@
+         constexpr uint32_t kMemoryCardStorageBudget = 64'000'000u;
+         const bool cardStorageCall = sid == kMemoryCardSid &&
+             (function == 0x10u || function == 0x0Au || function == 3u);
+-        uint32_t callBudget = cardStorageCall ? kMemoryCardStorageBudget : 0u;
++        // Card detection can scan/repair metadata and Open(create/truncate)
++        // can release a populated save's cluster chain and flush dirty cache.
++        // The supplied original drivers exceed the short bound on both paths.
++        // Restrict the longer metadata bound to their complete public ABIs.
++        const bool cardMetadataCall = sid == kMemoryCardSid &&
++            ((function == 1u && input.size() == 48u) ||
++             (function == 2u && input.size() == 1044u));
++        uint32_t callBudget = cardStorageCall || cardMetadataCall ? kMemoryCardStorageBudget : 0u;
+         if (sid == kMemoryCardSid && (function == 5u || function == 6u) && input.size() == 48u)
+         {
+             const uint32_t size = uint32_t{input[12]} | (uint32_t{input[13]} << 8u) |
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "iop_vblank_fixtures.h"
+ #include "iop_scheduler_fixtures.h"
+ #include "iop_card_admission_fixtures.h"
++#include "iop_card_metadata_fixtures.h"
+ #include "emulator/iop_emulator.h"
+ 
+ #include <functional>
+@@ -1646,6 +1647,8 @@
+ int main()
+ {
+     const Test tests[] = {
++        {"Card metadata calls wait for real peer completion beyond the short invocation budget", iop_card_metadata_test::metadataCallbacksWaitForRealPeers},
++        {"Card metadata budgets retain ABI/service scope and finite no-completion failures", iop_card_metadata_test::metadataBudgetsStayScopedAndFinite},
+         {"Event results use bounded writable RAM rather than preinitialized input ownership", iop_card_admission_test::eventResultsAcceptUninitializedWritableRam},
+         {"Owned external kernel waits pump real peer semaphore/event signals and bound idle work", iop_card_admission_test::externalKernelWaitsPumpOwnedPeers},
+         {"Invalid external wait IDs and patterns do not pump unrelated work", iop_card_admission_test::invalidExternalWaitsDoNotPump},
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -1027,7 +1027,7 @@
+         constexpr uint32_t server = 0x1000u, callback = 0x2000u;
+         constexpr uint32_t buffer = 0x3000u, stack = 0x4000u, result = 0x5000u;
+         if (!memory.zeroRam(server, 0x30u) || !memory.zeroRam(callback, 4u) ||
+-            !memory.zeroRam(buffer, 48u) || !memory.zeroRam(stack, 32u) ||
++            !memory.zeroRam(buffer, 1056u) || !memory.zeroRam(stack, 32u) ||
+             !memory.zeroRam(result, 4u))
+             return false;
+         executor.callbackResult = result;
+@@ -1055,7 +1055,7 @@
+                     executor.lastBudget == 64'000'000u,
+                     "flush/close did not receive the finite dirty-cache budget"))
+             return false;
+-        for (uint32_t command : {1u, 0x11u, 2u, 5u, 6u})
++        for (uint32_t command : {4u, 0x11u, 2u, 5u, 6u})
+             (void)bridge.executePacketCall(0x80000400u, server, command, request, 4u, executor);
+         if (!expect(registerServer(0x12345678u), "other RPC registration failed"))
+             return false;
+@@ -1080,7 +1080,7 @@
+                     "failed format published or replaced pending EE transfers"))
+             return false;
+         executor.throwCall = false;
+-        (void)bridge.executePacketCall(0x80000400u, server, 1u, request, 4u, executor, &transfers);
++        (void)bridge.executePacketCall(0x80000400u, server, 4u, request, 4u, executor, &transfers);
+         if (!expect(executor.calls == 13u && executor.budgetedCalls == 4u && transfers.empty(),
+                     "failed format leaked packet ownership into the next callback"))
+             return false;
+@@ -1107,8 +1107,26 @@
+             (void)bridge.executePacketCall(0x12345678u, server, command, request, 4u, executor);
+             (void)bridge.executePacketCall(0x80000400u, server, command, std::span(request).first(47u), 4u, executor);
+         }
+-        return expect(executor.budgetedCalls == previous,
+-                      "bulk work budget escaped to seek, another SID or a different descriptor ABI");
++        if (!expect(executor.budgetedCalls == previous,
++                    "bulk work budget escaped to seek, another SID or a different descriptor ABI"))
++            return false;
++        std::vector<uint8_t> metadata(1045u);
++        for (const auto [command, bytes] : std::array<std::pair<uint32_t, size_t>, 2u>{{{1u, 48u}, {2u, 1044u}}})
++        {
++            const uint32_t before = executor.budgetedCalls;
++            (void)bridge.executePacketCall(0x80000400u, server, command, std::span(metadata).first(bytes), 4u, executor);
++            if (!expect(executor.budgetedCalls == before + 1u && executor.lastBudget == 64'000'000u,
++                        "complete card GetInfo/Open metadata work did not receive its finite bound"))
++                return false;
++        }
++        const uint32_t metadataBefore = executor.budgetedCalls;
++        for (const auto [command, bytes] : std::array<std::pair<uint32_t, size_t>, 6u>{{
++                 {1u, 47u}, {1u, 49u}, {1u, 1044u}, {2u, 48u}, {2u, 1043u}, {2u, 1045u}}})
++            (void)bridge.executePacketCall(0x80000400u, server, command, std::span(metadata).first(bytes), 4u, executor);
++        for (const auto [command, bytes] : std::array<std::pair<uint32_t, size_t>, 2u>{{{1u, 48u}, {2u, 1044u}}})
++            (void)bridge.executePacketCall(0x12345678u, server, command, std::span(metadata).first(bytes), 4u, executor);
++        return expect(executor.budgetedCalls == metadataBefore,
++                      "card metadata bound escaped its complete ABI or SID");
+     }
+ 
+     bool testPacketSequentialDmaSnapshotsAreBounded()
+diff --git a/ps2xIOP/tests/iop_card_metadata_fixtures.h b/ps2xIOP/tests/iop_card_metadata_fixtures.h
+new file mode 100644
+--- /dev/null
++++ b/ps2xIOP/tests/iop_card_metadata_fixtures.h
+@@ -0,0 +1,111 @@
++#pragma once
++
++#include "iop_vblank_fixtures.h"
++
++namespace iop_card_metadata_test
++{
++    using namespace iop_vblank_test;
++    using ps2x::iop::SifEeTransfer;
++
++    inline Program metadataProgram(uint32_t sid, bool signal)
++    {
++        Program p;
++        p.image.bytes.resize(0x4100u, 0u);
++        for (uint32_t at : {68u, 72u})
++        {
++            p.image.bytes[at] = 0u;
++            p.image.bytes[at + 1u] = 0x40u;
++            p.image.bytes[at + 2u] = p.image.bytes[at + 3u] = 0u;
++        }
++        p.imports(0x1800u, "sifcmd", {17u});
++        p.imports(0x1900u, "thbase", {33u});
++        p.image.words(0x2400u, {0u, 0u, p.base + 0xB00u, 0x1000u, 20u});
++        p.image.words(0x2300u, {0x12345678u});
++        p.begin();
++        p.constant(4u, p.data(0x100u)); p.call(p.stub(0x1300u)); p.store(2u, p.data(0x40u));
++        p.constant(4u, p.data(0x400u)); p.call(p.stub(0x1200u)); p.store(2u, p.data(0x44u));
++        p.constant(4u, p.data(0x200u)); p.constant(5u, sid);
++        p.constant(6u, p.base + 0x600u); p.constant(7u, p.data(0x800u));
++        p.emit(0xAFA00010u); p.emit(0xAFA00014u); p.emit(0xAFA00018u);
++        p.call(p.stub(0x1800u)); p.finish();
++
++        p.begin(0x600u);
++        if (signal)
++        {
++            p.load(4u, p.data(0x44u)); p.constant(5u, 0u);
++            p.call(p.stub(0x1200u, 1u));
++        }
++        p.load(4u, p.data(0x40u)); p.constant(5u, 8u);
++        p.constant(6u, 0u); p.constant(7u, 0u);
++        p.call(p.stub(0x1300u, 2u)); p.finish(p.data(0x300u));
++
++        p.begin(0xB00u); p.constant(4u, 70000u); p.call(p.stub(0x1900u));
++        p.constant(8u, 1u); p.store(8u, p.data(0x48u));
++        p.load(4u, p.data(0x40u)); p.constant(5u, 8u);
++        p.call(p.stub(0x1300u, 1u)); p.finish();
++        return p;
++    }
++
++    inline void checkMetadataInvocation(uint32_t sid, uint32_t function, size_t inputSize,
++                                        bool signal, bool success, uint64_t maximum)
++    {
++        Host host;
++        IopEmulator iop(host);
++        const auto p = metadataProgram(sid, signal);
++        start(iop, p);
++        uint32_t server = 0u, buffer = 0u, callback = 0u;
++        require(iop.getPacketRpcServer(sid, server, buffer, callback), "metadata regression server absent");
++        std::vector<uint8_t> input(inputSize, 0u);
++        if (inputSize >= 1044u)
++        {
++            input[8] = 3u; input[9] = 2u;
++            constexpr char path[] = "/TEST/SAVE";
++            std::memcpy(input.data() + 20u, path, sizeof(path));
++        }
++        const uint64_t before = iop.cycles();
++        std::vector<SifEeTransfer> transfers{{0x4000u, {0xA5u}}};
++        bool failed = false;
++        try
++        {
++            const auto output = iop.executePacketRpc(sid, server, function, input, 4u, &transfers);
++            require(output == std::vector<uint8_t>({0x78u, 0x56u, 0x34u, 0x12u}),
++                    "metadata callback result changed");
++        }
++        catch (const std::runtime_error &error)
++        {
++            failed = true;
++            require(std::string_view(error.what()).find("external kernel wait exhausted its invocation budget") !=
++                        std::string_view::npos, "metadata test failed for another reason");
++        }
++        const uint64_t elapsed = iop.cycles() - before;
++        require(failed != success, "metadata wait completed with the wrong budget scope");
++        require(elapsed >= 2'000'000u && elapsed <= maximum + 20'000u,
++                "metadata wait did not retain its finite cycle bound");
++        if (success)
++            require(word(iop, p.data(0x48u)) == 1u && transfers.empty(),
++                    "metadata wait bypassed real peer or leaked ordered output");
++        else
++            require(transfers.size() == 1u && transfers[0].data == std::vector<uint8_t>({0xA5u}),
++                    "failed metadata callback published partial EE output");
++    }
++
++    inline void metadataCallbacksWaitForRealPeers()
++    {
++        // An authored peer signals the same event pattern after 70 ms of modeled
++        // IOP time (>2M cycles). No original driver/game bytes are embedded here.
++        checkMetadataInvocation(0x80000400u, 2u, 1044u, true, true, 64'000'000u);
++        checkMetadataInvocation(0x80000400u, 1u, 48u, true, true, 64'000'000u);
++    }
++
++    inline void metadataBudgetsStayScopedAndFinite()
++    {
++        for (size_t bytes : {47u, 49u, 1044u})
++            checkMetadataInvocation(0x80000400u, 1u, bytes, true, false, 2'000'000u);
++        for (size_t bytes : {48u, 1043u, 1045u})
++            checkMetadataInvocation(0x80000400u, 2u, bytes, true, false, 2'000'000u);
++        checkMetadataInvocation(0x80000400u, 4u, 1044u, true, false, 2'000'000u);
++        checkMetadataInvocation(0x12345678u, 1u, 48u, true, false, 2'000'000u);
++        checkMetadataInvocation(0x12345678u, 2u, 1044u, true, false, 2'000'000u);
++        checkMetadataInvocation(0x80000400u, 2u, 1044u, false, false, 64'000'000u);
++    }
++}
