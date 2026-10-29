@@ -2,13 +2,13 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original frontend graphics and input verified on Linux; main menu and gameplay remain unverified.** A fresh patch-0047 Linux run rendered the original autosave caution. A 90-second headless run with Cross/Up/Cross then left the frontend and timed out in the original MPEG `_nextStartCode` routine with a black surface. It reported no strict unsupported-import error; movie playback and the cause of the timeout remain unverified.
+**Status: original frontend graphics, input and ordinary virtual-card storage verified on Linux; main menu and gameplay remain unverified.** Patch 0048 attaches a persistent 8 MiB card through SIO2 and the original Sony memory-card drivers. A 512 KiB file survived format/write/flush/close, full readback and reopening in a new process. This verifies the driver storage path; saving a Mafia mission remains unverified.
 
-Subsequent patches implement kernel alarms, deferred `sceCdNop` completion, owned stream1 reads through `sceCdRE`, cancellation through `sceCdBreak`, and blocking `sceCdSync` modes 0/5. Patch 0046 also preserves one synchronous guest driver call nested inside a managed IOP thread. Patch 0047 fixes priority ordering when a delayed peer becomes ready before that caller resumes. All twenty IOP programs and all 64 CDVD command regression groups pass locally with GCC; Linux and ARM64 macOS CI are confirmed through patch 0047. Independent concurrent native waits, timed/stream-wide waits, stream0 and IRQ/interrupt-disabled waits remain unsupported. The exact original disc, its complete extraction and the supplied BIOS are now available locally; the original C++ corpus has been regenerated and the current native game executed in bounded REA captures. These runs do not establish movie playback, menu entry or working saves. See [the progress report](docs/PROGRESS.md) for evidence and CI status.
+A current original-game run accepted the formatted card, left the frontend after Cross and reached movie initialization. Its 60-second diagnostic limit expired in `_waitIpuIdle64` with a black surface. Movie playback and the cause of that timeout remain under investigation. Local source, runtime, all 21 IOP programs and focused ASan/UBSan checks pass. Linux and ARM64 macOS CI are confirmed through patch 0047; current pull-request checks and detailed provenance are in [the progress report](docs/PROGRESS.md).
 
-![Original Mafia no-card dialog with Yes selected through the original controller drivers on Linux](docs/screenshots/mafia-linux-no-card.png)
+![Original Mafia autosave caution with a mounted virtual card, patch 0048 on Linux](docs/screenshots/mafia-linux-card-autosave.png)
 
-Actual 640×448 GS capture from the original program on Linux, encoded as PNG with identical RGB pixels. This patch-0035 window run reached the original no-card dialog, selected Yes through real keyboard input and closed cleanly after saving the frame. It documents the working dialog and selection; main-menu entry remains unverified. No newer screenshot is claimed.
+Actual patch-0048 640×448 GS capture, encoded as PNG with identical RGB pixels. This initial caution is normal game behavior: Cross continues. It appears before the game queries the card and is not an absent-card error.
 
 ## Build from your own disc
 
@@ -45,6 +45,8 @@ The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA
 
 `MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and running the original game corpus on Apple Silicon remain separate milestones. A desktop session is required for the window. F11 toggles fullscreen. When no desktop gamepad is available, the keyboard fallback maps Enter to Start, X or Space to Cross, C to Circle, and the arrows or WASD to directions. These samples feed controller port 1 through SIO2, allowing the original PADMAN module to process them. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio.
 
+Slot 1 uses `SAVE_ROOT/slot1.ps2` by default. Linux defaults to `.local/memory-cards` under the working directory; macOS uses `~/Library/Application Support/MafiaNative/memory-cards`. Use `--save-root PATH` to choose that directory, `--memory-card IMAGE.ps2` to select an existing raw card, or `--no-memory-card` for an intentional absent-card run. A missing image is created **blank and unformatted**; original drivers own formatting and save files. Existing images are preserved, and invalid geometry or an image already in use fails before guest entry. Supported raw images contain 8 MiB of data plus 16 spare bytes per 512-byte page (8,650,752 bytes total). Plain 8 MiB images are not converted automatically. Physical MagicGate authentication and protected files are unsupported.
+
 For a bounded headless Linux run after building (use `run_macos.sh` on macOS):
 
 ```sh
@@ -74,7 +76,7 @@ bash tools/test.sh
 
 `tools/recompile.sh` supports `--elf`, `--work`, `--upstream`, `--tools-build` and an optional external `--function-map`. By default it exports the retained function symbols plus reviewed boot-code boundaries. It uses PS2Recomp's CSV format without claiming that Ghidra was run. For a stripped executable, obtain reviewed boundaries with upstream's `ps2xRecomp/tools/ghidra/ExportPS2Functions.java` and create an exact build profile first.
 
-CI runs source-only Python/C++ tests, native-host contracts, the upstream runtime suite, all twenty IOP test programs and emitted-integer UBSan checks on Linux and ARM64 macOS. `MafiaHostContract.app` compiles the real native host with an authored test ELF; it is not a game build. CI retains verified public IOP sources and test logs for seven days. It never downloads or uploads commercial fixtures. Game milestones require separate evidence from the original program.
+CI runs source-only Python/C++ tests, native-host contracts, the upstream runtime suite, all 21 IOP test programs and emitted-integer UBSan checks on Linux and ARM64 macOS. `MafiaHostContract.app` compiles the real native host with an authored test ELF; it is not a game build. CI retains verified public IOP sources and test logs for seven days. It never downloads or uploads commercial fixtures. Game milestones require separate evidence from the original program.
 
 ## Design and license
 

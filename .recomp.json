@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "original-mpeg-start-code-scan-timeout-under-investigation",
+    "stage": "virtual-card-persistence-verified-mpeg-ipu-timeout-under-investigation",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -23,21 +23,21 @@
     "game_initialization_complete": false,
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
-      "subsystem": "Original MPEG/video pipeline after frontend exit",
+      "subsystem": "Original MPEG/IPU video pipeline after frontend exit",
       "status": "bounded-run-timeout-under-investigation",
-      "description": "A 90-second original-game headless run with Cross/Up/Cross reached this PC, with an empty active menu chain and a black GS surface. No strict unsupported-import error occurred; the underlying cause and eventual progress remain unestablished.",
+      "description": "A 60-second formatted-card original-game run accepted ordinary virtual storage, left the frontend after Cross and timed out at _waitIpuIdle64 with a black GS surface. Movie playback, main-menu entry and Mafia mission saves remain unverified.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
     },
     "last_observed_original_blocker": {
-      "patch_set": "0001-0047",
+      "patch_set": "0001-0048",
       "kind": "bounded-execution-timeout",
-      "subsystem": "Original MPEG start-code scanning",
-      "ee_pc": "0x003c3914",
-      "symbol": "_nextStartCode",
-      "symbol_offset": 92,
-      "branch_symbol": "_peepBit",
-      "description": "A 90-second original-game headless run with Cross/Up/Cross reached this PC, with an empty active menu chain and a black GS surface. No strict unsupported-import error occurred; the underlying cause and eventual progress remain unestablished."
+      "subsystem": "Original MPEG/IPU idle wait",
+      "ee_pc": "0x003c3348",
+      "symbol": "_waitIpuIdle64",
+      "symbol_offset": 0,
+      "branch_symbol": "_flushBuf",
+      "description": "A 60-second formatted-card original-game run accepted ordinary virtual storage, left the frontend after Cross and timed out at _waitIpuIdle64 with a black GS surface. Movie playback, main-menu entry and Mafia mission saves remain unverified."
     },
     "macos_arm64_synthetic_host_verified": true,
     "first_game_frame_verified": false,
@@ -48,32 +48,31 @@
     "startup_screenshot": "docs/screenshots/mafia-linux-gathering.png",
     "menu_verified": false,
     "macos_arm64_synthetic_host_verified_patch_set": "0001-0047",
-    "latest_runtime_patch_set": "0001-0047",
+    "latest_runtime_patch_set": "0001-0048",
     "latest_runtime_platform": "linux-x86_64",
-    "latest_runtime_binary_sha256": "98de4944215cc5b99dacd93cd5086588e3ccc7d3c2908bab66727f15a966ad4c",
+    "latest_runtime_binary_sha256": "395882e3d654e9d1c3ffa22ed8259aabb63a772679db4f8dddaf62a5dac56d0a",
     "updated_macos_ci_verified": true,
     "linux_arm64_game_execution_verified": false,
     "last_verified_ci_patch_set": "0001-0047",
-    "last_verified_ci_run": 40841887834,
+    "last_verified_ci_run": 40846058172,
     "original_frontend_screen_verified": true,
-    "frontend_screenshot": "docs/screenshots/mafia-linux-no-card.png",
+    "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0047",
-    "latest_local_iop_test_patch_set": "0001-0047",
+    "latest_reviewed_patch_set": "0001-0050",
+    "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
-      "programs_passed": 20,
+      "programs_passed": 21,
       "programs_failed": 0,
       "gcc_version": "14.2.0",
       "optimized_clang_run": false,
-      "asan_ubsan_run": false,
+      "focused_asan_ubsan_programs_passed": 5,
+      "leak_detection_enabled": false,
       "ncmd_stream_cases_passed": 64,
       "ncmd_stream_cases_total": 64,
-      "preceding_source_patch_set": "0001-0046",
-      "same_cases_passed_on_preceding_source": 63,
-      "new_cases_failing_on_preceding_source": 1,
-      "preceding_runtime_source_verified_files": 95,
-      "preceding_runtime_changed_test_files": 2,
+      "sio2_groups_passed": 29,
+      "dmacman_groups_passed": 7,
+      "strict_loader_groups_passed": 64,
       "original_game_execution": false
     },
     "blocking_cdvd_sync_supported_modes": [
@@ -96,7 +95,7 @@
     "original_iop_controller_input_verified": true,
     "latest_runtime_evidence_kind": "original-full-game-headless-rea-process-capture",
     "latest_runtime_patch_set_is_historical": false,
-    "latest_runtime_uses_current_reconstructed_patch_set": true,
+    "latest_runtime_uses_current_reconstructed_patch_set": false,
     "controller_input_verified_buttons_in_original_frontend": [
       "Up",
       "Cross"
@@ -107,7 +106,7 @@
     "original_layer_zero_file_search_dispatched": true,
     "original_movie_playback_verified": false,
     "audio_output_verified": false,
-    "frontend_screenshot_kind": "original-no-card-dialog-with-Yes-selected",
+    "frontend_screenshot_kind": "original-autosave-caution-with-mounted-card",
     "original_video_file_metadata_received": true,
     "original_stream_start_entered": true,
     "latest_local_source_tests": {
@@ -137,19 +136,48 @@
       "import": "cdvdman:46 version=0x0101",
       "iop_pc": "0x9D2B8",
       "iop_ra": "0x9C188",
-      "description": "sceCdNop was unsupported in the last recorded original-game executable. Later patches implement it, but a newer original-game run remains unverified."
+      "description": "Historical sceCdNop stop; later patches implement it and current original-game runs reach the MPEG/IPU pipeline."
     },
-    "latest_runtime_report_sha256": "8d3af3641263ca28ee72fa3ddd75743870ed4aae13820e6db96e67ff6211a2e5",
-    "latest_runtime_rea_evidence_id": "ev_1af817d09fc94fa30ab4dd40adbf9a90a337618c8a00586240b83fe8416547a0",
-    "latest_runtime_diagnostic_limit_ms": 90000,
+    "latest_runtime_report_sha256": "2b579cb748aef7bf105cd413f2da369936710e75445392b2ee0a5480c75cbac4",
+    "latest_runtime_rea_evidence_id": "ev_e6af0b3ad886dcdc64d1e9690fd3658e09715b1e90720682f087b17ad942dc5b",
+    "latest_runtime_diagnostic_limit_ms": 60000,
     "latest_runtime_frontend_active_menu": 0,
     "latest_runtime_frame_nonblack_pixels": 0,
-    "latest_runtime_iop_instructions": 9650165,
+    "latest_runtime_iop_instructions": 9026341,
     "latest_runtime_iop_loaded_modules": 12,
-    "latest_runtime_sio2_transfers": 688,
+    "latest_runtime_sio2_transfers": 661,
     "current_patch_startup_graphics_verified": true,
-    "current_patch_autosave_capture_sha256": "fe1033ac946a2a5f8cb7a5cb3a2404320ceda20e75a3f8cbb58ba8e184c512ec",
-    "current_patch_bios_execution_verified": false
+    "current_patch_autosave_capture_sha256": "afd74791069e028d9f1a545255c6b9310d4a4ead7839218e5c36094882f497f4",
+    "current_patch_bios_execution_verified": false,
+    "historical_patch_0047_blocker": {
+      "patch_set": "0001-0047",
+      "kind": "bounded-execution-timeout",
+      "subsystem": "Original MPEG start-code scanning",
+      "ee_pc": "0x003c3914",
+      "symbol": "_nextStartCode",
+      "symbol_offset": 92,
+      "branch_symbol": "_peepBit",
+      "description": "A 90-second original-game headless run with Cross/Up/Cross reached this PC, with an empty active menu chain and a black GS surface. No strict unsupported-import error occurred; the underlying cause and eventual progress remain unestablished."
+    },
+    "patch_0048_sha256": "1e6b0002b39ba1c34b341d0599c7e8712e5b98eae8f0c8c4eb420f7a45e2214b",
+    "ordinary_virtual_memory_card_verified": true,
+    "physical_magicgate_verified": false,
+    "mafia_mission_save_load_verified": false,
+    "original_driver_memory_card_acceptance": {
+      "payload_bytes": 524288,
+      "format_write_flush_close_read_verified": true,
+      "new_process_full_readback_verified": true,
+      "hle_memory_card_operations": 0,
+      "physical_authentication": "modeled ordinary virtual storage admission only"
+    },
+    "latest_runtime_memory_card_packets": 595,
+    "latest_runtime_memory_card_missing_devices": 0,
+    "patch_0049_sha256": "9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff",
+    "patch_0049_scope": "Rename only the memory-card test helper to avoid std::exchange ADL; all production sources and tested runtime identities are unchanged.",
+    "latest_runtime_production_sources_match_current_patch_set": true,
+    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks",
+    "patch_0050_sha256": "b8d48abbadc681202e7a37db5581c1a14c7de2de942a672939672555eaa94c76",
+    "patch_0050_scope": "Runtime test only: distinguish the 32-tag per-submission limit from the 512-snapshot callback aggregate; verify exact acceptance and overflow rejection. Production sources unchanged."
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,
@@ -187,7 +215,7 @@
     "available_in_current_workspace": true
   },
   "latest_regenerated_original_corpus": {
-    "patch_set": "0001-0047",
+    "patch_set": "0001-0048",
     "functions": 7791,
     "cpp_units": 7792,
     "unresolved_source_lines": 0,
@@ -196,6 +224,6 @@
     "sources_manifest_sha256": "ae9f147aedbf649ab7f0dc4b862269a9d3085dd960724c3ed6938dbaaa8056a9",
     "matches_historical_manifest": true,
     "current_game_execution_verified": true,
-    "current_game_execution_scope": "Bounded startup and frontend-to-MPEG flow only; menu, movie playback, gameplay and saves unverified."
+    "current_game_execution_scope": "Bounded startup and formatted-card frontend-to-MPEG/IPU flow; driver-level persistence verified separately. Menu, movie playback, gameplay and Mafia mission saves unverified."
   }
 }

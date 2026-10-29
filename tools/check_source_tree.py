@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_PARTS = {".deps", ".work", ".local", "data", "extracted", "generated", "reports", "build", "dist"}
-FORBIDDEN_SUFFIXES = {".iso", ".elf", ".irx", ".rar", ".7z", ".bin", ".dta", ".fql", ".pss", ".dat"}
+FORBIDDEN_SUFFIXES = {".iso", ".elf", ".irx", ".rar", ".7z", ".bin", ".dta", ".fql", ".pss", ".dat", ".ps2"}
 MAGIC = (b"\x7fELF", b"Rar!", b"7z\xbc\xaf\x27\x1c", b"ISD0")
 RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tga", ".dds", ".ppm", ".pgm", ".pbm", ".tif", ".tiff"}
 SCREENSHOT_ROOT = Path("docs/screenshots")

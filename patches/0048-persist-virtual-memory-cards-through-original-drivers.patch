@@ -1,0 +1,3309 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index 01f2e2b229baf25bd37d64f62f15151922188e95..58f33bb8c1431afc17483d9ca4c1cd7ef4b7a82f 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -16,6 +16,7 @@ add_library(ps2_iop STATIC
+     src/emulator/core/iop_kernel.cpp
+     src/emulator/core/iop_mailbox.cpp
+     src/emulator/core/iop_memory.cpp
++    src/emulator/core/iop_memory_card.cpp
+     src/emulator/core/iop_sio2.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+@@ -54,6 +55,11 @@ add_library(ps2x::iop ALIAS ps2_iop)
+ 
+ if(PS2X_IOP_BUILD_TESTS)
+     enable_testing()
++    add_executable(ps2_iop_memory_card_tests tests/iop_memory_card_tests.cpp)
++    target_link_libraries(ps2_iop_memory_card_tests PRIVATE ps2_iop)
++    target_include_directories(ps2_iop_memory_card_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
++    add_test(NAME ps2_iop_memory_card_tests COMMAND ps2_iop_memory_card_tests)
++
+     add_executable(ps2_iop_cdvd_ncmd_tests tests/iop_cdvd_ncmd_tests.cpp)
+     target_link_libraries(ps2_iop_cdvd_ncmd_tests PRIVATE ps2_iop)
+     target_include_directories(ps2_iop_cdvd_ncmd_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index e565aa4a86f977fa9bfce34286231e37c76445fc..a4221e1e5a84973e14cc3616f55a6fb8a2ed6bf9 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -5,6 +5,7 @@
+ #include "ps2x/iop/iop_sif_transfer.h"
+ 
+ #include <memory>
++#include <filesystem>
+ #include <span>
+ #include <string>
+ #include <string_view>
+@@ -51,6 +52,8 @@ namespace ps2x::iop
+         void reset();
+         // Host sample updates may run concurrently with IOP execution/reset.
+         void setControllerState(uint32_t port, const ControllerState &state);
++        // Mount while guest execution is stopped; IOP resets retain the image.
++        void mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create);
+         [[nodiscard]] std::vector<uint8_t> readRebootImage(std::string_view path) const;
+         void rebootFromImage(std::string path, std::vector<uint8_t> image);
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 1b3faef5b62b6388e13f06d0c06e2b246d8d76aa..a942373de0710e51afeb294ed2c1615575e59ce1 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -433,7 +433,7 @@ namespace ps2x::iop::detail
+         return true;
+     }
+ 
+-    bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu)
++    bool IopKernel::dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu, bool allowBlocking)
+     {
+         const auto setV0 = [&](int32_t value)
+         {
+@@ -491,6 +491,8 @@ namespace ps2x::iop::detail
+             }
+             else if (ordinal == 9)
+                 setV0(-419);
++            else if (!allowBlocking)
++                throw NativeWaitPending();
+             else if (m_currentThread != nullptr)
+             {
+                 m_currentThread->state = IopThreadState::Semaphore;
+@@ -607,7 +609,7 @@ namespace ps2x::iop::detail
+         return true;
+     }
+ 
+-    bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu)
++    bool IopKernel::dispatchEventImport(uint16_t ordinal, IopCpuState &cpu, bool allowBlocking)
+     {
+         const auto setV0 = [&](int32_t value)
+         {
+@@ -680,6 +682,16 @@ namespace ps2x::iop::detail
+             }
+             const uint32_t bits = cpu.gpr[5];
+             const uint32_t mode = cpu.gpr[6];
++            const uint32_t result = cpu.gpr[7];
++            const uint32_t segment = result & 0xE0000000u;
++            const uint32_t physical = IopMemory::physicalAddress(result);
++            // This is a write-only caller result. It need not contain bytes
++            // previously initialized by the host's readable-input ledger.
++            const bool writableResult = result == 0u ||
++                ((result & 3u) == 0u && (segment == 0u || segment == 0x80000000u || segment == 0xA0000000u) &&
++                 physical <= IopMemory::RamSize - 4u);
++            if (bits == 0u || (mode & ~0x11u) != 0u || !writableResult)
++                throw std::runtime_error("IOP event wait has an invalid pattern, mode or result range");
+             if (eventSatisfied(event->second, bits, mode))
+             {
+                 if (cpu.gpr[7] != 0u)
+@@ -690,6 +702,8 @@ namespace ps2x::iop::detail
+             }
+             else if (ordinal == 11)
+                 setV0(-418);
++            else if (!allowBlocking)
++                throw NativeWaitPending();
+             else if (m_currentThread != nullptr)
+             {
+                 m_currentThread->state = IopThreadState::EventFlag;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index b194b6a54f8724fbde2226892750937b06749957..cc84fbb7c1e49cbbf83ffbf4dc4c6491224f5b30 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
++#include <stdexcept>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -53,13 +54,19 @@ namespace ps2x::iop::detail
+     class IopKernel
+     {
+     public:
++        class NativeWaitPending final : public std::runtime_error
++        {
++        public:
++            NativeWaitPending() : std::runtime_error("IOP native kernel wait is pending") {}
++        };
++
+         explicit IopKernel(IopMemory &memory) noexcept;
+ 
+         void reset();
+ 
+         [[nodiscard]] bool dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
+-        [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);
+-        [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu, bool allowBlocking = true);
++        [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu, bool allowBlocking = true);
+         [[nodiscard]] bool dispatchMailboxImport(uint16_t ordinal, IopCpuState &cpu, bool interruptContext = false);
+ 
+         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 468cc1055fdfcaa1bba39d1ec22eabdd45f464bf..cc700d06a6f128905b7a991d8a232cce20afbb2f 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -179,6 +179,8 @@ namespace ps2x::iop::detail
+     void IopMemory::write8(uint32_t address, uint8_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (phys >= 0x1F801540u && phys < 0x1F801560u)
++            throw std::runtime_error("SIO2 DMA register writes require aligned 32-bit access");
+         guardKernelAlarmTimerRegisters(phys, 1u);
+         if (phys >= Sio2Base && phys < Sio2End)
+         {
+@@ -208,6 +210,8 @@ namespace ps2x::iop::detail
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (uint64_t(phys) < 0x1F801560u && uint64_t(phys) + 2u > 0x1F801540u)
++            throw std::runtime_error("SIO2 DMA register writes require aligned 32-bit access");
+         guardKernelAlarmTimerRegisters(phys, 2u);
+         if (uint64_t(phys) < Sio2End && uint64_t(phys) + 2u > Sio2Base)
+         {
+@@ -229,6 +233,8 @@ namespace ps2x::iop::detail
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        if (uint64_t(phys) < 0x1F801560u && uint64_t(phys) + 4u > 0x1F801540u && (phys & 3u) != 0u)
++            throw std::runtime_error("SIO2 DMA register writes require aligned 32-bit access");
+         guardKernelAlarmTimerRegisters(phys, 4u);
+         if (uint64_t(phys) < Sio2End && uint64_t(phys) + 4u > Sio2Base)
+         {
+@@ -323,6 +329,12 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        if (address >= 0x1F801540u && address < 0x1F801560u)
++        {
++            const auto registers = m_sio2Registers.lock();
++            if (!registers) throw std::runtime_error("SIO2 DMA read without a live device");
++            return registers->readSio2DmaRegister(address);
++        }
+         if (address >= CdvdBase && address < CdvdEnd)
+         {
+             uint32_t result = 0u;
+@@ -348,6 +360,13 @@ namespace ps2x::iop::detail
+ 
+     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
+     {
++        if (address >= 0x1F801540u && address < 0x1F801560u)
++        {
++            const auto registers = m_sio2Registers.lock();
++            if (!registers) throw std::runtime_error("SIO2 DMA write without a live device");
++            registers->writeSio2DmaRegister(address, value);
++            return;
++        }
+         switch (address)
+         {
+         case 0x1F801070u:
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 48cde39b34297c1e676a0b53e35af44aefd084a8..9008ca71e57b17ca4a3fe5aea0848268104e0fec 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -27,6 +27,8 @@ namespace ps2x::iop::detail
+         virtual ~IopSio2Registers() = default;
+         [[nodiscard]] virtual uint32_t readSio2Register(uint32_t physical, uint32_t width) = 0;
+         virtual void writeSio2Register(uint32_t physical, uint32_t width, uint32_t value) = 0;
++        [[nodiscard]] virtual uint32_t readSio2DmaRegister(uint32_t physical) const = 0;
++        virtual void writeSio2DmaRegister(uint32_t physical, uint32_t value) = 0;
+     };
+ 
+     class IopMemory
+diff --git a/ps2xIOP/src/emulator/core/iop_memory_card.cpp b/ps2xIOP/src/emulator/core/iop_memory_card.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab7b9d60b27764898ca4a0c954249342f2f6361e
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_memory_card.cpp
+@@ -0,0 +1,338 @@
++#include "iop_memory_card.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <fcntl.h>
++#include <stdexcept>
++#include <string>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        [[noreturn]] void storageError(const char *operation)
++        {
++            const int error = errno;
++            throw std::runtime_error(std::string("IOP memory-card ") + operation + ": " + std::strerror(error));
++        }
++
++        class File
++        {
++        public:
++            explicit File(int descriptor = -1) : fd(descriptor) {}
++            ~File() { if (fd >= 0) (void)::close(fd); }
++            File(const File &) = delete;
++            File &operator=(const File &) = delete;
++            int release() noexcept { const int result = fd; fd = -1; return result; }
++            int fd;
++        };
++
++        void writeAll(int fd, std::span<const uint8_t> bytes)
++        {
++            size_t offset = 0u;
++            while (offset < bytes.size())
++            {
++                const ssize_t written = ::write(fd, bytes.data() + offset, bytes.size() - offset);
++                if (written < 0 && errno == EINTR) continue;
++                if (written < 0) storageError("write failed");
++                if (written == 0) throw std::runtime_error("IOP memory-card write made no progress");
++                offset += static_cast<size_t>(written);
++            }
++        }
++
++        void syncDirectory(const std::filesystem::path &directory)
++        {
++            File fd(::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
++            if (fd.fd < 0) storageError("directory open failed");
++            if (::fsync(fd.fd) < 0) storageError("directory sync failed");
++        }
++
++        uint8_t xorBytes(std::span<const uint8_t> bytes)
++        {
++            uint8_t value = 0u;
++            for (const uint8_t byte : bytes) value ^= byte;
++            return value;
++        }
++    }
++
++    class IopMemoryCard::Impl
++    {
++    public:
++        enum class Address { None, Erase, Write, Read };
++        struct Change { size_t offset; std::vector<uint8_t> bytes; bool erase = false; };
++        struct State
++        {
++            uint8_t terminator = 0x55u;
++            Address address = Address::None;
++            size_t cursor = 0u;
++            size_t pendingBytes = 0u;
++            std::vector<Change> pending;
++        };
++        struct Result { std::vector<uint8_t> response; std::vector<Change> changes; };
++
++        ~Impl() { if (fd >= 0) (void)::close(fd); }
++
++        void requireMounted() const
++        {
++            if (fd < 0) throw std::runtime_error("IOP memory card is not mounted");
++            if (failed) throw std::runtime_error("IOP memory-card storage has a previous failure; reopen the card");
++        }
++
++        Result process(std::span<const uint8_t> tx, size_t receiveSize, State &next) const
++        {
++            requireMounted();
++            if (tx.size() < 2u || tx[0] != 0x81u)
++                throw std::runtime_error("IOP memory-card packet requires its complete 0x81 prefix and command");
++            const uint8_t command = tx[1];
++            size_t expected = 0u;
++            switch (command)
++            {
++            case 0x11u: case 0x12u: case 0x81u: case 0x82u: expected = 4u; break;
++            case 0x21u: case 0x22u: case 0x23u: expected = 9u; break;
++            case 0x26u: expected = 13u; break;
++            case 0x27u: case 0x28u: case 0xBFu: case 0xF3u: expected = 5u; break;
++            case 0x42u: case 0x43u:
++                if (tx.size() < 3u || tx[2] == 0u || tx[2] > 128u)
++                    throw std::runtime_error("IOP memory-card data length must be 1..128 bytes");
++                expected = size_t{tx[2]} + 6u;
++                break;
++            case 0xF0u: case 0xF1u: case 0xF2u: case 0xF7u:
++                throw std::runtime_error("IOP memory-card cryptographic authentication is unsupported");
++            default:
++                throw std::runtime_error("IOP memory-card serial command is unsupported: " + std::to_string(command));
++            }
++            if (tx.size() != expected || receiveSize != expected)
++                throw std::runtime_error("IOP memory-card packet has an invalid transmit/receive size");
++
++            Result result{std::vector<uint8_t>(expected, 0u), {}};
++            auto &rx = result.response;
++            rx[expected - 2u] = 0x2Bu;
++            rx[expected - 1u] = next.terminator;
++            switch (command)
++            {
++            case 0x11u: // Presence and erase/write status, without fake formatting.
++            case 0x12u:
++            case 0xBFu: // Boot/status ACK: current terminator; no auth or storage effect.
++                break;
++            case 0x21u: case 0x22u: case 0x23u:
++            {
++                if (!next.pending.empty())
++                    throw std::runtime_error("IOP memory-card write requires an end command before changing address");
++                if (xorBytes(tx.subspan(2u, 4u)) != tx[6u])
++                    throw std::runtime_error("IOP memory-card address XOR is invalid");
++                const uint32_t page = uint32_t{tx[2]} | (uint32_t{tx[3]} << 8u) |
++                    (uint32_t{tx[4]} << 16u) | (uint32_t{tx[5]} << 24u);
++                if (page >= PageCount) throw std::runtime_error("IOP memory-card page is out of range");
++                next.cursor = size_t{page} * PageBytes;
++                next.address = command == 0x21u ? Address::Erase :
++                    (command == 0x22u ? Address::Write : Address::Read);
++                break;
++            }
++            case 0x26u:
++            {
++                rx[2u] = 0x2Bu; // Standard PS2 flags, including guest-supplied ECC.
++                const std::array<uint8_t, 8u> geometry{0x00u, 0x02u, 0x10u, 0x00u,
++                                                     0x00u, 0x40u, 0x00u, 0x00u};
++                std::copy(geometry.begin(), geometry.end(), rx.begin() + 3u);
++                rx[11u] = xorBytes(geometry);
++                break;
++            }
++            case 0x27u:
++                next.terminator = tx[2u];
++                rx[4u] = next.terminator;
++                break;
++            case 0x28u:
++                rx[2u] = 0x2Bu;
++                rx[3u] = next.terminator;
++                break;
++            case 0x42u: case 0x43u:
++            {
++                const size_t count = tx[2u];
++                const Address wanted = command == 0x42u ? Address::Write : Address::Read;
++                if (next.address != wanted || next.cursor > ImageBytes || count > ImageBytes - next.cursor)
++                    throw std::runtime_error("IOP memory-card data transfer has no matching address or exceeds storage");
++                rx[3u] = 0x2Bu;
++                if (command == 0x42u)
++                {
++                    const auto bytes = tx.subspan(3u, count);
++                    if (xorBytes(bytes) != tx[3u + count])
++                        throw std::runtime_error("IOP memory-card write XOR is invalid");
++                    if (next.pendingBytes > ImageBytes - count)
++                        throw std::runtime_error("IOP memory-card unfinished write exceeds storage");
++                    next.pending.push_back({next.cursor, {bytes.begin(), bytes.end()}});
++                    next.pendingBytes += count;
++                    rx[count + 4u] = xorBytes(bytes);
++                }
++                else
++                {
++                    std::copy_n(image.begin() + next.cursor, count, rx.begin() + 4u);
++                    rx[count + 4u] = xorBytes(std::span<const uint8_t>(rx).subspan(4u, count));
++                }
++                next.cursor += count;
++                break;
++            }
++            case 0x81u:
++                result.changes = std::move(next.pending);
++                next.pending.clear();
++                next.pendingBytes = 0u;
++                next.address = Address::None;
++                break;
++            case 0x82u:
++                if (next.address != Address::Erase || !next.pending.empty())
++                    throw std::runtime_error("IOP memory-card erase requires an erase address");
++                result.changes.push_back({(next.cursor / (PageBytes * PagesPerBlock)) *
++                    PageBytes * PagesPerBlock, std::vector<uint8_t>(PageBytes * PagesPerBlock, 0xFFu), true});
++                next.address = Address::None;
++                break;
++            case 0xF3u:
++                // Reset transport authentication state only. No challenge or
++                // cryptographic authentication is claimed by this command.
++                next = {};
++                rx[4u] = next.terminator;
++                break;
++            }
++            return result;
++        }
++
++        void commit(const std::vector<Change> &changes)
++        {
++            if (changes.empty()) return;
++            std::vector<uint8_t> candidate = image;
++            for (const auto &change : changes)
++            {
++                if (change.erase)
++                    std::fill_n(candidate.begin() + change.offset, change.bytes.size(), 0xFFu);
++                else
++                    for (size_t index = 0u; index < change.bytes.size(); ++index)
++                        candidate[change.offset + index] &= change.bytes[index];
++            }
++
++            // A complete replacement leaves the old exact-sized raw image
++            // intact on failures before rename. It also persists spare/ECC
++            // bytes exactly as authored by the guest. Unchanged erases do no I/O.
++            static std::atomic<uint64_t> sequence{0u};
++            const auto temporary = path.parent_path() /
++                (path.filename().string() + ".tmp." + std::to_string(::getpid()) + "." +
++                 std::to_string(sequence.fetch_add(1u)));
++            bool renamed = false;
++            bool created = false;
++            try
++            {
++                struct stat mounted{}, named{};
++                if (::fstat(fd, &mounted) < 0) storageError("mounted image stat failed");
++                if (::lstat(path.c_str(), &named) < 0) storageError("image path stat failed");
++                if (!S_ISREG(named.st_mode) || named.st_dev != mounted.st_dev ||
++                    named.st_ino != mounted.st_ino || named.st_size != static_cast<off_t>(ImageBytes))
++                    throw std::runtime_error("IOP memory-card mounted image identity or size changed");
++                if (candidate == image) return;
++                File replacement(::open(temporary.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
++                if (replacement.fd < 0) storageError("replacement create failed");
++                created = true;
++                if (::flock(replacement.fd, LOCK_EX | LOCK_NB) < 0) storageError("replacement lock failed");
++                writeAll(replacement.fd, candidate);
++                if (::fsync(replacement.fd) < 0) storageError("replacement sync failed");
++                if (::rename(temporary.c_str(), path.c_str()) < 0) storageError("replacement rename failed");
++                renamed = true;
++                (void)::close(fd);
++                fd = replacement.release();
++                image.swap(candidate);
++                syncDirectory(path.parent_path());
++            }
++            catch (...)
++            {
++                if (created && !renamed) (void)::unlink(temporary.c_str());
++                failed = true; // A post-rename sync error must never become success on retry.
++                throw;
++            }
++        }
++
++        int fd = -1;
++        bool failed = false;
++        std::filesystem::path path;
++        std::vector<uint8_t> image;
++        State state;
++    };
++
++    IopMemoryCard::IopMemoryCard() : m_impl(std::make_unique<Impl>()) {}
++    IopMemoryCard::~IopMemoryCard() = default;
++
++    void IopMemoryCard::mount(const std::filesystem::path &input, bool create)
++    {
++        if (attached()) throw std::runtime_error("IOP memory card is already mounted");
++        const auto path = std::filesystem::absolute(input).lexically_normal();
++        if (path.filename().empty()) throw std::runtime_error("IOP memory-card image path is empty");
++        bool created = false;
++        int descriptor = ::open(path.c_str(), O_RDWR | O_NOFOLLOW | O_CLOEXEC);
++        if (descriptor < 0 && errno == ENOENT && create)
++        {
++            descriptor = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++            created = descriptor >= 0;
++        }
++        if (descriptor < 0) storageError("image open failed");
++        File file(descriptor);
++        try
++        {
++            if (::flock(file.fd, LOCK_EX | LOCK_NB) < 0) storageError("image is already in use");
++            struct stat info{};
++            if (::fstat(file.fd, &info) < 0) storageError("image stat failed");
++            if (!S_ISREG(info.st_mode) || (!created && info.st_size != static_cast<off_t>(ImageBytes)))
++                throw std::runtime_error("IOP memory-card image must be a regular 8 MiB raw PS2 image with 16-byte page spares");
++            std::vector<uint8_t> image(ImageBytes, 0xFFu);
++            if (created)
++            {
++                writeAll(file.fd, image);
++                if (::fsync(file.fd) < 0) storageError("new image sync failed");
++                syncDirectory(path.parent_path());
++            }
++            else
++            {
++                size_t offset = 0u;
++                while (offset < image.size())
++                {
++                    const ssize_t count = ::read(file.fd, image.data() + offset, image.size() - offset);
++                    if (count < 0 && errno == EINTR) continue;
++                    if (count < 0) storageError("image read failed");
++                    if (count == 0) throw std::runtime_error("IOP memory-card image shortened during mount");
++                    offset += static_cast<size_t>(count);
++                }
++            }
++            m_impl->path = path;
++            m_impl->image.swap(image);
++            m_impl->state = {};
++            m_impl->failed = false;
++            m_impl->fd = file.release();
++        }
++        catch (...)
++        {
++            if (created) (void)::unlink(path.c_str());
++            throw;
++        }
++    }
++
++    bool IopMemoryCard::attached() const noexcept { return m_impl->fd >= 0; }
++
++    std::vector<uint8_t> IopMemoryCard::exchange(std::span<const uint8_t> transmit, size_t receiveSize)
++    {
++        auto next = m_impl->state;
++        auto result = m_impl->process(transmit, receiveSize, next);
++        m_impl->commit(result.changes);
++        m_impl->state = std::move(next);
++        return result.response;
++    }
++
++    void IopMemoryCard::validateExchanges(std::span<const Packet> packets) const
++    {
++        auto next = m_impl->state;
++        for (const auto &packet : packets)
++            (void)m_impl->process(packet.transmit, packet.receiveSize, next);
++    }
++
++    void IopMemoryCard::resetProtocol() { m_impl->state = {}; }
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_memory_card.h b/ps2xIOP/src/emulator/core/iop_memory_card.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..bdf281c1a1bee4ac07aa504a463754fe83ecab6f
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_memory_card.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <span>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    // Raw PS2 serial card storage. Formatting and ECC belong to the guest driver.
++    class IopMemoryCard
++    {
++    public:
++        static constexpr size_t PageDataBytes = 512u;
++        static constexpr size_t PageSpareBytes = 16u;
++        static constexpr size_t PageBytes = PageDataBytes + PageSpareBytes;
++        static constexpr size_t PageCount = 16384u;
++        static constexpr size_t PagesPerBlock = 16u;
++        static constexpr size_t ImageBytes = PageBytes * PageCount;
++
++        struct Packet
++        {
++            std::span<const uint8_t> transmit;
++            size_t receiveSize;
++        };
++
++        IopMemoryCard();
++        ~IopMemoryCard();
++        IopMemoryCard(const IopMemoryCard &) = delete;
++        IopMemoryCard &operator=(const IopMemoryCard &) = delete;
++
++        // Mount before guest execution. Existing storage is never truncated.
++        void mount(const std::filesystem::path &path, bool create);
++        [[nodiscard]] bool attached() const noexcept;
++        [[nodiscard]] std::vector<uint8_t> exchange(std::span<const uint8_t> transmit,
++                                                    size_t receiveSize);
++        // Whole SIO2 queue preflight, including address/cursor changes, without
++        // changing protocol state, staged writes, or persistent storage.
++        void validateExchanges(std::span<const Packet> packets) const;
++        // Discard unfinished writes; retain the mounted image and storage errors.
++        void resetProtocol();
++
++    private:
++        class Impl;
++        std::unique_ptr<Impl> m_impl;
++    };
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_sio2.cpp b/ps2xIOP/src/emulator/core/iop_sio2.cpp
+index 848082576523891d296dc110e37c44743ec21cce..3d63ecc88e1ff4d14500f17befcbd895c1443642 100644
+--- a/ps2xIOP/src/emulator/core/iop_sio2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_sio2.cpp
+@@ -1,10 +1,12 @@
+ #include "iop_sio2.h"
+ #include "iop_memory.h"
++#include "iop_memory_card.h"
+ #include "../imports/iop_intrman.h"
+ 
+ #include <algorithm>
+ #include <array>
+ #include <mutex>
++#include <optional>
+ #include <span>
+ #include <sstream>
+ #include <stdexcept>
+@@ -27,6 +29,9 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kIrqStatus = 0x1F808280u;
+         constexpr size_t kFifoCapacity = 256u;
+         constexpr uint32_t kIrq = 17u;
++        constexpr uint32_t kDmaBase = 0x1F801540u;
++        constexpr uint32_t kDmaStart = 1u << 24u;
++        constexpr size_t kMaxDmaBytes = 16u * 512u;
+ 
+         [[noreturn]] void unsupported(const char *operation, uint32_t value)
+         {
+@@ -183,6 +188,13 @@ namespace ps2x::iop::detail
+             status = 0x1000u;
+             irqStatus = 0u;
+             irqDelivered = false;
++            for (auto &channel : dma)
++            {
++                channel.armed = false;
++                channel.control &= ~kDmaStart;
++                channel.snapshot.clear();
++                channel.owner.reset();
++            }
+         }
+ 
+         void reset()
+@@ -192,12 +204,112 @@ namespace ps2x::iop::detail
+             descriptors = {};
+             portControls = {};
+             protocols = {};
++            for (auto &card : cards) if (card) card->resetProtocol();
+             control = 0u;
+             servicing = false;
++            dma = {};
++            dmaIrqPending = {};
+             clearTransfer();
+             transfers = irqCallbacks = controllerPackets = memoryCardPackets = missingDevices = 0u;
+             lastPort = lastCommand = 0u;
+             lastButtons = 0xFFFFu;
++            dmaTransfers = dmaCallbacks = 0u;
++            cardTraceCount = 0u;
++        }
++
++        void mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create)
++        {
++            if (port >= cards.size()) throw std::out_of_range("SIO2 card port must be 0 or 1");
++            if (servicing || !tx.empty() || rxPosition != rx.size() || dma[0].armed || dma[1].armed)
++                throw std::runtime_error("SIO2 card cannot be replaced during a live transfer");
++            auto card = std::make_unique<IopMemoryCard>();
++            card->mount(path, create);
++            cards[port] = std::move(card);
++        }
++
++        struct DmaChannel
++        {
++            uint32_t address = 0u, blockControl = 0u, control = 0u;
++            bool armed = false;
++            std::optional<IopMemory::Allocation> owner;
++            std::vector<uint8_t> snapshot;
++            size_t blockBytes() const { return size_t(blockControl & 0xFFFFu) * 4u; }
++            size_t blocks() const { return blockControl >> 16u; }
++            size_t bytes() const { return blockBytes() * blocks(); }
++        };
++
++        void validateDmaOwner(const DmaChannel &channel) const
++        {
++            const uint32_t address = IopMemory::physicalAddress(channel.address);
++            const size_t size = channel.bytes();
++            if ((address & 3u) != 0u || size == 0u || size > kMaxDmaBytes ||
++                uint64_t(address) + size > IopMemory::RamSize || !memory.ownsRamRange(address, size))
++                throw std::runtime_error("SIO2 DMA buffer is outside bounded aligned owned IOP RAM");
++            const auto live = memory.allocationContaining(address);
++            if (address < IopMemory::HeapLimit && uint64_t(address) + size > IopMemory::HeapBase &&
++                (!live || size > live->size - (address - live->address)))
++                throw std::runtime_error("SIO2 DMA buffer lacks a complete live allocation");
++            if (channel.owner && (!live || live->identity != channel.owner->identity ||
++                                   live->address != channel.owner->address || live->size != channel.owner->size))
++                throw std::runtime_error("SIO2 DMA buffer allocation lifetime has ended");
++        }
++
++        uint32_t readSio2DmaRegister(uint32_t physical) const override
++        {
++            const auto &channel = dma[(physical - kDmaBase) / 16u];
++            switch ((physical - kDmaBase) % 16u)
++            {
++            case 0u: return channel.address;
++            case 4u: return channel.blockControl;
++            case 8u: return channel.control;
++            default: return 0u;
++            }
++        }
++
++        void writeSio2DmaRegister(uint32_t physical, uint32_t value) override
++        {
++            const size_t index = (physical - kDmaBase) / 16u;
++            auto &channel = dma[index];
++            const uint32_t offset = (physical - kDmaBase) % 16u;
++            if (offset == 12u)
++            {
++                if (value != 0u) unsupported("DMA linked-list address", value);
++                return;
++            }
++            if (channel.armed && (offset != 8u || (value & kDmaStart) != 0u))
++                throw std::runtime_error("SIO2 DMA cannot replace an armed transfer");
++            if (offset == 0u) { channel.address = value; return; }
++            if (offset == 4u) { channel.blockControl = value; return; }
++            if (offset != 8u) unsupported("DMA register", physical);
++            if ((value & kDmaStart) == 0u)
++            {
++                channel.control = value;
++                channel.armed = false;
++                channel.snapshot.clear();
++                channel.owner.reset();
++                return;
++            }
++            // PS2SDK SIO2MAN uses DMAC slice mode, DMA11 from RAM and DMA12
++            // to RAM. Transfers are bounded by the sixteen-entry device queue.
++            const uint32_t expected = kDmaStart | 0x200u | (index == 0u ? 1u : 0u);
++            if (value != expected && !(index == 1u && value == (expected | 0x40000000u)))
++                unsupported("DMA control mode", value);
++            DmaChannel next = channel;
++            if (next.blockBytes() == 0u || next.blockBytes() > 512u || next.blocks() == 0u || next.blocks() > 16u)
++                throw std::runtime_error("SIO2 DMA block geometry is outside the device queue bounds");
++            next.owner = memory.allocationContaining(IopMemory::physicalAddress(next.address));
++            validateDmaOwner(next);
++            if ((index == 0u && !tx.empty()) || (index == 1u && rxPosition != rx.size()))
++                throw std::runtime_error("SIO2 DMA cannot mix an unread PIO transfer");
++            if (index == 0u)
++            {
++                next.snapshot.resize(next.bytes());
++                if (!memory.readRam(next.address, next.snapshot.data(), next.snapshot.size()))
++                    throw std::runtime_error("SIO2 DMA cannot snapshot its owned input buffer");
++            }
++            next.control = value;
++            next.armed = true;
++            channel = std::move(next);
+         }
+ 
+         void setControllerState(uint32_t port, const ControllerState &state)
+@@ -290,21 +402,33 @@ namespace ps2x::iop::detail
+ 
+         void transfer()
+         {
++            const bool dmaTransfer = dma[0].armed || dma[1].armed;
++            if (dmaTransfer)
++            {
++                if (!dma[0].armed || !dma[1].armed || !tx.empty())
++                    throw std::runtime_error("SIO2 DMA transfer requires both owned channels and no PIO input");
++                validateDmaOwner(dma[0]);
++                validateDmaOwner(dma[1]);
++            }
+             size_t transmitSize = 0u, receiveSize = 0u, count = 0u;
+             for (; count < descriptors.size() && descriptors[count] != 0u; ++count)
+             {
+                 const uint32_t descriptor = descriptors[count];
+-                if ((descriptor & 0xFCu) != 0x40u || (descriptor & 0x38020000u) != 0u)
+-                    unsupported("transfer descriptor (only normal PIO is modeled)", descriptor);
++                if ((descriptor & 0xFCu) != (dmaTransfer ? 0x70u : 0x40u) ||
++                    (descriptor & 0x38020000u) != 0u || (dmaTransfer && (descriptor & 3u) < 2u))
++                    unsupported("transfer descriptor (normal PIO or owned card DMA required)", descriptor);
+                 const size_t send = (descriptor >> 8u) & 0x1FFu;
+                 const size_t receive = (descriptor >> 18u) & 0x1FFu;
+-                if (send == 0u || receive == 0u || send > kFifoCapacity || receive > kFifoCapacity ||
+-                    send > kFifoCapacity - transmitSize || receive > kFifoCapacity - receiveSize)
++                const size_t capacity = dmaTransfer ? kMaxDmaBytes : kFifoCapacity;
++                if (send == 0u || receive == 0u || send > capacity || receive > capacity ||
++                    send > capacity - transmitSize || receive > capacity - receiveSize ||
++                    (dmaTransfer && (send > dma[0].blockBytes() || receive > dma[1].blockBytes())))
+                     unsupported("transfer size", descriptor);
+                 transmitSize += send;
+                 receiveSize += receive;
+             }
+-            if (count == 0u || transmitSize != tx.size())
++            if (count == 0u || (!dmaTransfer && transmitSize != tx.size()) ||
++                (dmaTransfer && (count != dma[0].blocks() || count != dma[1].blocks())))
+                 unsupported("TX count does not match descriptor queue", static_cast<uint32_t>(tx.size()));
+             if (rxPosition != rx.size())
+                 unsupported("unread RX data before next transfer", static_cast<uint32_t>(rx.size() - rxPosition));
+@@ -317,8 +441,10 @@ namespace ps2x::iop::detail
+             // Queue and protocol preflight is transactional: even a later
+             // unsupported packet cannot partially change negotiation or RX.
+             auto nextProtocols = protocols;
+-            std::vector<uint8_t> result;
+-            result.reserve(receiveSize);
++            std::vector<uint8_t> result(dmaTransfer ? dma[1].bytes() : receiveSize, 0u);
++            std::vector<std::vector<uint8_t>> replies(count);
++            std::array<std::vector<IopMemoryCard::Packet>, 2u> cardPackets;
++            std::array<std::span<const uint8_t>, 16u> packets;
+             size_t txPosition = 0u;
+             uint64_t nextControllerPackets = 0u, nextCardPackets = 0u, nextMissingDevices = 0u;
+             uint32_t nextPort = 0u, nextCommand = 0u, nextButtons = lastButtons;
+@@ -329,7 +455,10 @@ namespace ps2x::iop::detail
+                 const uint32_t port = descriptor & 3u;
+                 const size_t send = (descriptor >> 8u) & 0x1FFu;
+                 const size_t receive = (descriptor >> 18u) & 0x1FFu;
+-                const std::span packet(tx.data() + txPosition, send);
++                const std::span<const uint8_t> packet = dmaTransfer ?
++                    std::span<const uint8_t>(dma[0].snapshot.data() + index * dma[0].blockBytes(), send) :
++                    std::span<const uint8_t>(tx.data() + txPosition, send);
++                packets[index] = packet;
+                 txPosition += send;
+                 nextPort = port;
+                 nextCommand = packet.size() > 1u ? packet[1] : 0u;
+@@ -337,21 +466,63 @@ namespace ps2x::iop::detail
+                 nextCardPackets += packet[0] == 0x81u;
+                 if (packet[0] == 0x01u && port < samples.size() && samples[port].state.connected)
+                 {
+-                    const auto reply = controllerReply(nextProtocols[port], samples[port], packet, receive);
+-                    result.insert(result.end(), reply.begin(), reply.end());
++                    replies[index] = controllerReply(nextProtocols[port], samples[port], packet, receive);
+                     nextButtons = samples[port].state.buttons;
+                 }
++                else if (packet[0] == 0x81u && cards[port & 1u] && cards[port & 1u]->attached())
++                    cardPackets[port & 1u].push_back({packet, receive});
+                 else
+                 {
+-                    // No physical card or multitap is attached. Address 0x81
+-                    // never receives pad bytes or a fabricated HLE card image.
+-                    result.insert(result.end(), receive, 0xFFu);
++                    replies[index].assign(receive, 0xFFu);
+                     // PS2SDK STAT_ERR_QUEUE_SLOT identifies descriptor position,
+                     // not port number; several slots can address the same port.
+                     nextStatus |= 0xC000u | (1u << (16u + index));
+                     ++nextMissingDevices;
+                 }
+             }
++            // Validate every selected card's complete ordered protocol before
++            // any device, durable image, output RAM or IRQ state is changed.
++            for (size_t port = 0u; port < cards.size(); ++port)
++                if (!cardPackets[port].empty()) cards[port]->validateExchanges(cardPackets[port]);
++            size_t receivePosition = 0u;
++            for (size_t index = 0u; index < count; ++index)
++            {
++                const auto packet = packets[index];
++                const uint32_t port = descriptors[index] & 3u;
++                const size_t receive = (descriptors[index] >> 18u) & 0x1FFu;
++                if (packet[0] == 0x81u && cards[port & 1u] && cards[port & 1u]->attached())
++                    replies[index] = cards[port & 1u]->exchange(packet, receive);
++                if (replies[index].size() != receive)
++                    throw std::runtime_error("SIO2 device returned an invalid response length");
++                const size_t destination = dmaTransfer ? index * dma[1].blockBytes() : receivePosition;
++                std::copy(replies[index].begin(), replies[index].end(), result.begin() + destination);
++                receivePosition += receive;
++            }
++            for (size_t index = 0u; index < count && cardTraceCount < cardTrace.size(); ++index)
++                if (packets[index][0] == 0x81u)
++                    cardTrace[cardTraceCount++] = {descriptors[index],
++                        packets[index].size() > 1u ? packets[index][1u] : uint8_t{0u}};
++            if (dmaTransfer)
++            {
++                // Bytes and CHCR completion are visible before either DMA or
++                // SIO2 handlers run. Padding follows DMA block framing rather
++                // than packing short command replies together.
++                if (!memory.writeRam(dma[1].address, result.data(), result.size()))
++                    throw std::runtime_error("SIO2 DMA failed to publish its validated output RAM");
++                for (size_t i = 0u; i < dma.size(); ++i)
++                {
++                    auto &channel = dma[i];
++                    channel.address += static_cast<uint32_t>(channel.bytes());
++                    channel.blockControl &= 0xFFFFu;
++                    channel.control &= ~kDmaStart;
++                    channel.armed = false;
++                    channel.owner.reset();
++                    channel.snapshot.clear();
++                    dmaIrqPending[i] = true;
++                }
++                ++dmaTransfers;
++                result.clear();
++            }
+             protocols = nextProtocols;
+             ++transfers;
+             controllerPackets += nextControllerPackets;
+@@ -371,6 +542,23 @@ namespace ps2x::iop::detail
+ 
+         void serviceInterrupt(const IopIntrman &intrman, IopGuestExecutor &executor)
+         {
++            if (servicing || intrman.inInterruptContext() || memory.interruptControl() == 0u)
++                return;
++            // DMA completions use the existing modeled INTRMAN channel IRQs.
++            // An unregistered/disabled channel remains pending; the ordinary
++            // SIO2 driver can still observe completed DMA through IRQ17.
++            for (size_t i = 0u; i < dmaIrqPending.size(); ++i)
++            {
++                // A preceding handler can disable CPU interrupts. Keep later
++                // channel completions pending until the live gate reopens.
++                if (intrman.inInterruptContext() || memory.interruptControl() == 0u) return;
++                if (!dmaIrqPending[i]) continue;
++                dmaIrqPending[i] = false;
++                struct DmaScope { bool &value; ~DmaScope() { value = false; } } scope{servicing};
++                servicing = true;
++                if (intrman.dispatchInterrupt(static_cast<int>(0x2Bu + i), executor)) ++dmaCallbacks;
++                else dmaIrqPending[i] = true;
++            }
+             const bool enabled = ((irqStatus & 1u) != 0u && (control & 0x200u) != 0u) ||
+                                  ((irqStatus & 2u) != 0u && (control & 0x100u) != 0u);
+             if (!enabled || irqDelivered || servicing || intrman.inInterruptContext() ||
+@@ -400,6 +588,16 @@ namespace ps2x::iop::detail
+                 {"missing_devices", missingDevices}, {"last_port", lastPort},
+                 {"last_command", lastCommand, true}, {"last_buttons", lastButtons, true},
+                 {"irq_status", irqStatus, true}, {"rx_remaining", rx.size() - rxPosition}};
++            row.metrics.push_back({"dma_transfers", dmaTransfers});
++            row.metrics.push_back({"dma_callbacks", dmaCallbacks});
++            for (size_t i = 0u; i < cards.size(); ++i)
++                row.metrics.push_back({"card_attached_" + std::to_string(i), cards[i] && cards[i]->attached() ? 1u : 0u});
++            for (size_t i = 0u; i < cardTraceCount; ++i)
++            {
++                const auto prefix = "card_trace_" + std::to_string(i);
++                row.metrics.push_back({prefix + "_descriptor", cardTrace[i].descriptor, true});
++                row.metrics.push_back({prefix + "_command", cardTrace[i].command, true});
++            }
+             return row;
+         }
+ 
+@@ -407,6 +605,12 @@ namespace ps2x::iop::detail
+         std::mutex inputMutex;
+         std::array<InputSample, 2u> inputs{};
+         std::array<PadProtocol, 2u> protocols{};
++        std::array<std::unique_ptr<IopMemoryCard>, 2u> cards;
++        std::array<DmaChannel, 2u> dma;
++        std::array<bool, 2u> dmaIrqPending{};
++        struct CardTrace { uint32_t descriptor; uint8_t command; };
++        std::array<CardTrace, 32u> cardTrace{};
++        size_t cardTraceCount = 0u;
+         std::array<uint32_t, 16u> descriptors{};
+         std::array<uint32_t, 8u> portControls{};
+         std::vector<uint8_t> tx, rx;
+@@ -415,6 +619,7 @@ namespace ps2x::iop::detail
+         bool irqDelivered = false, servicing = false;
+         uint64_t transfers = 0u, irqCallbacks = 0u, controllerPackets = 0u;
+         uint64_t memoryCardPackets = 0u, missingDevices = 0u;
++        uint64_t dmaTransfers = 0u, dmaCallbacks = 0u;
+         uint32_t lastPort = 0u, lastCommand = 0u, lastButtons = 0xFFFFu;
+     };
+ 
+@@ -427,6 +632,11 @@ namespace ps2x::iop::detail
+     IopSio2::~IopSio2() = default;
+     void IopSio2::reset() { m_impl->reset(); }
+     void IopSio2::setControllerState(uint32_t port, const ControllerState &state) { m_impl->setControllerState(port, state); }
++    void IopSio2::mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create) { m_impl->mountMemoryCard(port, path, create); }
++    bool IopSio2::memoryCardAttached(uint32_t port) const noexcept
++    {
++        return port < m_impl->cards.size() && m_impl->cards[port] && m_impl->cards[port]->attached();
++    }
+     void IopSio2::serviceInterrupt(const IopIntrman &intrman, IopGuestExecutor &executor) { m_impl->serviceInterrupt(intrman, executor); }
+     DebugService IopSio2::debugSnapshot() const { return m_impl->debugSnapshot(); }
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_sio2.h b/ps2xIOP/src/emulator/core/iop_sio2.h
+index a3cc0924f0a1b5081911306763d2d3ffe8c45d7d..3142b3d669900e1bab011da4caba6c87615a174a 100644
+--- a/ps2xIOP/src/emulator/core/iop_sio2.h
++++ b/ps2xIOP/src/emulator/core/iop_sio2.h
+@@ -4,6 +4,7 @@
+ #include "ps2x/iop/iop_types.h"
+ 
+ #include <memory>
++#include <filesystem>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -23,6 +24,8 @@ namespace ps2x::iop::detail
+         // host samples. The owning object is not replaced by an IOP reset.
+         void reset();
+         void setControllerState(uint32_t port, const ControllerState &state);
++        void mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create);
++        [[nodiscard]] bool memoryCardAttached(uint32_t port) const noexcept;
+         void serviceInterrupt(const IopIntrman &intrman, IopGuestExecutor &executor);
+         [[nodiscard]] DebugService debugSnapshot() const;
+ 
+diff --git a/ps2xIOP/src/emulator/imports/iop_dmacman.cpp b/ps2xIOP/src/emulator/imports/iop_dmacman.cpp
+index 4c2611dc41488a5e19853cd3c1e80df10b0a511b..ce7754d4851c3c2b1fa878da3a01c6f976911db3 100644
+--- a/ps2xIOP/src/emulator/imports/iop_dmacman.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_dmacman.cpp
+@@ -35,6 +35,66 @@ namespace ps2x::iop::detail
+                 return PriorityField{0x1F801570u, 24u, true};
+             return std::nullopt;
+         }
++
++        void validateSio2Buffer(IopMemory &memory, uint32_t address, uint32_t words, uint32_t count)
++        {
++            const uint32_t physical = IopMemory::physicalAddress(address);
++            const uint64_t bytes = uint64_t{words} * count * 4u;
++            if (words == 0u || words > 128u || count == 0u || count > 16u || bytes > 8192u ||
++                (physical & 3u) != 0u || uint64_t{physical} + bytes > IopMemory::RamSize ||
++                !memory.ownsRamRange(address, static_cast<size_t>(bytes)))
++                throw std::runtime_error("IOP DMACMAN SIO2 slice is outside bounded aligned owned IOP RAM");
++            if (physical < IopMemory::HeapLimit && uint64_t{physical} + bytes > IopMemory::HeapBase)
++            {
++                const auto owner = memory.allocationContaining(physical);
++                if (!owner || bytes > owner->size - (physical - owner->address))
++                    throw std::runtime_error("IOP DMACMAN SIO2 slice lacks a complete live allocation");
++            }
++        }
++    }
++
++    bool dispatchDmacmanSio2(IopMemory &memory, uint16_t ordinal, IopCpuState &cpu)
++    {
++        if (ordinal != 28u && ordinal != 32u) return false;
++        const uint32_t channel = cpu.gpr[4u];
++        if (channel != 11u && channel != 12u)
++            throw std::runtime_error("IOP DMACMAN slice/start supports only modeled SIO2 channels 11 and 12");
++        const uint32_t base = 0x1F801540u + (channel - 11u) * 16u;
++        const uint32_t control = memory.read32(base + 8u);
++        if ((control & 0x01000000u) != 0u)
++            throw std::runtime_error("IOP DMACMAN cannot replace or restart an armed SIO2 slice");
++        if (ordinal == 28u)
++        {
++            // PS2SDK dmacman.c at 329e2bb: SetSliceDMA has four argument
++            // registers and a fifth O32 argument at sp+16, returns 1, and does
++            // not set CHCR's START bit. Direction-to-RAM also sets bit30.
++            const uint32_t stack = IopMemory::physicalAddress(cpu.gpr[29u]);
++            if ((stack & 7u) != 0u || uint64_t{stack} + 20u > IopMemory::RamSize ||
++                !memory.ownsRamRange(cpu.gpr[29u], 20u))
++                throw std::runtime_error("IOP DMACMAN direction requires a complete owned O32 stack argument");
++            if (stack < IopMemory::HeapLimit && uint64_t{stack} + 20u > IopMemory::HeapBase)
++            {
++                const auto owner = memory.allocationContaining(stack);
++                if (!owner || 20u > owner->size - (stack - owner->address))
++                    throw std::runtime_error("IOP DMACMAN O32 argument crosses its live stack allocation");
++            }
++            const uint32_t direction = memory.read32(stack + 16u);
++            if (direction != (channel == 11u ? 1u : 0u))
++                throw std::runtime_error("IOP DMACMAN SIO2 slice direction does not match its channel");
++            validateSio2Buffer(memory, cpu.gpr[5u], cpu.gpr[6u], cpu.gpr[7u]);
++            memory.write32(base, cpu.gpr[5u] & 0x00FFFFFFu);
++            memory.write32(base + 4u, cpu.gpr[6u] | (cpu.gpr[7u] << 16u));
++            memory.write32(base + 8u, direction == 1u ? 0x201u : 0x40000200u);
++            cpu.gpr[2u] = 1u;
++            return true;
++        }
++        const uint32_t expected = channel == 11u ? 0x201u : 0x40000200u;
++        if (control != expected && !(channel == 12u && control == 0x200u))
++            throw std::runtime_error("IOP DMACMAN StartDMA requires a configured SIO2 slice");
++        const uint32_t blocks = memory.read32(base + 4u);
++        validateSio2Buffer(memory, memory.read32(base), blocks & 0xFFFFu, blocks >> 16u);
++        memory.write32(base + 8u, control | 0x01000000u);
++        return true; // StartDMA returns void and preserves the guest registers.
+     }
+ 
+     bool dispatchDmacmanPriority(IopMemory &memory, uint16_t ordinal, IopCpuState &cpu)
+diff --git a/ps2xIOP/src/emulator/imports/iop_dmacman.h b/ps2xIOP/src/emulator/imports/iop_dmacman.h
+index db1a5a0de5de6b9baf7d6dcea13fc21f3be5597b..0c3d87cac363c35d87a66c73f81e271da4b7175a 100644
+--- a/ps2xIOP/src/emulator/imports/iop_dmacman.h
++++ b/ps2xIOP/src/emulator/imports/iop_dmacman.h
+@@ -7,7 +7,9 @@ namespace ps2x::iop::detail
+     struct IopCpuState;
+     class IopMemory;
+ 
+-    // Only channel priority/enable operations are modeled here. Scheduling a
+-    // transfer still belongs to its actual hardware/device implementation.
++    // Channel priority/enable changes do not schedule a device transfer.
+     [[nodiscard]] bool dispatchDmacmanPriority(IopMemory &memory, uint16_t ordinal, IopCpuState &cpu);
++    // Bounded SetSliceDMA/StartDMA wrappers for the modeled SIO2 channels only.
++    // The fifth argument follows the guest IOP O32 stack ABI.
++    [[nodiscard]] bool dispatchDmacmanSio2(IopMemory &memory, uint16_t ordinal, IopCpuState &cpu);
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 502715e3ca4c23e20b5c5fbe369f44fd6c6b0d1c..e303c72b2fd96bd5d78804c3af773b7ee2cee93a 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -369,7 +369,7 @@ namespace ps2x::iop::detail
+         {
+             // A reentrant host hook must fail before clearing RAM or the map
+             // containing a managed CPU still referenced by a native call frame.
+-            if (kernel.hasNativeWaits())
++            if (kernel.hasNativeWaits() || virtualCardAdmissionInProgress || externalKernelWaitDepth != 0u)
+                 throw std::runtime_error("IOP reset cannot retire a live native-call owner");
+             memory.reset();
+             // Direct guest calls use this reserved kernel stack, including the
+@@ -406,6 +406,7 @@ namespace ps2x::iop::detail
+             strictExecution = false;
+             secrMcCommandHandler = {};
+             secrMcDevIdHandler = {};
++            secrRegistrationSerial = virtualCardAdmissions = 0u;
+             checkKelfPathCallback = {};
+         }
+ 
+@@ -728,6 +729,151 @@ namespace ps2x::iop::detail
+             return found;
+         }
+ 
++        ImportDisposition dispatchKernelWaitImport(const IopImportCall &call, CpuState &cpu, bool event)
++        {
++            struct WaitOwner
++            {
++                uint32_t &depth;
++                bool active = false;
++                ~WaitOwner() { if (active) --depth; }
++            } owner{externalKernelWaitDepth};
++            std::optional<InvocationBudget> budget;
++            for (;;)
++            {
++                try
++                {
++                    const bool managed = kernel.isCurrentThreadCpu(cpu);
++                    const bool handled = event ? kernel.dispatchEventImport(call.ordinal, cpu, managed) :
++                                                 kernel.dispatchSemaphoreImport(call.ordinal, cpu, managed);
++                    return handled ? ImportDisposition::Handled : ImportDisposition::Missing;
++                }
++                catch (const IopKernel::NativeWaitPending &)
++                {
++                    // Separate native frames cannot borrow an active managed
++                    // CPU's continuation. An entirely external owned RPC/start
++                    // invocation can instead keep its own CPU/stack and pump.
++                    if (kernel.hasCurrentThread())
++                        executionFailure(virtualCardAdmissionInProgress ?
++                            "virtual card callback cannot block an independently owned native frame" :
++                            "kernel wait cannot block an independently owned native frame", cpu);
++                    if (intrman.inInterruptContext() || memory.interruptControl() == 0u || !activeInvocationBudget)
++                        executionFailure("external kernel wait requires an interruptible owned invocation", cpu);
++                    if (!owner.active)
++                    {
++                        if (externalKernelWaitDepth != 0u)
++                            executionFailure("concurrent external kernel wait frames are unsupported", cpu);
++                        ++externalKernelWaitDepth;
++                        owner.active = true;
++                        budget = *activeInvocationBudget;
++                    }
++                    if (totalCycles >= budget->cycleLimit ||
++                        totalInstructions - budget->instructionStart >= budget->instructions)
++                        executionFailure("external kernel wait exhausted its invocation budget", cpu);
++                    runCycles(std::min<uint64_t>(kDefaultSlice, budget->cycleLimit - totalCycles));
++                    checkExecutionFailure();
++                }
++            }
++        }
++
++        bool liveCardHandler(const GuestCallback &callback) const
++        {
++            if (callback.function == 0u || (callback.function & 3u) != 0u ||
++                !iopRamRange(callback.function, 4u) || retiredStrictAddress(callback.function))
++                return false;
++            const uint32_t address = physicalAddress(callback.function);
++            return std::any_of(modules.begin(), modules.end(), [&](const auto &entry)
++                { const Module &module = entry.second;
++                  return module.strict && address >= module.base && address - module.base < module.size; });
++        }
++
++        uint32_t admitVirtualCard(CpuState &caller)
++        {
++            // This is admission to the explicitly mounted ordinary raw-card
++            // profile, not physical MagicGate cryptographic authentication.
++            // Original MCMAN retains its filesystem, ECC and formatting logic;
++            // protected boot/download imports remain unsupported.
++            const uint32_t port = caller.gpr[4], slot = caller.gpr[5], cnum = caller.gpr[6];
++            if (port < 2u || port > 3u || slot != 0u || cnum != ((port & 1u) << 3u) ||
++                virtualCardAdmissionInProgress || intrman.inInterruptContext() ||
++                memory.interruptControl() == 0u || !sio2.memoryCardAttached(port & 1u) ||
++                !liveCardHandler(secrMcCommandHandler) || !liveCardHandler(secrMcDevIdHandler))
++                return 0u;
++            const GuestCallback command = secrMcCommandHandler, device = secrMcDevIdHandler;
++            const uint64_t registration = secrRegistrationSerial;
++            const RestoreValue admissionGuard(virtualCardAdmissionInProgress, true);
++            const auto unchanged = [&]
++            {
++                return registration == secrRegistrationSerial &&
++                    liveCardHandler(command) && liveCardHandler(device) &&
++                    sio2.memoryCardAttached(port & 1u);
++            };
++            if (callFunction(device.function, port, slot, 0u, 0u, device.gp) != cnum || !unchanged())
++                return 0u;
++
++            // Public PS2SDK sio2_transfer_data_t is 148 bytes in the IOP ABI.
++            // Both five-byte PIO buffers live in the same owned allocation.
++            constexpr uint32_t packetBytes = 192u, txOffset = 160u, rxOffset = 176u;
++            const uint32_t packet = memory.allocate(packetBytes, 16u);
++            if (packet == 0u)
++                return 0u;
++            const auto allocation = memory.allocationContaining(packet);
++            if (!allocation || allocation->address != packet)
++                throw std::runtime_error("IOP virtual card admission lost its packet allocation");
++            struct PacketOwner
++            {
++                IopMemory &memory;
++                uint32_t address;
++                uint64_t identity;
++                ~PacketOwner() { (void)memory.freeAllocation(address, identity); }
++            } packetOwner{memory, packet, allocation->identity};
++            const auto packetOwned = [&]
++            {
++                const auto current = memory.allocationContaining(packet);
++                return current && current->address == packet && current->identity == allocation->identity;
++            };
++            const auto metric = [](const DebugService &state, std::string_view name)
++            {
++                const auto found = std::find_if(state.metrics.begin(), state.metrics.end(),
++                    [name](const DebugMetric &value) { return value.name == name; });
++                if (found == state.metrics.end())
++                    throw std::runtime_error("IOP virtual card admission lacks SIO2 transfer evidence");
++                return found->value;
++            };
++            for (const uint8_t operation : {uint8_t{0xF3u}, uint8_t{0x11u}})
++            {
++                if (!unchanged() || !packetOwned())
++                    return 0u;
++                const uint32_t length = operation == 0xF3u ? 5u : 4u;
++                (void)memory.zeroRam(packet, packetBytes);
++                memory.write32(packet + 4u + port * 4u, 0xFF060505u);
++                memory.write32(packet + 20u + port * 4u, 0x0003FFFFu);
++                memory.write32(packet + 40u, port | 0x40u | (length << 8u) | (length << 18u));
++                memory.write32(packet + 108u, length);
++                memory.write32(packet + 112u, length);
++                memory.write32(packet + 116u, packet + txOffset);
++                memory.write32(packet + 120u, packet + rxOffset);
++                memory.write8(packet + txOffset, 0x81u);
++                memory.write8(packet + txOffset + 1u, operation);
++                const auto before = sio2.debugSnapshot();
++                if (callFunction(command.function, port, slot, packet, 0u, command.gp) == 0u ||
++                    !unchanged() || !packetOwned())
++                    return 0u;
++                const auto after = sio2.debugSnapshot();
++                // ACK bytes alone are insufficient: require the actual card
++                // endpoint to have consumed this callback's exact PIO command.
++                if (metric(after, "memory_card_packets") != metric(before, "memory_card_packets") + 1u ||
++                    metric(after, "missing_devices") != metric(before, "missing_devices") ||
++                    metric(after, "last_port") != port || metric(after, "last_command") != operation ||
++                    (memory.read32(packet) & 0xE000u) != 0u ||
++                    memory.read8(packet + rxOffset + length - 2u) != 0x2Bu ||
++                    memory.read8(packet + rxOffset + length - 1u) != 0x55u)
++                    return 0u;
++            }
++            ++virtualCardAdmissions;
++            log(LogLevel::Info, "[IOP:modeled-card-admission] ordinary raw-card storage accepted; physical MagicGate not emulated");
++            return 1u;
++        }
++
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -773,6 +919,10 @@ namespace ps2x::iop::detail
+ 
+             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
+             {
++                if (virtualCardAdmissionInProgress && !kernel.isCurrentThreadCpu(cpu) &&
++                    (call.ordinal == 8u || call.ordinal == 9u || call.ordinal == 16u ||
++                     call.ordinal == 24u || call.ordinal == 33u))
++                    executionFailure("virtual card callback cannot yield an independently owned native frame", cpu);
+                 if (call.ordinal >= 35u && call.ordinal <= 38u)
+                 {
+                     // Compatible supplied alarm exports own their kernel state
+@@ -789,15 +939,11 @@ namespace ps2x::iop::detail
+             }
+             if (iequals(call.library, "thsemap"))
+             {
+-                return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                return dispatchKernelWaitImport(call, cpu, false);
+             }
+             if (iequals(call.library, "thevent"))
+             {
+-                return kernel.dispatchEventImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                return dispatchKernelWaitImport(call, cpu, true);
+             }
+             if (iequals(call.library, "thmsgbx"))
+             {
+@@ -809,18 +955,23 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
+                 return ImportDisposition::Handled;
+-            if (iequals(call.library, "secrman"))
++            if (iequals(call.library, "secrman") &&
++                imports.resolve(call.library, call.ordinal, call.version) == 0u &&
++                (call.version >> 8u) == 1u)
+             {
+                 switch (call.ordinal)
+                 {
+                 case 4: // SecrSetMcCommandHandler
+-                    secrMcCommandHandler = {a0, cpu.gpr[28]};
+-                    setV0(0);
+-                    return ImportDisposition::Handled;
+                 case 5: // SecrSetMcDevIDHandler
+-                    secrMcDevIdHandler = {a0, cpu.gpr[28]};
++                    if (secrRegistrationSerial == std::numeric_limits<uint64_t>::max())
++                        executionFailure("virtual card callback registration ordering exhausted", cpu);
++                    ++secrRegistrationSerial;
++                    (call.ordinal == 4u ? secrMcCommandHandler : secrMcDevIdHandler) = GuestCallback{a0, cpu.gpr[28]};
+                     setV0(0);
+                     return ImportDisposition::Handled;
++                case 6: // SecrAuthCard: scoped ordinary virtual-card admission.
++                    setV0(admitVirtualCard(cpu));
++                    return ImportDisposition::Handled;
+                 default:
+                     break;
+                 }
+@@ -867,6 +1018,10 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
++            if (iequals(call.library, "dmacman") && (call.version >> 8u) == 1u &&
++                imports.resolve(call.library, call.ordinal, call.version) == 0u &&
++                dispatchDmacmanSio2(memory, call.ordinal, cpu))
++                return ImportDisposition::Handled;
+             if (iequals(call.library, "dmacman") && dispatchDmacmanPriority(memory, call.ordinal, cpu))
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "dmacman") && !strictExecution)
+@@ -1614,6 +1769,9 @@ namespace ps2x::iop::detail
+         bool strictExecution = false;
+         GuestCallback secrMcCommandHandler;
+         GuestCallback secrMcDevIdHandler;
++        uint64_t secrRegistrationSerial = 0u, virtualCardAdmissions = 0u;
++        bool virtualCardAdmissionInProgress = false;
++        uint32_t externalKernelWaitDepth = 0u;
+         GuestCallback checkKelfPathCallback;
+     };
+ 
+@@ -1682,6 +1840,11 @@ namespace ps2x::iop::detail
+         return m_impl->stopModule(moduleId, result);
+     }
+ 
++    void IopEmulator::mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create)
++    {
++        m_impl->sio2.mountMemoryCard(port, path, create);
++    }
++
+     void IopEmulator::setControllerState(uint32_t port, const ControllerState &state)
+     {
+         m_impl->sio2.setControllerState(port, state);
+@@ -1689,7 +1852,9 @@ namespace ps2x::iop::detail
+ 
+     DebugService IopEmulator::sio2DebugSnapshot() const
+     {
+-        return m_impl->sio2.debugSnapshot();
++        auto snapshot = m_impl->sio2.debugSnapshot();
++        snapshot.metrics.push_back({"virtual_storage_admissions", m_impl->virtualCardAdmissions});
++        return snapshot;
+     }
+ 
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 6965ca5d5a8e4c571f86762dd15cbcd1043dfd7a..865505985a6fcd09ee336a57753d9ae26376c411 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -6,6 +6,7 @@
+ #include "ps2x/iop/iop_sif_transfer.h"
+ 
+ #include <cstdint>
++#include <filesystem>
+ #include <memory>
+ #include <span>
+ #include <string>
+@@ -25,6 +26,7 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+         void setControllerState(uint32_t port, const ControllerState &state);
++        void mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create);
+         [[nodiscard]] DebugService sio2DebugSnapshot() const;
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 40f7f2d179ebb5b908d4597202910caebf930c9a..d177353bc8d2bf9235e7cb5119fe440f53dc8bfe 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -44,11 +44,16 @@ namespace ps2x::iop::detail
+ 
+     void IopRpcBridge::reset()
+     {
++        if (m_resetGeneration == std::numeric_limits<uint64_t>::max())
++            throw std::runtime_error("IOP RPC reset lifetime exhausted");
++        ++m_resetGeneration;
+         m_servers.clear();
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
+-        m_packetCallActive = false;
+-        m_packetTransfers = nullptr;
++        // Reset retires a callback's registration, but its native frame and
++        // ordered transfer guard remain alive until that invocation unwinds.
++        if (!m_packetCallActive)
++            m_packetTransfers = nullptr;
+     }
+ 
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+@@ -166,6 +171,10 @@ namespace ps2x::iop::detail
+     void IopRpcBridge::capturePacketDma(IopCpuState &cpu)
+     {
+         constexpr uint32_t kMaxDescriptors = 32u; // SIFMAN's queued tag array
++        // A synchronous callback can complete and reuse that tag array many
++        // times (MCSERV reads in 8 KiB chunks). Bound the retained snapshots
++        // separately from one hardware submission and their total byte size.
++        constexpr uint32_t kMaxCapturedDescriptors = 512u;
+         constexpr uint32_t kEeRamSize = 32u * 1024u * 1024u;
+         constexpr uint64_t kMaxEeTransferBytes = uint64_t{0xFFFFu} * 16u;
+         const auto fail = [](const char *cause)
+@@ -177,7 +186,7 @@ namespace ps2x::iop::detail
+         if (count == 0u || count > kMaxDescriptors || (descriptorAddress & 3u) != 0u ||
+             !ownedPacketRange(m_memory, descriptorAddress, size_t(count) * 16u))
+             fail("requires a complete aligned owned descriptor array");
+-        if (m_packetTransfers->size() > kMaxDescriptors - count)
++        if (m_packetTransfers->size() > kMaxCapturedDescriptors - count)
+             fail("exceeds the bounded ordered descriptor queue");
+ 
+         size_t totalBytes = 0u;
+@@ -366,11 +375,109 @@ namespace ps2x::iop::detail
+             m_kernel.sleepCurrent(cpu);
+             setV0(0);
+             return true;
+-        case 23:
+-            if (m_packetCallActive)
+-                return false;
+-            setV0(0);
++        case 23: // sceSifGetOtherData: synchronous EE -> IOP payload
++        {
++            const auto fail = [](const char *cause)
++            {
++                throw std::runtime_error(std::string("IOP SIF GetOtherData: ") + cause);
++            };
++            if (m_otherDataActive)
++            {
++                m_otherDataReentered = true;
++                fail("reentrant transfer is unsupported");
++            }
++            struct TransferGuard
++            {
++                bool &active;
++                explicit TransferGuard(bool &flag) : active(flag) { active = true; }
++                ~TransferGuard() { active = false; }
++            } transferGuard(m_otherDataActive);
++            m_otherDataReentered = false;
++            const uint64_t resetGeneration = m_resetGeneration;
++            const bool packetActive = m_packetCallActive;
++            const auto *const packetTransfers = m_packetTransfers;
++            constexpr uint32_t kReceiveDataSize = 28u;
++            constexpr uint32_t kEeRamSize = 32u * 1024u * 1024u;
++            constexpr uint64_t kMaxWireBytes = uint64_t{0xFFFFu} * 16u;
++            const uint32_t receiveData = cpu.gpr[4];
++            const uint32_t source = cpu.gpr[5];
++            const uint32_t destination = cpu.gpr[6];
++            const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
++            const uint32_t stack = cpu.gpr[29];
++            if ((stack & 3u) != 0u || !ownedPacketRange(m_memory, stack, 20u))
++                fail("requires a complete owned O32 fifth argument");
++            const uint32_t mode = m_memory.read32(stack + 16u);
++            // The original MCSERV bulk write waits for this request. Async
++            // packet/event ownership is a separate ABI and remains explicit.
++            if (mode != 0u)
++                fail("only synchronous mode zero is supported");
++            if (receiveData == 0u || (receiveData & 3u) != 0u ||
++                !ownedPacketRange(m_memory, receiveData, kReceiveDataSize))
++                fail("requires complete aligned owned receive data");
++            if (size <= 0 || (source & 15u) != 0u || (destination & 15u) != 0u)
++                fail("requires a positive size and quadword-aligned payload addresses");
++            // EE DMA sends whole quadwords, including a partial requested tail.
++            // Validate and snapshot those actual bytes; never pad them or read
++            // past the complete source/destination ranges.
++            const uint64_t wireBytes = (uint64_t{static_cast<uint32_t>(size)} + 15u) & ~uint64_t{15u};
++            if (wireBytes > kMaxWireBytes || !ownedPacketRange(m_memory, destination, wireBytes))
++                fail("destination is outside the bounded complete owned IOP range");
++            const uint32_t destinationPhysical = IopMemory::physicalAddress(destination);
++            const uint32_t receivePhysical = IopMemory::physicalAddress(receiveData);
++            if (uint64_t{destinationPhysical} < uint64_t{receivePhysical} + kReceiveDataSize &&
++                uint64_t{receivePhysical} < uint64_t{destinationPhysical} + wireBytes)
++                fail("payload overlaps its receive status");
++            const auto owner = [&](uint32_t address, size_t bytes)
++            {
++                const uint32_t physical = IopMemory::physicalAddress(address);
++                if (!ownedPacketRange(m_memory, address, bytes))
++                    fail("IOP transfer range is no longer completely owned");
++                const auto allocation = m_memory.allocationContaining(physical);
++                if (physical < IopMemory::HeapLimit && uint64_t{physical} + bytes > IopMemory::HeapBase &&
++                    (!allocation || bytes > allocation->size - (physical - allocation->address)))
++                    fail("IOP transfer range crosses a live heap allocation");
++                return allocation;
++            };
++            const auto destinationOwner = owner(destination, wireBytes);
++            const auto receiveOwner = owner(receiveData, kReceiveDataSize);
++            const auto stackOwner = owner(stack, 20u);
++            const uint32_t segment = source & 0xE0000000u;
++            const uint32_t sourcePhysical = source & 0x1FFFFFFFu;
++            uint32_t normalized = 0u;
++            if ((segment != 0u && segment != 0x20000000u && segment != 0x80000000u && segment != 0xA0000000u) ||
++                sourcePhysical >= kEeRamSize || wireBytes > kEeRamSize - sourcePhysical ||
++                !m_host.normalizeGuestAddress(source, normalized) || normalized != sourcePhysical)
++                fail("source is outside complete EE RAM");
++            std::vector<uint8_t> payload(static_cast<size_t>(wireBytes));
++            if (!m_host.readGuest(sourcePhysical, payload.data(), payload.size()))
++                fail("could not snapshot the complete EE source");
++            if (m_otherDataReentered || resetGeneration != m_resetGeneration ||
++                packetActive != m_packetCallActive || packetTransfers != m_packetTransfers)
++                fail("transfer belongs to a retired or reentrant RPC context");
++            const auto sameOwner = [&](uint32_t address, size_t bytes, const auto &expected)
++            {
++                const auto live = owner(address, bytes);
++                if (live.has_value() != expected.has_value() ||
++                    (live && (live->identity != expected->identity || live->address != expected->address ||
++                              live->size != expected->size)))
++                    fail("IOP transfer allocation lifetime has ended");
++            };
++            sameOwner(destination, wireBytes, destinationOwner);
++            sameOwner(receiveData, kReceiveDataSize, receiveOwner);
++            sameOwner(stack, 20u, stackOwner);
++            if (m_memory.read32(stack + 16u) != mode)
++                fail("synchronous mode changed while reading EE data");
++
++            // A synchronous modeled completion has no live firmware packet or
++            // semaphore identity. Preserve the trailing src/dest/size fields:
++            // the original SIF library does not populate them for this call.
++            const std::array<uint32_t, 4u> completed{0u, 0u, 0xFFFFFFFFu, 0u};
++            if (!m_memory.writeRam(destination, payload.data(), payload.size()) ||
++                !m_memory.writeRam(receiveData, completed.data(), sizeof(completed)))
++                fail("validated synchronous completion copy failed");
++            setV0(0u);
+             return true;
++        }
+         case 24: // RemoveRpc
+         {
+             const uint32_t serverData = cpu.gpr[4];
+@@ -498,6 +605,11 @@ namespace ps2x::iop::detail
+                                                        IopGuestExecutor &executor,
+                                                        std::vector<SifEeTransfer> *precedingTransfers)
+     {
++        if (m_otherDataActive)
++        {
++            m_otherDataReentered = true;
++            packetFailure(sid, "packet callback cannot reenter an active EE source snapshot");
++        }
+         if (input.size() > IopMemory::RamSize)
+             packetFailure(sid, "payload size exceeds IOP RAM");
+         validatePacketCall(sid, serverAddress, static_cast<uint32_t>(input.size()), receiveSize);
+@@ -507,6 +619,7 @@ namespace ps2x::iop::detail
+         // The guest may register/remove services while its callback runs. Keep a
+         // value snapshot, never a map reference which that code could invalidate.
+         const RpcServer server = m_servers.at(sid);
++        const uint64_t resetGeneration = m_resetGeneration;
+         std::vector<SifEeTransfer> pending;
+         struct PacketCallGuard
+         {
+@@ -525,8 +638,38 @@ namespace ps2x::iop::detail
+         if (!input.empty() && !m_memory.writeRam(server.buffer, input.data(), input.size()))
+             packetFailure(sid, "validated request copy failed");
+ 
+-        const uint32_t resultAddress = executor.executeGuestFunction(server.function, function, server.buffer,
+-                                                                     static_cast<uint32_t>(input.size()), 0u, server.gp);
++        // Original MCSERV format scans/erases the card, and flush/close can
++        // write all dirty cache entries through the real SIO2 worker. Those
++        // operations outlast the ordinary short guest-call budget. Keep their
++        // larger bound local to these commands; other callbacks keep the
++        // normal short limit.
++        constexpr uint32_t kMemoryCardSid = 0x80000400u;
++        constexpr uint32_t kMemoryCardStorageBudget = 64'000'000u;
++        const bool cardStorageCall = sid == kMemoryCardSid &&
++            (function == 0x10u || function == 0x0Au || function == 3u);
++        uint32_t callBudget = cardStorageCall ? kMemoryCardStorageBudget : 0u;
++        if (sid == kMemoryCardSid && (function == 5u || function == 6u) && input.size() == 48u)
++        {
++            const uint32_t size = uint32_t{input[12]} | (uint32_t{input[13]} << 8u) |
++                                  (uint32_t{input[14]} << 16u) | (uint32_t{input[15]} << 24u);
++            if (static_cast<int32_t>(size) > 0)
++            {
++                // Each MCSERV read/write chunk is at most 8 KiB and can fetch
++                // or evict card cache entries. Scale the finite bound with the
++                // requested work, independently of the ordinary call limit.
++                constexpr uint64_t kChunkBytes = 8192u, kChunkBudget = 2'000'000u;
++                constexpr uint64_t kMaximumBulkBudget = 256'000'000u;
++                callBudget = static_cast<uint32_t>(std::min(kMaximumBulkBudget,
++                    kChunkBudget * (1u + (uint64_t{size} + kChunkBytes - 1u) / kChunkBytes)));
++            }
++        }
++        const uint32_t resultAddress = callBudget != 0u
++            ? executor.executeGuestFunctionWithBudget(server.function, function, server.buffer,
++                static_cast<uint32_t>(input.size()), 0u, server.gp, callBudget)
++            : executor.executeGuestFunction(server.function, function, server.buffer,
++                static_cast<uint32_t>(input.size()), 0u, server.gp);
++        if (m_resetGeneration != resetGeneration)
++            packetFailure(sid, "callback belongs to a retired reset lifetime");
+         if (receiveSize != 0u && (resultAddress == 0u || !ownedPacketRange(m_memory, resultAddress, receiveSize)))
+             packetFailure(sid, "callback did not return the complete requested result in owned IOP RAM");
+ 
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index 0c1cdf397785fee3b722d137ab33692bd39c481c..75bae7ae8c5eb4f753cec41e6f5d1ecce090e9d6 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -95,8 +95,11 @@ namespace ps2x::iop::detail
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
+         uint32_t m_nextDmaId = 1u;
++        uint64_t m_resetGeneration = 0u;
+         bool m_sifInitialized = false;
+         bool m_packetCallActive = false;
++        bool m_otherDataActive = false;
++        bool m_otherDataReentered = false;
+         std::vector<SifEeTransfer> *m_packetTransfers = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index ed2707d85077554cba92ee3b110392669cb48cf6..81e0af966412dcda97bc0acf277bd57c5cd7ad99 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -159,6 +159,11 @@ namespace ps2x::iop
+         m_impl->emulator.setControllerState(port, state);
+     }
+ 
++    void IopSubsystem::mountMemoryCard(uint32_t port, const std::filesystem::path &path, bool create)
++    {
++        m_impl->emulator.mountMemoryCard(port, path, create);
++    }
++
+     void IopSubsystem::reset()
+     {
+         m_impl->bootFailure.clear();
+diff --git a/ps2xIOP/tests/iop_card_admission_fixtures.h b/ps2xIOP/tests/iop_card_admission_fixtures.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fecf3617e2ba077a11e9af01c64deb5fb7e0e6a6
+--- /dev/null
++++ b/ps2xIOP/tests/iop_card_admission_fixtures.h
+@@ -0,0 +1,332 @@
++#pragma once
++
++#include "iop_vblank_fixtures.h"
++#include "emulator/core/iop_kernel.h"
++#include "emulator/core/iop_memory.h"
++
++#include <cstdlib>
++#include <filesystem>
++#include <unistd.h>
++
++namespace iop_card_admission_test
++{
++    using namespace iop_vblank_test;
++
++    struct CardDirectory
++    {
++        std::filesystem::path path;
++        CardDirectory()
++        {
++            auto name = (std::filesystem::temp_directory_path() / "ps2-card-admission-XXXXXX").string();
++            name.push_back('\0');
++            const char *created = ::mkdtemp(name.data());
++            if (!created) throw std::runtime_error("cannot create authored card directory");
++            path = created;
++        }
++        ~CardDirectory() { std::error_code error; std::filesystem::remove_all(path, error); }
++        std::filesystem::path image() const { return path / "ordinary.ps2"; }
++    };
++
++    struct CardProgram : Program
++    {
++        explicit CardProgram(uint32_t base = 0x10000u, uint16_t version = 0x0103u) : Program(base)
++        {
++            imports(0x1600u, "secrman", {4u, 5u, 6u, 8u});
++            image.words(0x1608u, {version});
++        }
++        void registrations(bool command = true, bool device = true)
++        {
++            constant(28u, 0x11223344u);
++            constant(4u, command ? base + 0x600u : 0u); call(stub(0x1600u));
++            constant(28u, 0x55667788u);
++            constant(4u, device ? base + 0x900u : 0u); call(stub(0x1600u, 1u));
++        }
++        void admit(uint32_t port = 2u, uint32_t slot = 0u, uint32_t cnum = 0u)
++        {
++            constant(4u, port); constant(5u, slot); constant(6u, cnum);
++            call(stub(0x1600u, 2u)); store(2u, data()); store(28u, data(4u));
++        }
++        void dynamicLoad(uint32_t target, uint32_t source, uint16_t offset)
++        { emit(0x8C000000u | (source << 21u) | (target << 16u) | offset); emit(0u); }
++        void dynamicStore(uint32_t value, uint32_t target, uint16_t offset)
++        { emit(0xAC000000u | (target << 21u) | (value << 16u) | offset); }
++        void branch(uint32_t offset, uint32_t instruction, uint32_t target)
++        { image.words(offset, {instruction | static_cast<uint16_t>((target - offset - 4u) / 4u)}); }
++        void callback(bool wire = true, bool unregister = false, bool fault = false)
++        {
++            begin(0x600u);
++            emit(0xAFB00018u); emit(0xAFB10014u); emit(0xAFB20010u); emit(0xAFB3000Cu);
++            move(16u, 6u); constant(17u, 0xBF808200u);
++            load(8u, data(8u)); emit(0x25080001u); store(8u, data(8u)); store(28u, data(12u));
++            if (fault) call(stub(0x1400u));
++            if (wire)
++            {
++                constant(8u, 0x3BCu); dynamicStore(8u, 17u, 0x68u);
++                dynamicLoad(8u, 16u, 40u); dynamicStore(8u, 17u, 0u); dynamicStore(0u, 17u, 4u);
++                dynamicLoad(18u, 16u, 116u); dynamicLoad(19u, 16u, 108u);
++                const uint32_t send = cursor;
++                emit(0x92480000u); emit(0u); emit(0xA2280060u);
++                emit(0x26520001u); emit(0x2673FFFFu);
++                const uint32_t sendBranch = cursor; emit(0u); emit(0u);
++                branch(sendBranch, 0x16600000u, send);
++                constant(8u, 0x3BDu); dynamicStore(8u, 17u, 0x68u);
++                dynamicLoad(18u, 16u, 120u); dynamicLoad(19u, 16u, 112u);
++                const uint32_t receive = cursor;
++                emit(0x92280064u); emit(0u); emit(0xA2480000u);
++                emit(0x26520001u); emit(0x2673FFFFu);
++                const uint32_t receiveBranch = cursor; emit(0u); emit(0u);
++                branch(receiveBranch, 0x16600000u, receive);
++                dynamicLoad(8u, 17u, 0x6Cu); dynamicStore(8u, 16u, 0u);
++                constant(8u, 3u); dynamicStore(8u, 17u, 0x80u);
++            }
++            else
++            {
++                // A fake callback with plausible ACK bytes must not admit a
++                // card unless the physical endpoint consumed the command.
++                dynamicLoad(18u, 16u, 120u); dynamicLoad(19u, 16u, 112u);
++                emit(0x02539021u); constant(8u, 0x2Bu); emit(0xA248FFFEu);
++                constant(8u, 0x55u); emit(0xA248FFFFu); dynamicStore(0u, 16u, 0u);
++            }
++            if (unregister) { constant(4u, 0u); call(stub(0x1600u)); }
++            emit(0x8FB3000Cu); emit(0x8FB20010u); emit(0x8FB10014u); emit(0x8FB00018u);
++            finish(1u);
++            require(cursor < 0x900u, "authored card callback overlaps device handler");
++            begin(0x900u); store(28u, data(16u));
++            emit(0x30820001u); emit(0x000210C0u); emit(0x00451021u);
++            emit(0x8FBF001Cu); emit(0x27BD0020u); emit(0x03E00008u); emit(0u);
++        }
++    };
++
++    inline uint64_t metric(IopEmulator &iop, std::string_view name)
++    {
++        for (const auto &value : iop.sio2DebugSnapshot().metrics)
++            if (value.name == name) return value.value;
++        throw std::runtime_error("missing card admission metric");
++    }
++
++    inline void actualWireAdmissionAndRejectedArguments()
++    {
++        for (uint32_t port : {2u, 3u})
++        {
++            CardDirectory directory; Host host; IopEmulator iop(host);
++            iop.mountMemoryCard(port & 1u, directory.image(), true);
++            CardProgram p;
++            p.begin(); p.registrations(); p.admit(port, 0u, (port & 1u) << 3u); p.finish(); p.callback();
++            start(iop, p);
++            require(word(iop, p.data()) == 1u && word(iop, p.data(4u)) == 0x55667788u &&
++                word(iop, p.data(8u)) == 2u && word(iop, p.data(12u)) == 0x11223344u &&
++                word(iop, p.data(16u)) == 0x55667788u && metric(iop, "memory_card_packets") == 2u &&
++                metric(iop, "virtual_storage_admissions") == 1u,
++                "ordinary card admission lost port, callback GP, real wire validation or caller state");
++        }
++        for (const auto arguments : {std::array<uint32_t, 3u>{0u, 0u, 0u}, {1u, 0u, 8u},
++                                    {4u, 0u, 0u}, {2u, 1u, 1u}, {2u, 0u, 8u}})
++        {
++            CardDirectory directory; Host host; IopEmulator iop(host);
++            iop.mountMemoryCard(0u, directory.image(), true);
++            CardProgram p;
++            p.begin(); p.registrations(); p.admit(arguments[0], arguments[1], arguments[2]); p.finish(); p.callback();
++            start(iop, p);
++            require(word(iop, p.data()) == 0u && word(iop, p.data(8u)) == 0u &&
++                metric(iop, "virtual_storage_admissions") == 0u,
++                "invalid port/slot/device accepted or invoked a card callback");
++        }
++    }
++
++    inline void absentCallbacksAndFabricatedRepliesFail()
++    {
++        for (unsigned mode = 0; mode < 5u; ++mode)
++        {
++            CardDirectory directory; Host host; IopEmulator iop(host);
++            if (mode != 0u) iop.mountMemoryCard(0u, directory.image(), true);
++            CardProgram p;
++            p.begin(); p.registrations(mode != 1u, mode != 2u); p.admit(); p.finish();
++            p.callback(mode != 3u, mode == 4u);
++            start(iop, p);
++            require(word(iop, p.data()) == 0u && metric(iop, "virtual_storage_admissions") == 0u,
++                "absent card, missing/changed callback or fabricated ACK became admission success");
++        }
++    }
++
++    inline void callbackLifetimeVersionAndProviderPrecedence()
++    {
++        CardDirectory directory; Host host; IopEmulator iop(host);
++        iop.mountMemoryCard(0u, directory.image(), true);
++        CardProgram registrar;
++        registrar.begin(); registrar.registrations(); registrar.finish(); registrar.callback();
++        const int id = start(iop, registrar);
++        require(iop.stopModule(id, nullptr), "could not stop original-style card callback owner");
++        CardProgram consumer(0x20000u);
++        consumer.begin(); consumer.admit(); consumer.finish(); start(iop, consumer);
++        require(word(iop, consumer.data()) == 0u, "retired original callback admitted a card");
++        iop.reset();
++        CardProgram afterReset;
++        afterReset.begin(); afterReset.admit(); afterReset.finish(); start(iop, afterReset);
++        require(word(iop, afterReset.data()) == 0u && metric(iop, "virtual_storage_admissions") == 0u,
++                "reset retained an admission or original callback registration");
++
++        Host wrongHost; IopEmulator wrong(wrongHost); CardProgram unsupported(0x10000u, 0x0200u);
++        unsupported.begin(); unsupported.admit(); unsupported.finish();
++        rejects([&] { start(wrong, unsupported); }, "missing import secrman:6");
++
++        Host suppliedHost; IopEmulator supplied(suppliedHost);
++        Program provider(0x20000u);
++        provider.begin(); provider.constant(4u, provider.base + 0x1700u);
++        provider.call(provider.stub(0x1500u)); provider.finish();
++        provider.image.words(0x800u, {0x03E00008u, 0x24021234u});
++        provider.image.words(0x1700u, {0x41C00000u, 0u, 0x0103u, 0x72636573u, 0x006E616Du,
++            0x20800u, 0x20800u, 0x20800u, 0x20800u, 0x20800u, 0x20800u, 0x20800u, 0u});
++        start(supplied, provider);
++        CardProgram caller;
++        caller.begin(); caller.admit(99u); caller.finish(); start(supplied, caller);
++        require(word(supplied, caller.data()) == 0x1234u,
++                "virtual card fallback shadowed a compatible supplied secrman export");
++    }
++    inline void contendedCallbacksCannotParkTheirManagedOwner()
++    {
++        for (bool eventWait : {false, true})
++        {
++            CardDirectory directory; Host host; IopEmulator iop(host);
++            iop.mountMemoryCard(0u, directory.image(), true);
++            CardProgram p;
++            p.imports(0x1800u, "thsemap", {4u, 8u});
++            p.imports(0x1900u, "thevent", {4u, 10u});
++            p.image.words(0x2400u, {0u, 0u, p.base + 0xB00u, 0x1000u, 20u});
++            p.image.words(0x2100u, {0u, 0u, 0u, 1u});
++            p.begin(); p.registrations();
++            p.constant(4u, p.base + 0x2400u); p.call(p.stub(0x1200u));
++            p.move(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1200u, 1u)); p.finish();
++            p.callback();
++            p.begin(0x600u); p.constant(4u, p.data(0x100u));
++            p.call(p.stub(eventWait ? 0x1900u : 0x1800u));
++            p.move(4u, 2u); p.constant(5u, 1u); p.constant(6u, 0u); p.constant(7u, 0u);
++            p.call(p.stub(eventWait ? 0x1900u : 0x1800u, 1u)); p.finish(1u);
++            p.begin(0xB00u); p.admit(); p.constant(8u, 1u); p.store(8u, p.data(0x20u)); p.finish();
++            start(iop, p);
++            rejects([&] { advance(iop, 10000u); }, "cannot block an independently owned native frame");
++            require(word(iop, p.data(0x20u)) == 0u && metric(iop, "virtual_storage_admissions") == 0u,
++                "contended native callback resumed its managed owner or claimed admission");
++            const auto stopped = iop.instructions(); iop.runEeCycles(10000u);
++            require(iop.instructions() == stopped, "callback contention lost its sticky failure");
++            iop.reset();
++        }
++    }
++
++    inline CardProgram externalWaitProgram(bool eventWait, bool peer)
++    {
++        CardProgram p;
++        p.imports(0x1800u, "thsemap", {4u, 8u, 6u});
++        p.imports(0x1900u, "thevent", {4u, 10u, 7u});
++        p.image.words(0x2100u, {0u, 0u, 0u, 1u});
++        p.image.words(0x2400u, {0u, 0u, p.base + 0xB00u, 0x1000u, 20u});
++        const uint32_t table = eventWait ? 0x1900u : 0x1800u;
++        p.begin(); p.constant(4u, p.data(0x100u)); p.call(p.stub(table)); p.store(2u, p.data(0x40u));
++        if (peer)
++        {
++            p.constant(4u, p.base + 0x2400u); p.call(p.stub(0x1200u));
++            p.move(4u, 2u); p.constant(5u, 0u); p.call(p.stub(0x1200u, 1u));
++        }
++        p.load(4u, p.data(0x40u));
++        p.constant(5u, 1u); p.constant(6u, 0u); p.constant(7u, p.data(0x60u));
++        p.call(p.stub(table, 1u)); p.store(2u, p.data());
++        p.constant(8u, 1u); p.store(8u, p.data(4u)); p.finish();
++        p.begin(0xB00u); p.load(4u, p.data(0x40u)); p.constant(5u, 1u);
++        p.call(p.stub(table, 2u)); p.constant(8u, 1u); p.store(8u, p.data(8u)); p.finish();
++        return p;
++    }
++
++    inline void externalKernelWaitsPumpOwnedPeers()
++    {
++        for (bool eventWait : {false, true})
++        {
++            Host host; IopEmulator iop(host); auto p = externalWaitProgram(eventWait, true);
++            start(iop, p);
++            require(word(iop, p.data()) == 0u && word(iop, p.data(4u)) == 1u &&
++                word(iop, p.data(8u)) == 1u && (!eventWait || word(iop, p.data(0x60u)) == 1u),
++                "external kernel wait returned before its actual peer signaled completion");
++            Host stalledHost; IopEmulator stalled(stalledHost); auto idle = externalWaitProgram(eventWait, false);
++            rejects([&] { start(stalled, idle); }, "external kernel wait exhausted its invocation budget");
++            require(word(stalled, idle.data(4u)) == 0u,
++                "idle external wait fabricated a completed import or did not count idle cycles");
++        }
++    }
++
++    inline void invalidExternalWaitsDoNotPump()
++    {
++        for (bool eventWait : {false, true})
++        {
++            Host host; IopEmulator iop(host); CardProgram p;
++            p.imports(0x1800u, eventWait ? "thevent" : "thsemap", {eventWait ? 10u : 8u});
++            p.begin(); p.constant(4u, 12345u); p.constant(5u, 1u); p.constant(6u, 0u); p.constant(7u, 0u);
++            p.call(p.stub(0x1800u)); p.store(2u, p.data()); p.finish(); start(iop, p);
++            require(word(iop, p.data()) == uint32_t(-1) && iop.cycles() < 1000u,
++                    "invalid wait ID entered external scheduling instead of returning its error");
++        }
++        for (uint32_t invalid : {0u, 0x80000001u})
++        {
++            Host host; IopEmulator iop(host); auto p = externalWaitProgram(true, true);
++            // Change only the wait's requested pattern or mode, after creation.
++            p.begin(); p.constant(4u, p.data(0x100u)); p.call(p.stub(0x1900u));
++            p.move(4u, 2u); p.constant(5u, invalid == 0u ? 0u : 1u);
++            p.constant(6u, invalid == 0u ? 0u : 0x80000000u); p.constant(7u, 0u);
++            p.call(p.stub(0x1900u, 1u)); p.finish();
++            rejects([&] { start(iop, p); }, "invalid pattern, mode or result range");
++            require(iop.cycles() < 1000u, "invalid event pattern/mode pumped unrelated guest work");
++        }
++    }
++
++    inline void pendingNativeWaitLeavesTheManagedCpuUntouched()
++    {
++        ps2x::iop::detail::IopMemory memory;
++        ps2x::iop::detail::IopKernel kernel(memory);
++        ps2x::iop::detail::IopCpuState api;
++        memory.write32(0x1008u, 0x10000u); memory.write32(0x100Cu, 0x800u); memory.write32(0x1010u, 20u);
++        api.gpr[4] = 0x1000u; require(kernel.dispatchThreadImport(4u, api, 0u), "thread create failed");
++        api.gpr[4] = api.gpr[2]; require(kernel.dispatchThreadImport(6u, api, 0u), "thread start failed");
++        auto *owner = kernel.beginNextReady(0u); require(owner != nullptr, "managed test owner missing");
++        memory.write32(0x104Cu, 1u); api.gpr[4] = 0x1040u;
++        require(kernel.dispatchSemaphoreImport(4u, api), "semaphore create failed"); api.gpr[4] = api.gpr[2];
++        rejects([&] { (void)kernel.dispatchSemaphoreImport(8u, api, false); }, "native kernel wait is pending");
++        require(owner->state == ps2x::iop::detail::IopThreadState::Running && owner->waitId == 0 && !api.yielded,
++                "pending separate semaphore CPU parked the managed owner before dispatch validation");
++        const int event = kernel.createInternalEventFlag(0u, 0u, 0u);
++        api.gpr[4] = event; api.gpr[5] = 1u; api.gpr[6] = 0u; api.gpr[7] = 0u;
++        rejects([&] { (void)kernel.dispatchEventImport(10u, api, false); }, "native kernel wait is pending");
++        require(owner->state == ps2x::iop::detail::IopThreadState::Running && owner->waitId == 0 && !api.yielded,
++                "pending separate event CPU parked the managed owner before dispatch validation");
++    }
++
++    inline void eventResultsAcceptUninitializedWritableRam()
++    {
++        using ps2x::iop::detail::IopMemory;
++        using ps2x::iop::detail::IopKernel;
++        using ps2x::iop::detail::IopCpuState;
++        for (uint32_t alias : {0u, 0x80000000u, 0xA0000000u})
++        for (uint32_t offset : {0x2000u, IopMemory::RamSize - 4u})
++        {
++            IopMemory memory; IopKernel kernel(memory); IopCpuState cpu;
++            const int event = kernel.createInternalEventFlag(0u, 0u, 1u);
++            const uint32_t result = alias | offset;
++            memory.write8(result - 1u, 0xA5u);
++            require(!memory.ownsRamRange(result, 4u), "fixture result unexpectedly contains initialized input");
++            cpu.gpr[4] = event; cpu.gpr[5] = 1u; cpu.gpr[6] = 0u; cpu.gpr[7] = result;
++            require(kernel.dispatchEventImport(11u, cpu, false) && cpu.gpr[2] == 0u &&
++                memory.read32(result) == 1u && memory.read8(result - 1u) == 0xA5u,
++                "valid write-only EventFlag result required preinitialized host input or damaged its neighbor");
++        }
++        for (uint32_t result : {0x2001u, 0x001FFFFFu, 0xC0002000u, 0x20002000u, 0xBF801074u, 0xFFFFFFFCu})
++        {
++            IopMemory memory; IopKernel kernel(memory); IopCpuState cpu;
++            const int event = kernel.createInternalEventFlag(0u, 0u, 1u);
++            const std::vector<uint8_t> before(memory.ram().begin(), memory.ram().end());
++            cpu.gpr[4] = event; cpu.gpr[5] = 1u; cpu.gpr[6] = 0x10u; cpu.gpr[7] = result;
++            rejects([&] { (void)kernel.dispatchEventImport(11u, cpu, false); }, "invalid pattern, mode or result range");
++            require(std::equal(before.begin(), before.end(), memory.ram().begin()) && memory.interruptMask() == 0u,
++                "invalid EventFlag output changed RAM or MMIO before rejection");
++            cpu.gpr[6] = 0u; cpu.gpr[7] = 0u;
++            require(kernel.dispatchEventImport(11u, cpu, false) && cpu.gpr[2] == 0u,
++                "invalid write-only output consumed the event's clear-on-read state");
++        }
++    }
++
++}
+diff --git a/ps2xIOP/tests/iop_dmacman_tests.cpp b/ps2xIOP/tests/iop_dmacman_tests.cpp
+index 1eca42da44d5f834a51778d7c3576fd06ff79e3b..5cada30d8e48a5c38579de85e452fbf169e4430e 100644
+--- a/ps2xIOP/tests/iop_dmacman_tests.cpp
++++ b/ps2xIOP/tests/iop_dmacman_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "iop_compat_test_support.h"
+ #include "emulator/core/iop_cpu.h"
+ #include "emulator/core/iop_memory.h"
++#include "emulator/core/iop_sio2.h"
+ 
+ #include <array>
+ #include <iostream>
+@@ -155,19 +156,106 @@ namespace
+                 "guest import dispatch did not expose the actual register updates or void ABI");
+         require(host.guestWrites == 0u, "DMAC configuration wrote unrelated EE memory");
+ 
+-        // A real transfer-start import still has no modeled implementation.
+-        // It must reach strict missing-import handling, not a success return.
+-        image.words(0x198u, {0x24000020u});
++        // Chained DMA remains unsupported; adding scoped SIO2 slice wrappers
++        // must not turn unrelated DMA services into successful imports.
++        image.words(0x198u, {0x2400001Du});
+         IopEmulator unsupported(host);
+         bool rejected = false;
+         try { (void)unsupported.loadModuleImage("authored-unimplemented-dma", image.bytes, nullptr, 0u); }
+         catch (const std::runtime_error &error)
+         {
+-            rejected = std::string_view(error.what()).find("missing import dmacman:32") != std::string_view::npos;
++            rejected = std::string_view(error.what()).find("missing import dmacman:29") != std::string_view::npos;
+         }
+         require(rejected && unsupported.loadedModuleCount() == 0u,
+                 "unsupported DMA execution became a successful module start");
+     }
++
++    void sliceWrappersUseTheOwnedO32StackAndSeparateStart()
++    {
++        IopMemory memory; IopSio2 device(memory); IopCpuState cpu{};
++        const uint32_t buffer = memory.allocate(288u), stack = memory.allocate(32u);
++        cpu.gpr[4] = 12u; cpu.gpr[5] = buffer; cpu.gpr[6] = 0x24u; cpu.gpr[7] = 2u;
++        cpu.gpr[8] = 1u; cpu.gpr[29] = stack;
++        memory.write32(stack + 16u, 0u);
++        const auto before = cpu.gpr;
++        require(dispatchDmacmanSio2(memory, 28u, cpu) && cpu.gpr[2] == 1u &&
++                    memory.read32(0xBF801550u) == buffer && memory.read32(0xBF801554u) == 0x00020024u &&
++                    memory.read32(0xBF801558u) == 0x40000200u,
++                "SetSliceDMA did not consume O32 sp+16 or preserve SDK to-memory CHCR bit30");
++        for (size_t i = 0u; i < cpu.gpr.size(); ++i) if (i != 2u)
++            require(cpu.gpr[i] == before[i], "SetSliceDMA changed an unrelated guest register");
++        require(memory.read32(0x1F808280u) == 0u && !memory.takeDmaStart(), "SetSliceDMA started a transfer or fabricated completion");
++        cpu.gpr[2] = 0xDEADBEEFu; const auto startRegisters = cpu.gpr;
++        require(dispatchDmacmanSio2(memory, 32u, cpu) && cpu.gpr == startRegisters &&
++                    memory.read32(0xBF801558u) == 0x41000200u && memory.read32(0x1F808280u) == 0u,
++                "StartDMA lost its void ABI or skipped its explicit start strobe");
++    }
++
++    void invalidSliceRequestsLeaveConfigurationUntouched()
++    {
++        IopMemory memory; IopSio2 device(memory); IopCpuState cpu{};
++        const uint32_t buffer = memory.allocate(144u), stack = memory.allocate(32u);
++        cpu.gpr[4] = 11u; cpu.gpr[5] = buffer; cpu.gpr[6] = 0x24u; cpu.gpr[7] = 1u; cpu.gpr[29] = stack;
++        memory.write32(stack + 16u, 1u);
++        require(dispatchDmacmanSio2(memory, 28u, cpu), "cannot set valid baseline slice");
++        const auto baseline = cpu;
++        const auto rejected = [&](uint16_t ordinal) {
++            bool failed = false;
++            try { (void)dispatchDmacmanSio2(memory, ordinal, cpu); } catch (const std::runtime_error &) { failed = true; }
++            require(failed && memory.read32(0xBF801540u) == buffer && memory.read32(0xBF801544u) == 0x00010024u &&
++                        memory.read32(0xBF801548u) == 0x201u && memory.read32(0x1F808280u) == 0u,
++                    "invalid DMA call partially changed its valid prior configuration");
++        };
++        for (uint32_t channel : {0u, 10u, 13u, 0xFFFFFFFFu}) { cpu = baseline; cpu.gpr[4] = channel; rejected(28u); }
++        for (uint32_t words : {0u, 129u, 0xFFFFFFFFu}) { cpu = baseline; cpu.gpr[6] = words; rejected(28u); }
++        for (uint32_t count : {0u, 17u, 0xFFFFFFFFu}) { cpu = baseline; cpu.gpr[7] = count; rejected(28u); }
++        for (uint32_t address : {buffer + 1u, 0x200000u, 0x1FFFFCu}) { cpu = baseline; cpu.gpr[5] = address; rejected(28u); }
++        for (uint32_t address : {stack + 1u, 0u, 0x1FFFF8u}) { cpu = baseline; cpu.gpr[29] = address; rejected(28u); }
++        for (uint32_t direction : {0u, 2u, 0xFFFFFFFFu}) { cpu = baseline; memory.write32(stack + 16u, direction); rejected(28u); }
++        memory.write32(stack + 16u, 1u);
++        require(memory.zeroRam(IopMemory::HeapBase - 16u, 32u), "cannot prepare owned heap-boundary argument control");
++        cpu = baseline; cpu.gpr[5] = IopMemory::HeapBase - 4u; rejected(28u);
++        memory.write32(IopMemory::HeapBase, 1u);
++        cpu = baseline; cpu.gpr[29] = IopMemory::HeapBase - 16u; rejected(28u);
++        cpu = baseline; cpu.gpr[4] = 12u;
++        bool failed = false;
++        try { (void)dispatchDmacmanSio2(memory, 32u, cpu); } catch (const std::runtime_error &) { failed = true; }
++        require(failed && memory.read32(0xBF801558u) == 0u, "StartDMA accepted an unconfigured slice");
++        require(!dispatchDmacmanSio2(memory, 29u, cpu), "SIO2 wrappers claimed an unrelated ordinal");
++    }
++
++    void authoredMipsSliceCallsUseO32Arguments()
++    {
++        iop_test::Irx image(0x10000u, 0x1000u); uint32_t cursor = 0u;
++        const auto emit = [&](uint32_t instruction) { image.words(cursor, {instruction}); cursor += 4u; };
++        const auto li = [&](uint32_t reg, uint32_t value) {
++            emit(0x3C000000u | (reg << 16u) | (value >> 16u));
++            emit(0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu));
++        };
++        const auto call = [&](uint32_t address) { emit(0x0C000000u | (address >> 2u)); emit(0u); };
++        emit(0x27BDFFE0u); emit(0xAFBF001Cu); li(17u, 0x10400u);
++        li(4u, 11u); li(5u, 0x10500u); li(6u, 0x24u); li(7u, 2u);
++        li(8u, 1u); emit(0xAFA80010u); li(8u, 0u); call(0x10314u); emit(0xAE220000u);
++        li(9u, 0xBF801540u); emit(0x8D2A0008u); emit(0u); emit(0xAE2A0004u);
++        li(2u, 0xDEADBEEFu); call(0x1031Cu); emit(0xAE220008u);
++        emit(0x8D2A0008u); emit(0u); emit(0xAE2A000Cu);
++        li(4u, 12u); li(5u, 0x10700u); li(6u, 0x24u); li(7u, 2u);
++        emit(0xAFA00010u); li(8u, 1u); call(0x10314u);
++        li(9u, 0xBF801550u); emit(0x8D2A0008u); emit(0u); emit(0xAE2A0010u);
++        call(0x1031Cu); emit(0x8D2A0008u); emit(0u); emit(0xAE2A0014u);
++        emit(0x8FBF001Cu); emit(0x27BD0020u); emit(0x03E00008u); emit(0x00001021u);
++        require(cursor < 0x300u, "authored O32 caller overlaps its import table");
++        image.words(0x300u, {0x41E00000u, 0u, 0x0102u, 0x63616D64u, 0x006E616Du,
++            0x03E00008u, 0x2400001Cu, 0x03E00008u, 0x24000020u, 0u, 0u});
++        iop_test::Host host; IopEmulator iop(host);
++        const auto loaded = iop.loadModuleImage("authored-o32-sio2-slices", image.bytes, nullptr, 0u);
++        std::array<uint32_t, 6u> captured{};
++        require(loaded.moduleId > 0 && loaded.startResult == 0 && iop.readMemory(0x10400u, captured.data(), sizeof(captured)),
++                "authored MIPS DMA slice calls did not complete");
++        require(captured == std::array<uint32_t, 6u>{1u, 0x201u, 0xDEADBEEFu, 0x01000201u, 0x40000200u, 0x41000200u},
++                "real MIPS wrappers used t0 instead of O32 sp+16, lost return ABI or started too early");
++        require(host.guestWrites == 0u && host.cardCalls.empty(), "DMA ABI fixture used unrelated EE or HLE card calls");
++    }
+ }
+ 
+ int main()
+@@ -178,7 +266,10 @@ int main()
+         banksAndPriorityMask();
+         unsupportedBeforeMutation();
+         guestImportDispatchAndStrictFallback();
+-        std::cout << "ps2xIOP DMAC priority tests passed (4 groups)\n";
++        sliceWrappersUseTheOwnedO32StackAndSeparateStart();
++        invalidSliceRequestsLeaveConfigurationUntouched();
++        authoredMipsSliceCallsUseO32Arguments();
++        std::cout << "ps2xIOP DMAC tests passed (7 groups)\n";
+         return 0;
+     }
+     catch (const std::exception &error)
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index dca34246c809ae96e99794abe6edd241dcb977ac..de4da1e5c7b8e234ab647b20dd02ce63192a2ac3 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -138,14 +138,55 @@ namespace
+             lastAddress = address;
+             lastArgument = a0;
+             lastGp = gp;
++            if (throwCall)
++                throw std::runtime_error("authored callback budget failure");
++            if (onCall)
++                onCall();
+             return callbackResult;
+         }
+ 
++        uint32_t executeGuestFunctionWithBudget(uint32_t address, uint32_t a0,
++                                               uint32_t a1, uint32_t a2, uint32_t a3,
++                                               uint32_t gp, uint32_t budget) override
++        {
++            ++budgetedCalls;
++            lastBudget = budget;
++            return executeGuestFunction(address, a0, a1, a2, a3, gp);
++        }
++
+         uint32_t callbackResult = 0u;
+         uint32_t calls = 0u;
+         uint32_t lastAddress = 0u;
+         uint32_t lastArgument = 0u;
+         uint32_t lastGp = 0u;
++        uint32_t budgetedCalls = 0u;
++        uint32_t lastBudget = 0u;
++        bool throwCall = false;
++        std::function<void()> onCall;
++    };
++
++    class OtherDataHost final : public NullHost
++    {
++    public:
++        std::vector<uint8_t> ee = std::vector<uint8_t>(32u * 1024u * 1024u);
++        std::function<void()> onRead;
++        bool failRead = false;
++        mutable uint32_t reads = 0u;
++        bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override
++        {
++            normalized = address & 0x1FFFFFFFu;
++            return normalized < ee.size();
++        }
++        bool readGuest(uint32_t address, void *destination, size_t size) const override
++        {
++            ++reads;
++            if (onRead)
++                onRead();
++            if (address > ee.size() || size > ee.size() - address)
++                return false;
++            std::memcpy(destination, ee.data() + address, size);
++            return !failRead;
++        }
+     };
+ 
+     bool expect(bool condition, std::string_view message)
+@@ -772,6 +813,434 @@ namespace
+                       "free queries did not restore full capacity after all allocations were freed");
+     }
+ 
++    bool testSifOtherDataBoundsAndLifetimes()
++    {
++        OtherDataHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopRpcBridge bridge(host, memory, kernel);
++        constexpr uint32_t receive = 0x1000u, destination = 0x2000u, stack = 0x3000u;
++        std::array<uint8_t, 64u> canary{};
++        canary.fill(0xA5u);
++        (void)memory.writeRam(receive, canary.data(), canary.size());
++        (void)memory.writeRam(destination, canary.data(), canary.size());
++        (void)memory.zeroRam(stack, 32u);
++        for (uint32_t i = 0u; i < 64u; ++i)
++            host.ee[destination + i] = static_cast<uint8_t>(i * 13u + 7u);
++        const auto request = [&]
++        {
++            IopCpuState cpu{};
++            cpu.gpr[2] = 0x12345678u;
++            cpu.gpr[4] = receive;
++            // Equal numeric EE/IOP addresses intentionally hold different bytes.
++            cpu.gpr[5] = destination;
++            cpu.gpr[6] = destination;
++            cpu.gpr[7] = 31u;
++            cpu.gpr[29] = stack;
++            return cpu;
++        };
++        for (uint32_t alias : {0u, 0x20000000u, 0x80000000u, 0xA0000000u})
++        {
++            auto cpu = request();
++            cpu.gpr[5] |= alias;
++            cpu.gpr[6] |= alias == 0x20000000u ? 0u : alias;
++            if (!expect(bridge.dispatchSifCmdImport(23u, cpu) && cpu.gpr[2] == 0u,
++                        "synchronous GetOtherData did not complete"))
++                return false;
++            std::array<uint8_t, 64u> copied{};
++            (void)memory.readRam(destination, copied.data(), copied.size());
++            if (!expect(std::equal(copied.begin(), copied.begin() + 32u, host.ee.begin() + destination) &&
++                        std::equal(copied.begin() + 32u, copied.end(), canary.begin() + 32u),
++                        "GetOtherData did not copy exact EE quadwords or overwrote a guard") ||
++                !expect(memory.read32(receive) == 0u && memory.read32(receive + 4u) == 0u &&
++                        memory.read32(receive + 8u) == 0xFFFFFFFFu && memory.read32(receive + 12u) == 0u &&
++                        memory.read32(receive + 16u) == 0xA5A5A5A5u &&
++                        memory.read32(receive + 20u) == 0xA5A5A5A5u &&
++                        memory.read32(receive + 24u) == 0xA5A5A5A5u,
++                        "synchronous receive status or trailing ABI fields changed incorrectly"))
++                return false;
++        }
++        const auto rejected = [&](IopCpuState cpu)
++        {
++            const std::vector<uint8_t> before(memory.ram().begin(), memory.ram().end());
++            bool failed = false;
++            try { (void)bridge.dispatchSifCmdImport(23u, cpu); }
++            catch (const std::runtime_error &) { failed = true; }
++            return expect(failed && cpu.gpr[2] == 0x12345678u &&
++                          std::equal(before.begin(), before.end(), memory.ram().begin()),
++                          "invalid GetOtherData mutated IOP bytes or published success");
++        };
++        for (uint32_t size : {0u, 0xFFFFFFFFu, 0x7FFFFFFFu, 0x100000u})
++        {
++            auto cpu = request(); cpu.gpr[7] = size;
++            if (!rejected(cpu)) return false;
++        }
++        for (uint32_t reg : {4u, 5u, 6u, 29u})
++        {
++            auto cpu = request(); ++cpu.gpr[reg];
++            if (!rejected(cpu)) return false;
++        }
++        for (uint32_t reg : {4u, 6u, 29u})
++        {
++            auto cpu = request(); cpu.gpr[reg] = 0x8000u; // unowned
++            if (!rejected(cpu)) return false;
++        }
++        for (uint32_t mode : {1u, 2u, 0x80000000u})
++        {
++            memory.write32(stack + 16u, mode);
++            if (!rejected(request())) return false;
++        }
++        memory.write32(stack + 16u, 0u);
++        auto cpu = request(); cpu.gpr[5] = 0x40002000u;
++        if (!rejected(cpu)) return false;
++        cpu = request(); cpu.gpr[5] = 32u * 1024u * 1024u - 16u; cpu.gpr[7] = 17u;
++        if (!rejected(cpu)) return false;
++        cpu = request(); cpu.gpr[6] = receive;
++        if (!rejected(cpu)) return false;
++        (void)memory.zeroRam(0x9000u, 17u); // requested bytes owned, wire tail unowned
++        cpu = request(); cpu.gpr[6] = 0x9000u; cpu.gpr[7] = 17u;
++        if (!rejected(cpu)) return false;
++        host.failRead = true;
++        if (!rejected(request())) return false;
++        host.failRead = false;
++
++        // A span crossing into heap RAM needs a single live allocation even if
++        // every byte was previously touched by guest code.
++        (void)memory.zeroRam(IopMemory::HeapBase - 16u, 32u);
++        cpu = request(); cpu.gpr[6] = IopMemory::HeapBase - 16u;
++        if (!rejected(cpu)) return false;
++        for (uint32_t reg : {4u, 6u, 29u})
++        {
++            const uint32_t allocation = memory.allocate(64u);
++            if (!expect(allocation != 0u, "GetOtherData owner allocation failed")) return false;
++            (void)memory.zeroRam(allocation, 64u);
++            cpu = request(); cpu.gpr[reg] = allocation;
++            bool changedOwner = false;
++            host.onRead = [&]
++            {
++                changedOwner = memory.freeAllocation(allocation) && memory.allocate(64u) == allocation;
++                (void)memory.writeRam(allocation, canary.data(), canary.size());
++            };
++            bool failed = false;
++            try { (void)bridge.dispatchSifCmdImport(23u, cpu); }
++            catch (const std::runtime_error &) { failed = true; }
++            host.onRead = {};
++            std::array<uint8_t, 64u> live{};
++            (void)memory.readRam(allocation, live.data(), live.size());
++            if (!expect(failed && changedOwner && live == canary && cpu.gpr[2] == 0x12345678u,
++                        "GetOtherData overwrote a replacement allocation or completed a stale request"))
++                return false;
++            (void)memory.freeAllocation(allocation);
++        }
++        for (bool reset : {false, true})
++        {
++            const std::vector<uint8_t> before(memory.ram().begin(), memory.ram().end());
++            bool nestedRejected = false;
++            host.onRead = [&]
++            {
++                if (reset) bridge.reset();
++                else
++                {
++                    auto nested = request();
++                    try { (void)bridge.dispatchSifCmdImport(23u, nested); }
++                    catch (const std::runtime_error &) { nestedRejected = true; }
++                }
++            };
++            bool failed = false;
++            cpu = request();
++            try { (void)bridge.dispatchSifCmdImport(23u, cpu); }
++            catch (const std::runtime_error &) { failed = true; }
++            host.onRead = {};
++            if (!expect(failed && (reset || nestedRejected) &&
++                        std::equal(before.begin(), before.end(), memory.ram().begin()),
++                        "GetOtherData published bytes after reset or reentrant host read"))
++                return false;
++        }
++        cpu = request();
++        if (!expect(bridge.dispatchSifCmdImport(23u, cpu) && cpu.gpr[2] == 0u,
++                    "failed GetOtherData leaked transfer ownership"))
++            return false;
++        // Exercise the same import from an owned packet callback, including
++        // callback failure and the next packet's ownership cleanup.
++        constexpr uint32_t server = 0x4000u, callback = 0x5000u, result = 0x6000u;
++        (void)memory.zeroRam(server, 0x30u);
++        (void)memory.zeroRam(callback, 4u);
++        (void)memory.zeroRam(result, 4u);
++        IopCpuState registration{};
++        registration.gpr[4] = server;
++        registration.gpr[5] = 0x80000400u;
++        registration.gpr[6] = callback;
++        registration.gpr[29] = stack;
++        if (!bridge.dispatchSifCmdImport(17u, registration)) return false;
++        RecordingExecutor executor;
++        executor.callbackResult = result;
++        bool packetReentryRejected = false;
++        host.onRead = [&]
++        {
++            try { (void)bridge.executePacketCall(0x80000400u, server, 1u, {}, 4u, executor); }
++            catch (const std::runtime_error &error)
++            {
++                packetReentryRejected = std::string_view(error.what()).find("active EE source snapshot") !=
++                                        std::string_view::npos;
++            }
++        };
++        const std::vector<uint8_t> beforePacketReentry(memory.ram().begin(), memory.ram().end());
++        cpu = request();
++        bool outerReentryRejected = false;
++        try { (void)bridge.dispatchSifCmdImport(23u, cpu); }
++        catch (const std::runtime_error &error)
++        {
++            outerReentryRejected = std::string_view(error.what()).find("reentrant RPC context") !=
++                                   std::string_view::npos;
++        }
++        host.onRead = {};
++        if (!expect(packetReentryRejected && outerReentryRejected && executor.calls == 0u &&
++                    cpu.gpr[2] == 0x12345678u &&
++                    std::equal(beforePacketReentry.begin(), beforePacketReentry.end(), memory.ram().begin()),
++                    "a direct EE source snapshot admitted a nested packet or published completion"))
++            return false;
++        executor.onCall = [&]
++        {
++            auto import = request();
++            if (!bridge.dispatchSifCmdImport(23u, import) || import.gpr[2] != 0u)
++                throw std::runtime_error("packet GetOtherData did not complete");
++        };
++        std::vector<SifEeTransfer> transfers;
++        (void)bridge.executePacketCall(0x80000400u, server, 6u, {}, 4u, executor, &transfers);
++        memory.write32(stack + 16u, 1u);
++        bool failed = false;
++        try { (void)bridge.executePacketCall(0x80000400u, server, 6u, {}, 4u, executor, &transfers); }
++        catch (const std::runtime_error &) { failed = true; }
++        memory.write32(stack + 16u, 0u);
++        (void)bridge.executePacketCall(0x80000400u, server, 6u, {}, 4u, executor, &transfers);
++        return expect(failed && transfers.empty() && executor.calls == 3u,
++                      "GetOtherData packet callback failure leaked ownership or invented EE output");
++    }
++
++    bool testPacketCardFormatBudgetIsScoped()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopRpcBridge bridge(host, memory, kernel);
++        RecordingExecutor executor;
++        constexpr uint32_t server = 0x1000u, callback = 0x2000u;
++        constexpr uint32_t buffer = 0x3000u, stack = 0x4000u, result = 0x5000u;
++        if (!memory.zeroRam(server, 0x30u) || !memory.zeroRam(callback, 4u) ||
++            !memory.zeroRam(buffer, 48u) || !memory.zeroRam(stack, 32u) ||
++            !memory.zeroRam(result, 4u))
++            return false;
++        executor.callbackResult = result;
++        const auto registerServer = [&](uint32_t sid)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = server;
++            cpu.gpr[5] = sid;
++            cpu.gpr[6] = callback;
++            cpu.gpr[7] = buffer;
++            cpu.gpr[29] = stack;
++            return bridge.dispatchSifCmdImport(17u, cpu);
++        };
++        std::array<uint8_t, 48u> request{};
++        if (!expect(registerServer(0x80000400u), "card RPC registration failed"))
++            return false;
++        (void)bridge.executePacketCall(0x80000400u, server, 0x10u, request, 4u, executor);
++        if (!expect(executor.calls == 1u && executor.budgetedCalls == 1u &&
++                    executor.lastBudget == 64'000'000u,
++                    "full-card format did not receive its finite service budget"))
++            return false;
++        for (uint32_t command : {0x0Au, 3u})
++            (void)bridge.executePacketCall(0x80000400u, server, command, request, 4u, executor);
++        if (!expect(executor.calls == 3u && executor.budgetedCalls == 3u &&
++                    executor.lastBudget == 64'000'000u,
++                    "flush/close did not receive the finite dirty-cache budget"))
++            return false;
++        for (uint32_t command : {1u, 0x11u, 2u, 5u, 6u})
++            (void)bridge.executePacketCall(0x80000400u, server, command, request, 4u, executor);
++        if (!expect(registerServer(0x12345678u), "other RPC registration failed"))
++            return false;
++        for (uint32_t command : {0x10u, 0x0Au, 3u})
++            (void)bridge.executePacketCall(0x12345678u, server, command, request, 4u, executor);
++        if (!expect(executor.calls == 11u && executor.budgetedCalls == 3u,
++                    "storage service budget escaped to another command or SID"))
++            return false;
++        std::vector<SifEeTransfer> transfers{{0x6000u, {0x5au}}};
++        executor.throwCall = true;
++        bool failed = false;
++        try
++        {
++            (void)bridge.executePacketCall(0x80000400u, server, 0x10u, request, 4u, executor, &transfers);
++        }
++        catch (const std::runtime_error &)
++        {
++            failed = true;
++        }
++        if (!expect(failed && transfers.size() == 1u && transfers[0].address == 0x6000u &&
++                    transfers[0].data == std::vector<uint8_t>{0x5au},
++                    "failed format published or replaced pending EE transfers"))
++            return false;
++        executor.throwCall = false;
++        (void)bridge.executePacketCall(0x80000400u, server, 1u, request, 4u, executor, &transfers);
++        if (!expect(executor.calls == 13u && executor.budgetedCalls == 4u && transfers.empty(),
++                    "failed format leaked packet ownership into the next callback"))
++            return false;
++        for (const auto [size, expectedBudget] : std::array<std::pair<uint32_t, uint32_t>, 7u>{{
++                 {1u, 4'000'000u}, {8192u, 4'000'000u}, {8193u, 6'000'000u},
++                 {524288u, 130'000'000u}, {0x7FFFFFFFu, 256'000'000u}, {0u, 0u}, {0xFFFFFFFFu, 0u}}})
++        {
++            for (uint32_t i = 0u; i < 4u; ++i) request[12u + i] = static_cast<uint8_t>(size >> (i * 8u));
++            for (uint32_t command : {5u, 6u})
++            {
++                const uint32_t previous = executor.budgetedCalls;
++                (void)bridge.executePacketCall(0x80000400u, server, command, request, 4u, executor);
++                if (!expect(executor.budgetedCalls == previous + (expectedBudget != 0u) &&
++                            (expectedBudget == 0u || executor.lastBudget == expectedBudget),
++                            "bulk read/write work did not receive its finite size-dependent budget"))
++                    return false;
++            }
++        }
++        request[12] = 1u; request[13] = request[14] = request[15] = 0u;
++        const uint32_t previous = executor.budgetedCalls;
++        (void)bridge.executePacketCall(0x80000400u, server, 4u, request, 4u, executor);
++        for (uint32_t command : {5u, 6u})
++        {
++            (void)bridge.executePacketCall(0x12345678u, server, command, request, 4u, executor);
++            (void)bridge.executePacketCall(0x80000400u, server, command, std::span(request).first(47u), 4u, executor);
++        }
++        return expect(executor.budgetedCalls == previous,
++                      "bulk work budget escaped to seek, another SID or a different descriptor ABI");
++    }
++
++    bool testPacketSequentialDmaSnapshotsAreBounded()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopRpcBridge bridge(host, memory, kernel);
++        constexpr uint32_t sid = 0x80000400u, server = 0x1000u, callback = 0x2000u;
++        constexpr uint32_t stack = 0x3000u, result = 0x4000u, descriptor = 0x5000u, source = 0x7000u;
++        for (uint32_t address : {server, callback, stack, result})
++            (void)memory.zeroRam(address, 64u);
++        (void)memory.zeroRam(descriptor, 33u * 16u);
++        (void)memory.zeroRam(source, 0xFFFF0u);
++        IopCpuState registration{};
++        registration.gpr[4] = server; registration.gpr[5] = sid;
++        registration.gpr[6] = callback; registration.gpr[29] = stack;
++        if (!bridge.dispatchSifCmdImport(17u, registration)) return false;
++        const auto submit = [&](uint32_t destination, uint32_t bytes, uint32_t count = 1u)
++        {
++            const std::array<uint32_t, 4u> dma{source, destination, bytes, 0u};
++            (void)memory.writeRam(descriptor, dma.data(), sizeof(dma));
++            IopCpuState cpu{};
++            cpu.gpr[4] = descriptor; cpu.gpr[5] = count;
++            return bridge.dispatchSifManImport(7u, cpu);
++        };
++        RecordingExecutor executor;
++        executor.callbackResult = result;
++        executor.onCall = [&]
++        {
++            for (uint32_t i = 0u; i < 65u; ++i)
++            {
++                memory.write32(source, i + 1u);
++                if (!submit(0x10000u + i * 16u, 16u))
++                    throw std::runtime_error("sequential DMA submission failed");
++            }
++            memory.write32(source, 0xFFFFFFFFu);
++        };
++        std::vector<SifEeTransfer> transfers;
++        (void)bridge.executePacketCall(sid, server, 5u, {}, 4u, executor, &transfers);
++        if (!expect(transfers.size() == 65u, "completed SIF submissions shared a 32-descriptor lifetime"))
++            return false;
++        for (uint32_t i = 0u; i < transfers.size(); ++i)
++            if (!expect(transfers[i].address == 0x10000u + i * 16u && transfers[i].data.size() == 16u &&
++                        transfers[i].data[0] == i + 1u && transfers[i].data[1] == 0u,
++                        "sequential SIF payload snapshots lost submission order or buffer lifetime"))
++                return false;
++        for (uint32_t variant = 0u; variant < 3u; ++variant)
++        {
++            executor.onCall = [&]
++            {
++                if (variant == 0u) (void)submit(0x10000u, 16u, 33u);
++                else if (variant == 1u)
++                    for (uint32_t i = 0u; i < 513u; ++i) (void)submit(0x10000u + i * 16u, 16u);
++                else
++                {
++                    (void)submit(0x100000u, 0xFFFF0u);
++                    (void)submit(0x200000u, 0xFFFF0u);
++                    (void)submit(0x300000u, 48u);
++                }
++            };
++            bool failed = false;
++            try { (void)bridge.executePacketCall(sid, server, 5u, {}, 4u, executor, &transfers); }
++            catch (const std::runtime_error &error)
++            {
++                const std::string_view cause(error.what());
++                failed = cause.find(variant == 0u ? "descriptor array" : variant == 1u ?
++                                    "descriptor queue" : "byte queue") != std::string_view::npos;
++            }
++            if (!expect(failed && transfers.size() == 65u && transfers.front().data[0] == 1u &&
++                        transfers.back().data[0] == 65u,
++                        "SIF submission, capture-count or byte bound partially published callback DMA"))
++                return false;
++        }
++        executor.onCall = {};
++        (void)bridge.executePacketCall(sid, server, 5u, {}, 4u, executor, &transfers);
++        return expect(transfers.empty(), "failed sequential DMA leaked into the next packet callback");
++    }
++
++    bool testPacketResetRetiresPendingTransfers()
++    {
++        NullHost host;
++        IopMemory memory;
++        IopKernel kernel(memory);
++        IopRpcBridge bridge(host, memory, kernel);
++        constexpr uint32_t sid = 0x80000400u, server = 0x1000u, callback = 0x2000u;
++        constexpr uint32_t stack = 0x3000u, result = 0x4000u, descriptor = 0x5000u, source = 0x6000u;
++        for (uint32_t address : {server, callback, stack, result, descriptor, source})
++            (void)memory.zeroRam(address, 64u);
++        const std::array<uint32_t, 4u> dma{source, 0x10000u, 16u, 0u};
++        (void)memory.writeRam(descriptor, dma.data(), sizeof(dma));
++        const auto registerServer = [&]
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = server; cpu.gpr[5] = sid; cpu.gpr[6] = callback; cpu.gpr[29] = stack;
++            return bridge.dispatchSifCmdImport(17u, cpu);
++        };
++        if (!registerServer()) return false;
++        RecordingExecutor executor;
++        executor.callbackResult = result;
++        bool dmaQueued = false, nestedRejected = false;
++        executor.onCall = [&]
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = descriptor; cpu.gpr[5] = 1u;
++            dmaQueued = bridge.dispatchSifManImport(7u, cpu) && cpu.gpr[2] != 0u;
++            bridge.reset();
++            if (!registerServer()) throw std::runtime_error("post-reset registration failed");
++            try { (void)bridge.executePacketCall(sid, server, 0u, {}, 4u, executor); }
++            catch (const std::runtime_error &error)
++            {
++                nestedRejected = std::string_view(error.what()).find("reentrant packet") != std::string_view::npos;
++            }
++            memory.write32(result, 5u);
++        };
++        std::vector<SifEeTransfer> transfers{{0x7000u, {0x5au}}};
++        bool resetRejected = false;
++        try { (void)bridge.executePacketCall(sid, server, 0u, {}, 4u, executor, &transfers); }
++        catch (const std::runtime_error &error)
++        {
++            resetRejected = std::string_view(error.what()).find("retired reset lifetime") != std::string_view::npos;
++        }
++        if (!expect(dmaQueued && nestedRejected && resetRejected && transfers.size() == 1u &&
++                    transfers[0].address == 0x7000u && transfers[0].data == std::vector<uint8_t>{0x5au},
++                    "reset callback published stale DMA/result or let a nested packet borrow its guard"))
++            return false;
++        executor.onCall = {};
++        const auto output = bridge.executePacketCall(sid, server, 0u, {}, 4u, executor, &transfers);
++        return expect(output == std::vector<uint8_t>({5u, 0u, 0u, 0u}) && transfers.empty(),
++                      "retired packet prevented a fresh post-unwind callback");
++    }
++
+     bool testTimrmanPeriodicCallback()
+     {
+         IopMemory memory;
+@@ -835,7 +1304,10 @@ int main()
+         !testCdvdFsvBuffer() || !testCdvdFsvBufferFailure() || !testCdvdFsvAllocationIdentity() ||
+         !testIopAllocationBoundsAndIdentity() || !testIopHeapReusesFreedStorage() ||
+         !testIopHeapCoalescesFreeGaps() || !testIopHeapRespectsFixedRangesAndAlignment() ||
+-        !testIopHeapFreeMemoryQueries() || !testTimrmanPeriodicCallback())
++        !testIopHeapFreeMemoryQueries() || !testSifOtherDataBoundsAndLifetimes() ||
++        !testPacketCardFormatBudgetIsScoped() || !testPacketSequentialDmaSnapshotsAreBounded() ||
++        !testPacketResetRetiresPendingTransfers() ||
++        !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
+diff --git a/ps2xIOP/tests/iop_memory_card_tests.cpp b/ps2xIOP/tests/iop_memory_card_tests.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e94d17a7893a7eec354df50e2df62b89e505de5
+--- /dev/null
++++ b/ps2xIOP/tests/iop_memory_card_tests.cpp
+@@ -0,0 +1,315 @@
++#include "emulator/core/iop_memory_card.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <iterator>
++#include <stdexcept>
++#include <string>
++#include <unistd.h>
++#include <vector>
++
++namespace
++{
++    using ps2x::iop::detail::IopMemoryCard;
++    using Bytes = std::vector<uint8_t>;
++
++    void require(bool condition, const char *message)
++    {
++        if (!condition) throw std::runtime_error(message);
++    }
++
++    template<typename F> void rejected(F &&call, const char *message)
++    {
++        bool failed = false;
++        try { call(); } catch (const std::runtime_error &) { failed = true; }
++        require(failed, message);
++    }
++
++    struct Temporary
++    {
++        Temporary()
++        {
++            auto text = (std::filesystem::temp_directory_path() / "ps2-card-tests-XXXXXX").string();
++            text.push_back('\0');
++            const char *created = ::mkdtemp(text.data());
++            if (!created) throw std::runtime_error("cannot create card test directory");
++            directory = created;
++        }
++        ~Temporary() { std::error_code error; std::filesystem::remove_all(directory, error); }
++        std::filesystem::path directory;
++        std::filesystem::path image() const { return directory / "card.ps2"; }
++    };
++
++    Bytes packet(uint8_t command, size_t size)
++    {
++        Bytes tx(size, 0u);
++        tx[0u] = 0x81u;
++        tx[1u] = command;
++        return tx;
++    }
++
++    Bytes address(uint8_t command, uint32_t page)
++    {
++        auto tx = packet(command, 9u);
++        for (size_t i = 0; i < 4u; ++i)
++        {
++            tx[2u + i] = static_cast<uint8_t>(page >> (i * 8u));
++            tx[6u] ^= tx[2u + i];
++        }
++        return tx;
++    }
++
++    uint8_t xorBytes(const Bytes &bytes)
++    {
++        uint8_t result = 0u;
++        for (auto byte : bytes) result ^= byte;
++        return result;
++    }
++
++    Bytes writePacket(const Bytes &bytes)
++    {
++        auto tx = packet(0x42u, bytes.size() + 6u);
++        tx[2u] = static_cast<uint8_t>(bytes.size());
++        std::copy(bytes.begin(), bytes.end(), tx.begin() + 3u);
++        tx[3u + bytes.size()] = xorBytes(bytes);
++        return tx;
++    }
++
++    Bytes exchange(IopMemoryCard &card, const Bytes &tx) { return card.exchange(tx, tx.size()); }
++
++    Bytes read(IopMemoryCard &card, size_t count)
++    {
++        auto tx = packet(0x43u, count + 6u);
++        tx[2u] = static_cast<uint8_t>(count);
++        const auto rx = exchange(card, tx);
++        Bytes data(rx.begin() + 4u, rx.begin() + 4u + count);
++        require(rx[0u] == 0u && rx[1u] == 0u && rx[2u] == 0u && rx[3u] == 0x2Bu,
++                "read data ACK layout is wrong");
++        require(rx[count + 4u] == xorBytes(data), "read data XOR is wrong");
++        return data;
++    }
++
++    Bytes disk(const std::filesystem::path &path)
++    {
++        std::ifstream file(path, std::ios::binary);
++        require(file.is_open(), "cannot read authored raw image");
++        return Bytes(std::istreambuf_iterator<char>(file), {});
++    }
++
++    void blankImageAndWireGeometry()
++    {
++        Temporary temporary;
++        {
++            IopMemoryCard card;
++            require(!card.attached(), "empty backend is attached");
++            rejected([&] { card.mount(temporary.image(), false); }, "missing image mounted without create");
++            card.mount(temporary.image(), true);
++            require(card.attached(), "created card is detached");
++            const auto raw = disk(temporary.image());
++            require(raw.size() == IopMemoryCard::ImageBytes &&
++                std::all_of(raw.begin(), raw.end(), [](uint8_t b) { return b == 0xFFu; }),
++                "new raw card is sized incorrectly or falsely formatted");
++            require(exchange(card, packet(0x11u, 4u)) == Bytes({0u, 0u, 0x2Bu, 0x55u}),
++                    "probe ACK or initial terminator is wrong");
++            auto set = packet(0x27u, 5u); set[2u] = 0x5Au;
++            require(exchange(card, set) == Bytes({0u, 0u, 0u, 0x2Bu, 0x5Au}), "set terminator failed");
++            require(exchange(card, packet(0x28u, 5u)) == Bytes({0u, 0u, 0x2Bu, 0x5Au, 0x5Au}),
++                    "get terminator compatibility bytes are wrong");
++            require(exchange(card, packet(0x26u, 13u)) ==
++                Bytes({0u, 0u, 0x2Bu, 0u, 2u, 16u, 0u, 0u, 64u, 0u, 0u, 0x52u, 0x5Au}),
++                "geometry, flags or geometry XOR is wrong");
++            require(exchange(card, packet(0xF3u, 5u)).back() == 0x55u, "auth reset did not reset terminator");
++            for (uint8_t command : {0xF0u, 0xF1u, 0xF2u, 0xF7u})
++                rejected([&] { (void)exchange(card, packet(command, 5u)); }, "unsupported authentication reported success");
++            IopMemoryCard conflicting;
++            rejected([&] { conflicting.mount(temporary.image(), true); }, "concurrent image mount succeeded");
++        }
++        IopMemoryCard reopened;
++        reopened.mount(temporary.image(), false);
++        require(reopened.attached(), "valid exact-sized raw card did not reopen");
++    }
++
++    void bootStatusPreservesTerminatorAndStagedWrite()
++    {
++        Temporary temporary;
++        IopMemoryCard card;
++        card.mount(temporary.image(), true);
++        auto setTerminator = packet(0x27u, 5u);
++        setTerminator[2u] = 0x6Bu;
++        (void)exchange(card, setTerminator);
++        (void)exchange(card, address(0x22u, 17u));
++        const Bytes data{0x13u, 0x57u, 0x9Bu, 0xDFu};
++        (void)exchange(card, writePacket(data));
++        const auto before = disk(temporary.image());
++        auto status = packet(0xBFu, 5u);
++        status[2u] = 0x55u; // Original MCMAN supplies this byte; it is not a reset.
++        rejected([&] { (void)card.exchange(status, 4u); }, "boot/status accepted a short response frame");
++        require(exchange(card, status) == Bytes({0u, 0u, 0u, 0x2Bu, 0x6Bu}),
++                "boot/status changed the terminator or returned the wrong ACK layout");
++        require(exchange(card, packet(0x28u, 5u))[3u] == 0x6Bu && disk(temporary.image()) == before,
++                "boot/status reset protocol or committed unfinished storage");
++        rejected([&] { (void)exchange(card, packet(0xF0u, 5u)); }, "boot/status admitted unsupported authentication");
++        (void)exchange(card, packet(0x81u, 4u));
++        const auto after = disk(temporary.image());
++        const size_t offset = 17u * IopMemoryCard::PageBytes;
++        require(std::equal(data.begin(), data.end(), after.begin() + offset) && after[offset + data.size()] == 0xFFu,
++                "boot/status discarded or changed a staged write");
++    }
++
++    void pageSpareCommitAndReopen()
++    {
++        Temporary temporary;
++        Bytes expected(IopMemoryCard::PageBytes);
++        for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<uint8_t>(i * 37u + 5u);
++        const size_t offset = (IopMemoryCard::PageCount - 1u) * IopMemoryCard::PageBytes;
++        {
++            IopMemoryCard card; card.mount(temporary.image(), true);
++            (void)exchange(card, address(0x22u, IopMemoryCard::PageCount - 1u));
++            for (size_t i = 0; i < expected.size(); i += 128u)
++            {
++                Bytes chunk(expected.begin() + i, expected.begin() + std::min(i + 128u, expected.size()));
++                const auto rx = exchange(card, writePacket(chunk));
++                require(rx[3u] == 0x2Bu && rx[chunk.size() + 4u] == xorBytes(chunk), "write ACK/XOR is wrong");
++            }
++            const auto uncommitted = disk(temporary.image());
++            require(std::all_of(uncommitted.begin() + offset, uncommitted.end(), [](uint8_t b) { return b == 0xFFu; }),
++                    "write chunks persisted before end command");
++            auto overrun = writePacket(Bytes{0u});
++            rejected([&] { (void)exchange(card, overrun); }, "card-end write exceeded storage");
++            (void)exchange(card, packet(0x81u, 4u));
++            const auto committed = disk(temporary.image());
++            require(std::equal(expected.begin(), expected.end(), committed.begin() + offset),
++                    "committed page or authored spare/ECC bytes were lost");
++            require(committed[offset - 1u] == 0xFFu, "page commit damaged a neighboring page");
++        }
++        IopMemoryCard reopened; reopened.mount(temporary.image(), false);
++        (void)exchange(reopened, address(0x23u, IopMemoryCard::PageCount - 1u));
++        Bytes observed;
++        for (size_t i = 0; i < expected.size(); i += 128u)
++        {
++            auto chunk = read(reopened, std::min(size_t{128u}, expected.size() - i));
++            observed.insert(observed.end(), chunk.begin(), chunk.end());
++        }
++        require(observed == expected, "reopened card differs from committed page and spare");
++        rejected([&] { (void)read(reopened, 1u); }, "card-end read exceeded storage");
++    }
++
++    void checksumsBoundsAndPreflight()
++    {
++        Temporary temporary;
++        IopMemoryCard card; card.mount(temporary.image(), true);
++        (void)exchange(card, address(0x22u, 7u));
++        auto wrongAddress = address(0x22u, 8u); wrongAddress[6u] ^= 1u;
++        rejected([&] { (void)exchange(card, wrongAddress); }, "bad address XOR accepted");
++        rejected([&] { (void)exchange(card, address(0x22u, 0xFFFFFFFFu)); }, "out-of-range page accepted");
++        auto badWrite = writePacket(Bytes{1u, 2u, 3u}); badWrite[6u] ^= 1u;
++        rejected([&] { (void)exchange(card, badWrite); }, "bad data XOR accepted");
++        auto valid = writePacket(Bytes{0x31u, 0x42u, 0x53u});
++        rejected([&] { (void)card.exchange(valid, valid.size() - 1u); }, "truncated receive packet accepted");
++        auto shortTx = valid; shortTx.pop_back();
++        rejected([&] { (void)card.exchange(shortTx, valid.size()); }, "truncated transmit packet accepted");
++        auto large = packet(0x43u, 135u); large[2u] = 129u;
++        rejected([&] { (void)exchange(card, large); }, "oversized data transaction accepted");
++        (void)exchange(card, valid);
++        (void)exchange(card, packet(0x81u, 4u));
++        const auto raw = disk(temporary.image());
++        require(raw[7u * IopMemoryCard::PageBytes] == 0x31u && raw[7u * IopMemoryCard::PageBytes + 3u] == 0xFFu &&
++            raw[8u * IopMemoryCard::PageBytes] == 0xFFu, "rejected packet mutated cursor or pending data");
++
++        auto setTerminator = packet(0x27u, 5u); setTerminator[2u] = 0x5Au;
++        const auto setAddress = address(0x22u, 12u);
++        const auto goodWrite = writePacket(Bytes(128u, 0x42u));
++        const auto end = packet(0x81u, 4u);
++        const std::array<IopMemoryCard::Packet, 5u> queue{{{setTerminator, setTerminator.size()},
++            {setAddress, setAddress.size()}, {goodWrite, goodWrite.size()}, {end, end.size()},
++            {badWrite, badWrite.size()}}};
++        rejected([&] { card.validateExchanges(queue); }, "queue with a later invalid packet accepted");
++        require(disk(temporary.image()) == raw && exchange(card, packet(0x28u, 5u))[3u] == 0x55u,
++                "queue preflight changed persistent data or terminator");
++        card.validateExchanges(std::span(queue).first(4u));
++        require(disk(temporary.image()) == raw, "successful preflight committed storage");
++    }
++
++    void eraseAndReset()
++    {
++        Temporary temporary;
++        IopMemoryCard card; card.mount(temporary.image(), true);
++        for (uint32_t page : {15u, 16u, 31u, 32u})
++        {
++            (void)exchange(card, address(0x22u, page));
++            (void)exchange(card, writePacket(Bytes(128u, 0u)));
++            (void)exchange(card, packet(0x81u, 4u));
++        }
++        (void)exchange(card, address(0x22u, 15u));
++        (void)exchange(card, writePacket(Bytes(128u, 0xFFu)));
++        (void)exchange(card, packet(0x81u, 4u));
++        require(disk(temporary.image())[15u * IopMemoryCard::PageBytes] == 0u,
++                "NAND programming incorrectly restored zero bits before erase");
++        (void)exchange(card, address(0x21u, 23u));
++        (void)exchange(card, packet(0x82u, 4u));
++        auto raw = disk(temporary.image());
++        require(raw[15u * IopMemoryCard::PageBytes] == 0u && raw[32u * IopMemoryCard::PageBytes] == 0u,
++                "erase damaged adjacent blocks");
++        require(std::all_of(raw.begin() + 16u * IopMemoryCard::PageBytes,
++            raw.begin() + 32u * IopMemoryCard::PageBytes, [](uint8_t b) { return b == 0xFFu; }),
++                "erase did not clear the whole selected block and spare bytes");
++        (void)exchange(card, address(0x22u, 17u));
++        (void)exchange(card, writePacket(Bytes(128u, 0u)));
++        card.resetProtocol();
++        (void)exchange(card, packet(0x81u, 4u));
++        require(disk(temporary.image()) == raw, "reset retained an unfinished write");
++        require(card.attached(), "reset detached storage");
++    }
++
++    void rejectedMountsAndStorageFailure()
++    {
++        Temporary temporary;
++        {
++            std::ofstream file(temporary.image(), std::ios::binary); file << "owned data";
++        }
++        const auto wrong = disk(temporary.image());
++        IopMemoryCard card;
++        rejected([&] { card.mount(temporary.image(), true); }, "wrong-sized image was replaced");
++        require(disk(temporary.image()) == wrong && !card.attached(), "rejected mount changed image or attached state");
++        const auto link = temporary.directory / "link.ps2";
++        std::filesystem::create_symlink(temporary.image(), link);
++        rejected([&] { card.mount(link, true); }, "symlink image mounted");
++        require(disk(temporary.image()) == wrong, "symlink mount changed target");
++        std::filesystem::remove(temporary.image());
++        card.mount(temporary.image(), true);
++        (void)exchange(card, address(0x22u, 0u));
++        (void)exchange(card, writePacket(Bytes(128u, 0x42u)));
++        const auto moved = temporary.directory / "preserved.ps2";
++        std::filesystem::rename(temporary.image(), moved);
++        rejected([&] { (void)exchange(card, packet(0x81u, 4u)); }, "missing mounted path reported committed success");
++        const auto preserved = disk(moved);
++        require(std::all_of(preserved.begin(), preserved.end(), [](uint8_t b) { return b == 0xFFu; }),
++                "failed commit modified preserved image");
++        card.resetProtocol();
++        rejected([&] { (void)exchange(card, packet(0x11u, 4u)); }, "storage error was cleared into successful probe");
++    }
++}
++
++int main()
++{
++    try
++    {
++        blankImageAndWireGeometry();
++        bootStatusPreservesTerminatorAndStagedWrite();
++        pageSpareCommitAndReopen();
++        checksumsBoundsAndPreflight();
++        eraseAndReset();
++        rejectedMountsAndStorageFailure();
++        std::cout << "PASS raw PS2 card geometry, durable page/spare roundtrip, validation, erase, reset and storage failure\n";
++        return 0;
++    }
++    catch (const std::exception &error)
++    {
++        std::cerr << "FAIL " << error.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/ps2xIOP/tests/iop_sio2_tests.cpp b/ps2xIOP/tests/iop_sio2_tests.cpp
+index eeb7a840cf231a3e2b25e2e99e842db138923ecd..f309517692e2dcc05dc4ce986490af31d1b65914 100644
+--- a/ps2xIOP/tests/iop_sio2_tests.cpp
++++ b/ps2xIOP/tests/iop_sio2_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "emulator/core/iop_memory.h"
+ #include "emulator/imports/iop_intrman.h"
+ #include "emulator/services/iop_rpc.h"
++#include "emulator/iop_emulator.h"
+ #ifndef PS2X_SIO2_BASELINE_ONLY
+ #include "emulator/core/iop_sio2.h"
+ #endif
+@@ -11,6 +12,9 @@
+ #include <functional>
+ #include <memory>
+ #include <thread>
++#include <chrono>
++#include <filesystem>
++#include <fstream>
+ 
+ namespace
+ {
+@@ -124,7 +128,8 @@ namespace
+                                      uint32_t, uint32_t, uint32_t gp) override
+         {
+             ++calls;
+-            require(address == 0x1234u && a0 == 0x5678u && gp == 0x9ABCu, "IRQ registration ABI changed");
++            require(address == 0x1234u && (identifyIrqs || a0 == 0x5678u) && gp == 0x9ABCu, "IRQ registration ABI changed");
++            if (identifyIrqs) irqs.push_back(a0);
+             require(intrman.inInterruptContext(), "SIO2 ISR lacks interrupt context");
+             if (callback) callback();
+             if (fail) throw std::runtime_error("authored ISR failure");
+@@ -135,6 +140,8 @@ namespace
+         IopIntrman &intrman;
+         size_t calls = 0u;
+         bool ack = false, fail = false;
++        bool identifyIrqs = false;
++        std::vector<uint32_t> irqs;
+         std::function<void()> callback;
+     };
+ 
+@@ -197,6 +204,242 @@ namespace
+ 
+     constexpr std::array<uint8_t, 5u> poll{1u, 0x42u, 0u, 0u, 0u};
+ 
++    struct CardImage
++    {
++        std::filesystem::path directory, path;
++        CardImage()
++        {
++            static std::atomic<uint64_t> sequence{0u};
++            directory = std::filesystem::temp_directory_path() / ("ps2x-sio2-card-" +
++                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-" +
++                std::to_string(sequence.fetch_add(1u)));
++            require(std::filesystem::create_directory(directory), "cannot create authored card test directory");
++            path = directory / "card.ps2";
++        }
++        ~CardImage() { std::error_code ignored; std::filesystem::remove_all(directory, ignored); }
++    };
++
++    std::vector<uint8_t> cardCommand(uint8_t command, size_t size)
++    {
++        std::vector<uint8_t> result(size, 0u); result[0] = 0x81u; result[1] = command; return result;
++    }
++    std::vector<uint8_t> cardAddress(uint8_t command, uint32_t page)
++    {
++        auto result = cardCommand(command, 9u);
++        for (unsigned i = 0u; i < 4u; ++i) { result[2u + i] = static_cast<uint8_t>(page >> (i * 8u)); result[6u] ^= result[2u + i]; }
++        return result;
++    }
++    void armCardDma(Fixture &f, uint32_t source, uint32_t destination, uint32_t count, uint32_t words = 0x24u)
++    {
++        f.memory.write32(0xBF801540u, source); f.memory.write32(0xBF801544u, (count << 16u) | words);
++        f.memory.write32(0xBF801548u, 0x01000201u);
++        f.memory.write32(0xBF801550u, destination); f.memory.write32(0xBF801554u, (count << 16u) | words);
++        f.memory.write32(0xBF801558u, 0x41000200u); // SDK to-memory slice flag plus START.
++    }
++
++    void attachedCardUsesRealStorageAndSurvivesReset()
++    {
++        CardImage image;
++        {
++            Fixture f; f.device.mountMemoryCard(0u, image.path, true); f.set(0u);
++            require(f.exchange(cardCommand(0x11u, 4u), 4u, 2u) == std::vector<uint8_t>({0u, 0u, 0x2Bu, 0x55u}), "attached raw card did not acknowledge its own serial address");
++            require(f.exchange(poll, 5u)[1] == 0x41u, "card attachment changed controller routing");
++            require(f.exchange(cardCommand(0x11u, 4u), 4u, 3u) == std::vector<uint8_t>(4u, 0xFFu), "slot0 image leaked into absent slot1");
++            const auto address = cardAddress(0x22u, 3u); (void)f.exchange(address, address.size(), 2u);
++            auto write = cardCommand(0x42u, 10u); write[2] = 4u;
++            write[3] = 0x12u; write[4] = 0x34u; write[5] = 0x56u; write[6] = 0x78u; write[7] = 0x08u;
++            (void)f.exchange(write, write.size(), 2u); (void)f.exchange(cardCommand(0x81u, 4u), 4u, 2u);
++            f.device.reset();
++            (void)f.exchange(cardAddress(0x23u, 3u), 9u, 2u);
++            auto read = cardCommand(0x43u, 10u); read[2] = 4u;
++            const auto reply = f.exchange(read, read.size(), 2u);
++            require(std::equal(reply.begin() + 4u, reply.begin() + 8u, write.begin() + 3u), "guest reset lost durable card bytes");
++        }
++        Fixture fresh; fresh.device.mountMemoryCard(0u, image.path, false);
++        (void)fresh.exchange(cardAddress(0x23u, 3u), 9u, 2u);
++        auto read = cardCommand(0x43u, 10u); read[2] = 4u;
++        require(fresh.exchange(read, read.size(), 2u)[4] == 0x12u, "new runtime did not reopen the same durable card");
++    }
++
++    void cardDmaFramesRepliesAndCompletesBeforeCallbacks()
++    {
++        CardImage image; Fixture f; f.device.mountMemoryCard(0u, image.path, true);
++        const auto first = cardCommand(0x11u, 4u), second = cardCommand(0x26u, 13u);
++        std::vector<uint8_t> input(288u, 0u), output(288u, 0xCCu);
++        std::copy(first.begin(), first.end(), input.begin()); std::copy(second.begin(), second.end(), input.begin() + 144u);
++        const uint32_t source = f.memory.allocate(288u), destination = f.memory.allocate(288u);
++        require(f.memory.writeRam(source, input.data(), input.size()) && f.memory.writeRam(destination, output.data(), output.size()), "cannot prepare owned DMA buffers");
++        f.memory.write32(Q, descriptor(2u, 4u, 4u) | 0x30u);
++        f.memory.write32(Q + 4u, descriptor(2u, 13u, 13u) | 0x30u);
++        f.memory.write32(Q + 8u, 0u);
++        f.executor.identifyIrqs = true;
++        for (uint32_t irq : {17u, 0x2Bu, 0x2Cu})
++        {
++            IopCpuState cpu{}; cpu.gpr[4] = irq; cpu.gpr[5] = 1u; cpu.gpr[6] = 0x1234u;
++            cpu.gpr[7] = irq; cpu.gpr[28] = 0x9ABCu;
++            require(f.intrman.dispatchImport(4u, cpu, f.executor) && f.intrman.dispatchImport(6u, cpu, f.executor), "cannot register authored DMA/SIO2 handlers");
++        }
++        armCardDma(f, source, destination, 2u);
++        require(f.memory.read32(IRQ) == 0u && f.executor.calls == 0u && f.memory.read32(destination) == 0xCCCCCCCCu, "arming DMA fabricated data or callbacks before START");
++        f.memory.write32(CTRL, 0x201u);
++        require((f.memory.read32(0xBF801548u) & 0x01000000u) == 0u && (f.memory.read32(0xBF801558u) & 0x01000000u) == 0u, "SIO2 completion left DMA channels busy");
++        require(f.memory.readRam(destination, output.data(), output.size()) && output[2] == 0x2Bu && output[3] == 0x55u && output[146] == 0x2Bu && output[148] == 2u && output[155] == 0x52u, "DMA packed replies instead of preserving 144-byte blocks");
++        require(std::all_of(output.begin() + 4u, output.begin() + 144u, [](auto b) { return b == 0u; }), "DMA padding did not stay inside its response block");
++        f.executor.callback = [&] {
++            require(f.memory.read32(destination) == 0x552B0000u && (f.memory.read32(0xBF801558u) & 0x01000000u) == 0u,
++                    "DMA/SIO2 handler ran before output RAM and completion");
++            if (f.executor.calls == 3u) f.memory.write32(IRQ, 3u);
++        };
++        f.service(); require(f.executor.irqs == std::vector<uint32_t>({0x2Bu, 0x2Cu, 17u}), "DMA11/DMA12/SIO2 callbacks were missing, reordered or duplicated");
++        f.service(); require(f.executor.calls == 3u, "acknowledged DMA/SIO2 completion was delivered twice");
++
++        // Live CPU gating also applies between handlers of one completed batch.
++        f.memory.write32(CTRL, 0x3BCu);
++        armCardDma(f, source, destination, 2u);
++        f.memory.write32(CTRL, 0x201u);
++        f.executor.irqs.clear(); f.executor.calls = 0u;
++        f.executor.callback = [&] {
++            if (f.executor.calls == 1u) f.memory.setInterruptControl(0u);
++            if (f.executor.calls == 3u) f.memory.write32(IRQ, 3u);
++        };
++        f.service(); require(f.executor.irqs == std::vector<uint32_t>({0x2Bu}), "DMA12 ran after DMA11 disabled CPU interrupts");
++        f.service(); require(f.executor.calls == 1u, "disabled CPU interrupts consumed a pending completion");
++        f.memory.setInterruptControl(1u); f.service(); f.service();
++        require(f.executor.irqs == std::vector<uint32_t>({0x2Bu, 0x2Cu, 17u}), "reenabling CPU interrupts lost or duplicated pending DMA/SIO2 work");
++    }
++
++    void malformedCardQueueCannotCommitEarlierWrite()
++    {
++        CardImage image; Fixture f; f.device.mountMemoryCard(0u, image.path, true);
++        (void)f.exchange(cardAddress(0x22u, 0u), 9u, 2u);
++        auto write = cardCommand(0x42u, 7u); write[2] = 1u; write[3] = 0xA5u; write[4] = 0xA5u;
++        (void)f.exchange(write, write.size(), 2u);
++        const auto end = cardCommand(0x81u, 4u), bad = cardCommand(0xFFu, 4u);
++        f.memory.write32(CTRL, 0x3BCu);
++        f.memory.write32(Q, descriptor(2u, 4u, 4u)); f.memory.write32(Q + 4u, descriptor(2u, 4u, 4u)); f.memory.write32(Q + 8u, 0u);
++        for (auto b : end) f.memory.write8(TX, b); for (auto b : bad) f.memory.write8(TX, b);
++        throws([&] { f.memory.write32(CTRL, 0x201u); });
++        require(f.memory.read32(FIFO) == 8u && f.memory.read32(IRQ) == 0u, "malformed later card command consumed bytes or signaled completion");
++        std::ifstream storage(image.path, std::ios::binary); require(storage.get() == 0xFF, "later malformed card packet durably committed the earlier end command");
++        f.device.reset(); (void)f.exchange(cardAddress(0x23u, 0u), 9u, 2u);
++        auto read = cardCommand(0x43u, 7u); read[2] = 1u;
++        require(f.exchange(read, 7u, 2u)[4] == 0xFFu, "malformed queue or protocol reset retained an uncommitted write");
++    }
++
++    void cardDmaRejectsRetiredBuffersBeforeMutation()
++    {
++        CardImage image; Fixture f; f.device.mountMemoryCard(0u, image.path, true);
++        std::vector<uint8_t> input(144u, 0u); input[0] = 0x81u; input[1] = 0x11u;
++        const uint32_t source = f.memory.allocate(144u), destination = f.memory.allocate(144u);
++        require(f.memory.writeRam(source, input.data(), input.size()), "cannot prepare DMA lifetime fixture");
++        f.memory.write32(Q, descriptor(2u, 4u, 4u) | 0x30u); f.memory.write32(Q + 4u, 0u);
++        armCardDma(f, source, destination, 1u);
++        require(f.memory.freeAllocation(destination), "cannot retire DMA destination");
++        require(f.memory.allocate(144u, 16u, destination) == destination, "cannot reuse DMA address for negative control");
++        f.memory.write32(destination, 0xAABBCCDDu);
++        throws([&] { f.memory.write32(CTRL, 0x201u); });
++        require(f.memory.read32(destination) == 0xAABBCCDDu && f.memory.read32(IRQ) == 0u && (f.memory.read32(0xBF801558u) & 0x01000000u) != 0u, "retired DMA owner received bytes or a fabricated completion");
++    }
++
++    void authoredMipsCardDmaReachesItsOwnIsr()
++    {
++        CardImage card; iop_test::Host host; IopEmulator iop(host);
++        iop.mountMemoryCard(0u, card.path, true);
++        iop_test::Irx image(0x10000u, 0x1000u);
++        uint32_t cursor = 0u;
++        const auto emit = [&](uint32_t instruction) { image.words(cursor, {instruction}); cursor += 4u; };
++        const auto li = [&](uint32_t reg, uint32_t value) {
++            emit(0x3C000000u | (reg << 16u) | (value >> 16u));
++            emit(0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xFFFFu));
++        };
++        const auto call = [&](uint32_t address) { emit(0x0C000000u | (address >> 2u)); emit(0u); };
++        emit(0x27BDFFE0u); emit(0xAFBF001Cu);
++        li(4u, 17u); li(5u, 1u); li(6u, 0x10200u); li(7u, 0x10400u); call(0x10314u);
++        li(4u, 17u); call(0x1031Cu);
++        li(17u, Q); li(8u, 0x3BCu); emit(0xAE280068u);
++        li(8u, descriptor(2u, 13u, 13u) | 0x30u); emit(0xAE280000u); emit(0xAE200004u);
++        for (uint32_t channel = 0u; channel < 2u; ++channel)
++        {
++            li(17u, 0xBF801540u + channel * 16u);
++            li(8u, channel == 0u ? 0x10500u : 0x10600u); emit(0xAE280000u);
++            li(8u, 0x00010024u); emit(0xAE280004u);
++            li(8u, channel == 0u ? 0x01000201u : 0x01000200u); emit(0xAE280008u);
++        }
++        li(17u, Q); li(8u, 0x201u); emit(0xAE280068u);
++        emit(0x8FBF001Cu); emit(0x27BD0020u); emit(0x03E00008u); emit(0x00001021u);
++        require(cursor < 0x200u, "authored card DMA entry overlaps its ISR");
++        cursor = 0x200u;
++        li(8u, 0xBF801550u); emit(0x8D090008u); emit(0u); emit(0xAC890004u);
++        li(8u, 0x10600u); emit(0x8D090000u); emit(0u); emit(0xAC890008u);
++        emit(0x8D090004u); emit(0u); emit(0xAC89000Cu);
++        li(8u, Q); emit(0x8D090080u); emit(0u); emit(0xAC890010u);
++        emit(0x24090003u); emit(0xAD090080u);
++        emit(0x8C890000u); emit(0u); emit(0x25290001u); emit(0xAC890000u);
++        emit(0x03E00008u); emit(0x24020001u);
++        image.words(0x300u, {0x41E00000u, 0u, 0x0101u, 0x72746E69u, 0x006E616Du,
++            0x03E00008u, 0x24000004u, 0x03E00008u, 0x24000006u, 0u, 0u});
++        image.words(0x500u, {0x00002681u});
++        const auto loaded = iop.loadModuleImage("authored-card-dma", image.bytes, nullptr, 0u);
++        require(loaded.moduleId > 0 && loaded.startResult == 0, "authored card DMA entry failed");
++        std::array<uint32_t, 5u> reply{};
++        require(iop.readMemory(0x10400u, reply.data(), sizeof(reply)) && reply[0] == 1u &&
++                    reply[1] == 0x200u && reply[2] == 0x002B0000u && reply[3] == 0x00001002u && reply[4] == 1u,
++                "real MIPS SIO2 IRQ did not observe completed DMA and physical card geometry");
++        require(host.cardCalls.empty() && host.guestWrites == 0u, "authored card DMA used HLE or EE packet substitution");
++    }
++
++    void malformedDmaGeometryAndWidthsStayUnarmed()
++    {
++        Fixture f;
++        const uint32_t source = f.memory.allocate(144u);
++        f.memory.write32(0xBF801540u, source);
++        for (uint32_t geometry : {0u, 0x00010000u, 0x00000024u, 0x00110024u, 0x00010200u})
++        {
++            f.memory.write32(0xBF801544u, geometry);
++            throws([&] { f.memory.write32(0xBF801548u, 0x01000201u); });
++            require(f.memory.read32(0xBF801548u) == 0u && f.memory.read32(IRQ) == 0u,
++                    "invalid DMA geometry armed a channel or delivered completion");
++        }
++        f.memory.write32(0xBF801544u, 0x00010024u);
++        for (uint32_t address : {source + 1u, 0x200000u, 0x1FFFFCu})
++        {
++            f.memory.write32(0xBF801540u, address);
++            throws([&] { f.memory.write32(0xBF801548u, 0x01000201u); });
++        }
++        f.memory.write32(0xBF801540u, source);
++        throws([&] { f.memory.write8(0xBF801548u, 1u); });
++        throws([&] { f.memory.write16(0xBF801548u, 0x201u); });
++        throws([&] { f.memory.write32(0xBF801547u, 0x01000201u); });
++        require(f.memory.read32(0xBF801544u) == 0x00010024u && f.memory.read32(0xBF801548u) == 0u,
++                "partial DMA MMIO store changed a neighboring register or channel state");
++    }
++
++    void dmaSpansCrossingHeapBoundaryCannotBorrowANewOwner()
++    {
++        Fixture f; const uint32_t owner = f.memory.allocate(144u);
++        require(owner == IopMemory::HeapBase && f.memory.zeroRam(owner - 4u, 144u), "cannot author heap-boundary DMA control");
++        for (uint32_t channel : {0u, 1u})
++        {
++            const uint32_t base = 0xBF801540u + channel * 16u;
++            f.memory.write32(base, owner - 4u); f.memory.write32(base + 4u, 0x00010024u);
++            throws([&] { f.memory.write32(base + 8u, channel == 0u ? 0x01000201u : 0x41000200u); });
++            require((f.memory.read32(base + 8u) & 0x01000000u) == 0u && f.memory.read32(IRQ) == 0u,
++                    "heap-crossing DMA span captured no owner and became armed");
++        }
++        require(f.memory.freeAllocation(owner) && f.memory.allocate(144u, 16u, owner) == owner, "cannot replace heap-boundary owner");
++        f.memory.write32(owner, 0xAABBCCDDu);
++        f.memory.write32(Q, descriptor(2u, 4u, 4u) | 0x30u); f.memory.write32(Q + 4u, 0u);
++        throws([&] { f.memory.write32(CTRL, 0x201u); });
++        require(f.memory.read32(owner) == 0xAABBCCDDu && f.memory.read32(IRQ) == 0u,
++                "heap-crossing DMA overwrote a later allocation or fabricated completion");
++        // A static span ending exactly at the heap boundary remains valid.
++        f.memory.write32(CTRL, 0x3BCu);
++        require(f.memory.zeroRam(IopMemory::HeapBase - 144u, 144u), "cannot author static boundary buffer");
++        f.memory.write32(0xBF801540u, IopMemory::HeapBase - 144u);
++        f.memory.write32(0xBF801544u, 0x00010024u); f.memory.write32(0xBF801548u, 0x01000201u);
++        require((f.memory.read32(0xBF801548u) & 0x01000000u) != 0u, "static nonheap DMA buffer was rejected");
++    }
++
+     void digitalPressAndRelease()
+     {
+         Fixture f; f.set(0u);
+@@ -509,6 +752,13 @@ int main()
+         {"authored MIPS Start through physical FIFO and original-style IRQ17", originalInstructionPathStart},
+         {"authored MIPS physical card selection returns no ACK without HLE", originalInstructionPathAbsentCard},
+ #ifndef PS2X_SIO2_BASELINE_ONLY
++        {"mounted serial card uses durable storage across resets and runtimes",attachedCardUsesRealStorageAndSurvivesReset},
++        {"card DMA block framing and completion precede handlers",cardDmaFramesRepliesAndCompletesBeforeCallbacks},
++        {"whole card queue preflight prevents earlier durable mutation",malformedCardQueueCannotCommitEarlierWrite},
++        {"retired DMA owners cannot receive bytes or completion",cardDmaRejectsRetiredBuffersBeforeMutation},
++        {"authored MIPS card DMA publishes data before original-style IRQ17",authoredMipsCardDmaReachesItsOwnIsr},
++        {"invalid DMA geometry addresses and partial MMIO writes stay unarmed",malformedDmaGeometryAndWidthsStayUnarmed},
++        {"heap-crossing DMA spans cannot borrow a replacement allocation",dmaSpansCrossingHeapBoundaryCannotBorrowANewOwner},
+         {"digital press and release wire masks",digitalPressAndRelease},
+         {"one immutable host sample per transaction",transactionSamplesOnce},
+         {"configuration transaction IDs and analog mode",configurationIdsAndAnalog},
+diff --git a/ps2xIOP/tests/iop_strict_loader_tests.cpp b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+index 6525b6c3397cc86e7d32b98cdee7cb7af6e75a14..7287e39ae019e6ea36a923e2ff7b508fee34dcef 100644
+--- a/ps2xIOP/tests/iop_strict_loader_tests.cpp
++++ b/ps2xIOP/tests/iop_strict_loader_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "iop_strict_fixtures.h"
+ #include "iop_vblank_fixtures.h"
+ #include "iop_scheduler_fixtures.h"
++#include "iop_card_admission_fixtures.h"
+ #include "emulator/iop_emulator.h"
+ 
+ #include <functional>
+@@ -856,7 +857,7 @@ namespace
+             else
+             {
+                 const bool dma = variant == 1u || variant == 3u;
+-                constexpr std::array<uint16_t, 5> unsupportedCommands{15u, 16u, 23u, 28u, 29u};
++                constexpr std::array<uint16_t, 5> unsupportedCommands{15u, 16u, 18u, 28u, 29u};
+                 const uint32_t ordinal = variant == 3u ? 0x123u : variant >= 4u ? unsupportedCommands[variant - 4u] :
+                                          dma ? 7u : 12u;
+                 image.words(0x100u, {0x41E00000u, 0u, 0x0101u,
+@@ -1645,6 +1646,14 @@ namespace
+ int main()
+ {
+     const Test tests[] = {
++        {"Event results use bounded writable RAM rather than preinitialized input ownership", iop_card_admission_test::eventResultsAcceptUninitializedWritableRam},
++        {"Owned external kernel waits pump real peer semaphore/event signals and bound idle work", iop_card_admission_test::externalKernelWaitsPumpOwnedPeers},
++        {"Invalid external wait IDs and patterns do not pump unrelated work", iop_card_admission_test::invalidExternalWaitsDoNotPump},
++        {"Pending separate wait CPUs leave their managed caller untouched", iop_card_admission_test::pendingNativeWaitLeavesTheManagedCpuUntouched},
++        {"Contended card callbacks cannot park or redispatch their managed caller", iop_card_admission_test::contendedCallbacksCannotParkTheirManagedOwner},
++        {"Ordinary virtual-card admission requires actual reset/probe exchanges and valid addressing", iop_card_admission_test::actualWireAdmissionAndRejectedArguments},
++        {"Absent cards, missing callbacks and fabricated ACKs cannot become virtual admission", iop_card_admission_test::absentCallbacksAndFabricatedRepliesFail},
++        {"Virtual-card admission follows original callback lifetime, reset, version and provider ownership", iop_card_admission_test::callbackLifetimeVersionAndProviderPrecedence},
+         {"Host budgets preserve equal-priority IOP continuation", iop_scheduler_test::equalPriorityContinuation},
+         {"IOP readiness is FIFO and preemption preserves the interrupted queue head", iop_scheduler_test::fifoReadinessAndPreemptedFront},
+         {"IOP interrupt-disabled critical sections survive host budget boundaries", iop_scheduler_test::criticalSectionAcrossBudgets},
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 8d14c6d87cbb295d6fca50302e56986bfad776a3..9bad51371612fcaa2acdfd1ec18001cd85a16670 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -390,6 +390,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_vfs.cpp
+     src/lib/ps2_runtime.cpp
+     src/lib/ps2_controller.cpp
++    src/lib/ps2_memory_card.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+diff --git a/ps2xRuntime/include/runtime/ps2_memory_card.h b/ps2xRuntime/include/runtime/ps2_memory_card.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..da04c02b04d8c0931642ded6e97019ae027c0fd0
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_memory_card.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++
++class PS2Runtime;
++
++namespace ps2x::iop
++{
++    // Attach persistent serial storage before starting the guest worker.
++    // The original guest drivers own card formatting and filesystem operations.
++    void mountMemoryCard(PS2Runtime &runtime, uint32_t port,
++                         const std::filesystem::path &path, bool create);
++}
+diff --git a/ps2xRuntime/src/lib/ps2_memory_card.cpp b/ps2xRuntime/src/lib/ps2_memory_card.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5da05534f9c5b88dd0311b82551d59171aa0691c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_memory_card.cpp
+@@ -0,0 +1,16 @@
++#include "runtime/ps2_memory_card.h"
++#include "ps2_iop_transport.h"
++
++#include <stdexcept>
++
++namespace ps2x::iop
++{
++    void mountMemoryCard(PS2Runtime &runtime, uint32_t port,
++                         const std::filesystem::path &path, bool create)
++    {
++        auto *const subsystem = PS2IopTransport::subsystem(&runtime);
++        if (!subsystem)
++            throw std::logic_error("Memory-card storage requires a live IOP subsystem");
++        subsystem->mountMemoryCard(port, path, create);
++    }
++}

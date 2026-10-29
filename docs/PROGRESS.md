@@ -1,10 +1,87 @@
 # Verified progress
 
-Updated **2026-10-29**. **Main-menu entry, movie playback and gameplay remain unverified.** The recovered exact-profile game has been regenerated, rebuilt and executed with patches 0001–0047 in bounded Linux REA captures. The newest run exits the frontend and times out in original MPEG start-code scanning; no successful movie, menu or save milestone is claimed.
+Updated **2026-10-29**. **Ordinary virtual memory-card storage is verified through original PS2 drivers. Main-menu entry, movie playback and gameplay remain unverified.** The exact-profile game has been regenerated, rebuilt and executed with production patches 0001–0048. Patch 0049 changes only the test helper name. The current formatted-card run leaves the frontend and reaches an MPEG/IPU wait at the diagnostic limit; no Mafia mission save/load milestone is claimed.
 
 The [patch-0045 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/f3d55ea43c21e88f33a029bb26e7a26e0e771f23/docs/PROGRESS.md) retains the direct/external blocking-sync tests. The [patch-0044 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/4af8b23c05a78e40dec0e0c46321c0b28520fbab/docs/PROGRESS.md), [patch-0043 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) and [earlier detailed history](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md) preserve the preceding test and screenshot provenance.
 
-## Latest source checkpoint: patch 0047
+## Latest source checkpoint: patches 0048–0050
+
+Patch 0048 implements persistent ordinary raw cards below the original Sony SIO2MAN/MCMAN/MCSERV stack. The host mounts slot 1 before guest execution and reports its image and mount state. New images are exclusively created, all-FF and unformatted; exact-size existing images are reopened without rewriting. Reads, staged writes and erase operations validate complete commands, NAND bit transitions, checksums and bounds. Completed mutations use atomic replacement and file/directory synchronization. A separate lock prevents concurrent writers; malformed images, symlinks and storage failures fail explicitly. IOP reset keeps the mounted image and discards unfinished protocol state.
+
+The original transport uses SIO2 descriptors and DMA channels 11/12, including dmacman SetSliceDMA/StartDMA and its O32 stack argument. Buffer spans retain allocation identities across callbacks. A DMA11 callback disabling CPU interrupts leaves DMA12 pending until interrupts are enabled again. The DMA model is bounded and synchronous: DPCR enable/priority timing is not emulated.
+
+Original MCMAN also requires synchronous `sifcmd:23` GetOtherData, bounded external semaphore/event waits, and longer per-operation RPC execution for format/flush/close and large reads/writes. These changes retain strict buffer ownership, reset epochs and rejection of destructive reentry. A callback cannot publish retired DMA after reset. Read/write budgets depend on validated request size; the default budget for unrelated services is unchanged. Per-submission DMA limits remain 32 tags, with a bounded callback aggregate for the original driver's larger reads. Asynchronous GetOtherData and blocking a nested callback inside an already active managed caller remain unsupported.
+
+Ordinary virtual-card admission is explicit in diagnostics. It requires a mounted card, live original driver callbacks and successful protocol probes. This is a modeled storage contract, **not physical MagicGate authentication or BIOS execution**; protected operations remain unsupported. Compatible supplied exports retain precedence. There is no HLE replacement for the original memory-card file operations.
+
+Patch 0049 fixes an Apple libc++ compile failure in the new test helper: unqualified `exchange(card, vector)` could select `std::exchange` through argument-dependent lookup. The helper is now named `exchangeCard`; production sources and the runtime binary are unchanged. An explicit `<utility>` compile control reproduces the old failure with GCC and passes after the rename. The 21-program IOP suite is rerun for this final test source. The first final-head CI attempt is retained in [run 40857634019](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40857634019); current checks are on [PR #3](https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks).
+
+Patch 0050 updates the full upstream runtime regression for the independently bounded callback snapshot queue. The old test expected a failure on the 33rd one-tag submission; that intentionally supported case now fits the 512-snapshot aggregate needed by original-driver reads. The test still rejects 33 tags in a single submission and malformed arrays. It now accepts 32, 33, 65 and exactly 512 one-tag submissions, accepts 16 submissions of 32 tags, and rejects 513 one-tag submissions or 17 submissions of 32 tags before any EE publication. Failure must report the callback-DMA error, retain that exact cause (allowing the stored strict-error prefix) when the real receiver is armed, and publish no secondary data, ordinary result or END packet. Public reply queries rethrow stored failures; private queue emptiness is not claimed. The separate 2 MiB byte-bound test remains intact. This patch changes only the runtime test fixture, leaving production and original-driver acceptance identities unchanged. The obsolete-bound failure is retained in [run 40858392852](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40858392852). A subsequent test-control error in [run 40860102393](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40860102393) incorrectly queried the sticky-failed reply API; the armed-receiver control corrects it. Current complete-suite results are in PR #3 checks.
+
+### Original-driver storage acceptance
+
+The private integration probe boots the original IOPRP271 image through modeled reset and loads the supplied original SIO2MAN, MTAPMAN, MCMAN and MCSERV through LOADFILE RPC. It invokes the original memory-card RPC server, with **zero HLE memory-card operations**:
+
+1. A blank card reports unformatted. Original Format returns 0; GetInfo reports type 2, formatted and 8000 free clusters.
+2. Original Open/Write/Flush/Close creates `REA_TEST.BIN` containing 524,288 authored bytes. GetDir reports the exact filename and length.
+3. Original Read returns every byte correctly, using 65 ordered SIF transfers. The pattern differs across bulk chunks.
+4. Destroying and recreating host/IOP state preserves the complete file. A separate new OS process then repeats GetInfo/Open/Read/Close/GetDir, verifies every byte and exits 0 without rewriting the payload.
+
+A separate clean image was formatted through the same original drivers, verified with 8000 free clusters and no test file, then exclusively copied to this workspace's ignored default card path. Existing user images were not replaced. Fresh installations still create blank cards; formatting from Mafia's own menus has not been verified.
+
+| Acceptance identity | SHA-256 |
+| --- | --- |
+| Production patch 0048 | `1e6b0002b39ba1c34b341d0599c7e8712e5b98eae8f0c8c4eb420f7a45e2214b` |
+| Test portability patch 0049 | `9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff` |
+| Runtime boundary-test patch 0050 | `b8d48abbadc681202e7a37db5581c1a14c7de2de942a672939672555eaa94c76` |
+| Final tested IOP library | `5305490b928a5d16ec582dba69a2c58d1115e22efbf475332e68794e3159a357` |
+| Private authored probe source | `0946b208afbf757ff9dd32d918cad0e98d668dab11d3aa05e643749aada4f917` |
+| Probe executable | `e9a4c0dcffc44a53b0a9b0c9d993106c7fd42b59045d8bbb569d0afed1fe61ee` |
+| Format/write/read log | `74ace3ace1f0ca2960e76d374c83126899ac2461994bc0782f2b837a60936282` |
+| New-process reopen log | `b3cf529ce3f19d3ce1e0ab290d276198e6e22dbb5ca6bd3eeb1e46e67aa94240` |
+| Authored 512 KiB payload | `f99323d215880b1d4541f9c7a6473ee2cf4efb0e9e8499e49e0752e5a3d90b03` |
+
+The private probe and commercial inputs remain outside this source repository. These results establish ordinary driver-level persistence, not a saved Mafia mission.
+
+### Current executed checks
+
+| Check | Observed result |
+| --- | --- |
+| Complete upstream runtime suite | 542/542 passed after rebuilding the final fixture; compiled object confirmed newer than source. |
+| Source suite | 118 Python tests and 2 CTest checks passed. |
+| Native host/runtime contracts | 5/5 passed, including create/reopen, validation-only, invalid-image preservation and absent-card mode. |
+| Complete IOP suite, GCC 14.2 Debug | 21/21 programs passed. |
+| Focused memory-card, SIO2, DMACMAN, strict-loader and import programs | 5/5 passed under ASan/UBSan. Leak detection disabled because the environment does not support LSan under ptrace. |
+| Generated integer operations | 68 arithmetic cases passed under UBSan. |
+| Independent negative controls | Old SIO2 source fails only the two new heap-boundary/interrupt-callback regression groups (27/29); corrected source passes 29/29. Old DMAC span capture also fails its new boundary case. |
+| Exact final dependency source | Verified against the pinned upstream and patches 0001–0050; patches 0049–0050 change only test fixtures. |
+| Original driver 512 KiB acceptance and cold process reopen | Both exit 0 with exact full readback. |
+| Full Linux and ARM64 macOS CI, patch 0047 | All four final-head jobs passed in [run 40846058172](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40846058172). |
+| Current full-source CI | See the [PR #3 checks](https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks). CI includes the new memory-card test executable; no commercial fixtures are uploaded. |
+
+## Current original run: patch 0048
+
+The freshly generated 7,791-function corpus has the same source manifest as before, with zero stubs, instruction patches or unresolved source lines. GCC 14.2 compiled the native game with generated-code `-O1 -g0 -UNDEBUG`, strict floating-point flags and unity batches of 32. REA 6.8.0 captured the actual process.
+
+- **15-second control:** mounted clean formatted default card, no input. The original autosave caution is visible at 640×448, VBlank 255, with 220,694 nonblack pixels. This normal warning precedes the card query; Cross continues.
+- **60-second formatted-card run:** Cross at 25 seconds for 800 host milliseconds. Original drivers exchanged 595 card packets and 155 DMA transfers, with zero missing-device replies and one explicit virtual-storage admission. The frontend chain is empty; 12 original modules loaded and 9,026,341 IOP instructions executed. The final black surface and diagnostic timeout at `_waitIpuIdle64` (`0x003c3348`, branch context `_flushBuf`) do not establish movie playback or menu entry. HLE MCSERV remained inactive.
+- Both successful captures are untruncated, with verified owned-process cleanup and removed temporary roots. REA retains its process-sampling, prelaunch-identity, inherited-environment and unobserved-network limitations.
+
+An earlier blank-card runtime report is retained separately. Its REA cleanup was incomplete because two unrelated process candidates were unreadable while sanitizer compilation ran. A subsequent audit found all named processes and the owned process group absent and removed the exact retained temporary root. That failed capture is not represented as successful REA Evidence.
+
+| Current-run identity | SHA-256 / Evidence ID |
+| --- | --- |
+| Native executable | `395882e3d654e9d1c3ffa22ed8259aabb63a772679db4f8dddaf62a5dac56d0a` |
+| 15-second runtime report | `dab27c12c2ccc857783c4cb8290168d6e92c6dc1f12339623d6a53eb85553b6c` |
+| 60-second runtime report | `2b579cb748aef7bf105cd413f2da369936710e75445392b2ee0a5480c75cbac4` |
+| Autosave PPM | `afd74791069e028d9f1a545255c6b9310d4a4ead7839218e5c36094882f497f4` |
+| Published autosave PNG | `45d17dd8b0a514bfd08806549e912a7d81df4e967824d6d6ce5e5e74095fde01` |
+| Autosave REA Evidence | `ev_1f4ef447c274bff96dcd94bd6432625359d706771cf3927390aa392fd0d8c2dd` |
+| Formatted-card flow REA Evidence | `ev_e6af0b3ad886dcdc64d1e9690fd3658e09715b1e90720682f087b17ad942dc5b` |
+
+![Current patch-0048 autosave caution with a mounted virtual card](screenshots/mafia-linux-card-autosave.png)
+
+## Previous source checkpoint: patch 0047
 
 [Patch 0046](https://github.com/dnesdan/mafia-ps2-recomp/commit/6c710ae1259a89a71562b40b478503e04cad0a80) extends pending `sceCdSync` (`cdvdman:11`) modes **0 and 5** to one synchronous guest driver invocation inside a running managed IOP thread. It pins the exact caller while its separate driver CPU/native frame waits, schedules peers and returns without redispatching the active IOMAN Devctl import. The earlier direct managed-import and external startup/RPC paths remain available. Caller/driver stacks and GP, thread identity, read errors, successor commands and sticky failures are covered by authored tests.
 
@@ -48,7 +125,7 @@ Patch 0042 fixed Apple standard-library test portability while retaining concurr
 
 ## Original-game execution status
 
-The user-supplied PS2 archive was recovered, its RAR CRC passed, and its ISO and ELF hashes exactly match the existing profile. All 281 disc files are extracted locally. The supplied 4 MiB BIOS is also available, but no firmware execution or BIOS comparison has been performed. A fresh original corpus was generated with the current verified patch stack; the native game build and two bounded executions completed. Private input files, share links and passwords are not stored in this repository or its CI artifacts.
+The user-supplied PS2 archive was recovered, its RAR CRC passed, and its ISO and ELF hashes exactly match the existing profile. All 281 disc files are extracted locally. The supplied 4 MiB BIOS is also available, but no firmware execution or BIOS comparison has been performed. A fresh original corpus was generated with the current verified patch stack; the native game build and bounded executions completed. Private input files, share links and passwords are not stored in this repository or its CI artifacts.
 
 | Milestone | Historical evidence and remaining limit |
 | --- | --- |
@@ -56,12 +133,12 @@ The user-supplied PS2 archive was recovered, its RAR CRC passed, and its ISO and
 | Original IOP services | Supplied LOADFILE, CDVDFSV and FILEIO execute their entry functions and register services; later game modules also execute. Kernel/reset behavior is modeled, not a PS2 BIOS boot. |
 | Original frontend graphics | Gathering splash, autosave caution and no-card dialog captured from the actual GS surface on Linux x86-64. |
 | Original input | Up/Cross consumed through original SIO2MAN/PADMAN in full-game Xvfb/software-OpenGL runs. Separate original-driver tests verify Start/Cross press and release. Physical gamepads remain untested. |
-| Memory-card query | Original MCSERV reply completes and the no-card dialog appears. No present card or working save system is claimed. |
+| Memory-card query | Original MCSERV reply completes and the no-card dialog appears. Historical absent-card result; patch 0048 now verifies a present card and ordinary driver-level persistence, as documented above. |
 | Movie initialization | Original CDVDSTM starts; stream initialization and layer-zero search advance; correct trailer metadata reaches EE memory. |
 | Movie playback, main menu, missions and save/load | Not verified. |
 | Complete original game on macOS ARM64 or Linux ARM64 | Not verified. macOS CI uses constructed input, not the game corpus. |
 
-### Latest original run: patch 0047
+### Historical original run: patch 0047
 
 The current executable uses GCC 14.2, generated-code `-O1 -g0 -UNDEBUG`, strict floating-point flags and unity batches of 32. The regenerated source manifest is byte-identical to the historical corpus. REA **6.8.0** ran the actual executable through `capture_process_scenario`; it did not emulate or replay the game.
 
@@ -92,7 +169,7 @@ Its strict stop was `cdvdman:46`, version `0x0101`, IOP PC `0x9D2B8`, return add
 | Original executable | `457d2f9d80f5ad66c270a284b77e662490559d5f01bb080ffeba25167407bf92` |
 | Original runtime report | `f54d53d8c13703917d4bb62020013cb0c939d078010fcb1831205716015b5d19` |
 
-## Latest published screenshot
+## Historical no-card screenshot
 
 ![Original no-card dialog with Yes selected through the original controller drivers](screenshots/mafia-linux-no-card.png)
 
@@ -139,6 +216,6 @@ cmake --build build/iop-only --parallel 2
 ctest --test-dir build/iop-only --output-on-failure --no-tests=error
 ```
 
-The observed Linux GCC sanitizer build uses `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie` in C++ flags and `-fsanitize=address,undefined -no-pie` in executable linker flags, with `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1`. The non-PIE flags are Linux test configuration, not macOS build requirements.
+The observed Linux GCC sanitizer build uses `-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie` in C++ flags and `-fsanitize=address,undefined -no-pie` in executable linker flags, with `ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1`. The non-PIE flags are Linux test configuration, not macOS build requirements.
 
-Next integration work is to trace MPEG `_nextStartCode` / `_peepBit` and its media-feed path, distinguish slow progress from a persistent wait, and validate original stream reads, cancellation and synchronization. Only mark main-menu entry after the original menu is visible and navigable. The missing physical memory-card path, independently resumable concurrent native waits, broader timed synchronization, PCSX2 comparisons, saves, missions, audio and performance remain separate milestones.
+Next integration work is to trace MPEG/IPU `_waitIpuIdle64`, `_nextStartCode` and `_peepBit` and its media-feed path, distinguish slow progress from a persistent wait, and validate original stream reads, cancellation and synchronization. Only mark main-menu entry after the original menu is visible and navigable. Physical MagicGate/protected-card support, independently resumable concurrent native waits, broader timed synchronization, PCSX2 comparisons, Mafia mission saves, missions, audio and performance remain separate milestones.
