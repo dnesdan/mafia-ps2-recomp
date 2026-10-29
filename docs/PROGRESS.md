@@ -16,7 +16,7 @@ Ordinary virtual-card admission is explicit in diagnostics. It requires a mounte
 
 Patch 0049 fixes an Apple libc++ compile failure in the new test helper: unqualified `exchange(card, vector)` could select `std::exchange` through argument-dependent lookup. The helper is now named `exchangeCard`; production sources and the runtime binary are unchanged. An explicit `<utility>` compile control reproduces the old failure with GCC and passes after the rename. The 21-program IOP suite is rerun for this final test source. The first final-head CI attempt is retained in [run 40857634019](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40857634019); current checks are on [PR #3](https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks).
 
-Patch 0050 updates the full upstream runtime regression for the independently bounded callback snapshot queue. The old test expected a failure on the 33rd one-tag submission; that intentionally supported case now fits the 512-snapshot aggregate needed by original-driver reads. The test still rejects 33 tags in a single submission and malformed arrays. It now accepts 32, 33, 65 and exactly 512 one-tag submissions, accepts 16 submissions of 32 tags, and rejects 513 one-tag submissions or 17 submissions of 32 tags before any EE publication. The separate 2 MiB byte-bound test remains intact. This patch changes only the runtime test fixture, leaving production and original-driver acceptance identities unchanged. The preceding full-suite failure (541/542) is retained in [run 40858392852](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40858392852); current complete-suite results are in PR #3 checks.
+Patch 0050 updates the full upstream runtime regression for the independently bounded callback snapshot queue. The old test expected a failure on the 33rd one-tag submission; that intentionally supported case now fits the 512-snapshot aggregate needed by original-driver reads. The test still rejects 33 tags in a single submission and malformed arrays. It now accepts 32, 33, 65 and exactly 512 one-tag submissions, accepts 16 submissions of 32 tags, and rejects 513 one-tag submissions or 17 submissions of 32 tags before any EE publication. Failure must report the callback-DMA error and leave no queued reply, independently of an unarmed receiver. The separate 2 MiB byte-bound test remains intact. This patch changes only the runtime test fixture, leaving production and original-driver acceptance identities unchanged. The preceding full-suite failure (541/542) is retained in [run 40858392852](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40858392852); current complete-suite results are in PR #3 checks.
 
 ### Original-driver storage acceptance
 
@@ -33,7 +33,7 @@ A separate clean image was formatted through the same original drivers, verified
 | --- | --- |
 | Production patch 0048 | `1e6b0002b39ba1c34b341d0599c7e8712e5b98eae8f0c8c4eb420f7a45e2214b` |
 | Test portability patch 0049 | `9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff` |
-| Runtime boundary-test patch 0050 | `d0f0415209483c6cd09dce98ff18ed3a561131d05dfd686c415bdaf14c13850c` |
+| Runtime boundary-test patch 0050 | `fae56faa122b81840047473c9de49787bc0e0b01f1b86d533e493472defaf27d` |
 | Final tested IOP library | `5305490b928a5d16ec582dba69a2c58d1115e22efbf475332e68794e3159a357` |
 | Private authored probe source | `0946b208afbf757ff9dd32d918cad0e98d668dab11d3aa05e643749aada4f917` |
 | Probe executable | `e9a4c0dcffc44a53b0a9b0c9d993106c7fd42b59045d8bbb569d0afed1fe61ee` |

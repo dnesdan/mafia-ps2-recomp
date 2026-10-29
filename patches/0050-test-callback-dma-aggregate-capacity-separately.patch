@@ -1,5 +1,5 @@
 diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
-index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cbcee80bc675abd43faeaaaa7303148c9bd27942 100644
+index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cb985686a2e4b541b2e3549084a5ddc7a5fc0d27 100644
 --- a/ps2xTest/src/ps2_sif_packet_tests.cpp
 +++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
 @@ -1321,9 +1321,10 @@ void register_ps2_sif_packet_tests()
@@ -15,17 +15,18 @@ index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cbcee80bc675abd43faeaaaa7303148c
              {
                  PacketEnv env;
                  const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, count, calls, address);
-@@ -1335,13 +1336,24 @@ void register_ps2_sif_packet_tests()
+@@ -1331,17 +1332,31 @@ void register_ps2_sif_packet_tests()
+                 const auto server = env.bindService(sid);
+                 bool failed = false;
+                 try { env.submitRpc(server, 0u, {}, 4u); }
+-                catch (const std::runtime_error &) { failed = true; }
++                catch (const std::runtime_error &error)
++                { failed = std::string(error.what()).find("callback SIF DMA") != std::string::npos; }
                  t.IsTrue(failed, "invalid array or exhausted queue must fail before publication");
                  t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "queued captures cannot escape a later failed descriptor call");
-             }
--            PacketEnv env;
--            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 1u, 32u);
--            t.IsTrue(env.iop().loadModuleImage("full-queue.irx", image.bytes).moduleId > 0, "register exact-bound producer");
--            const auto server = env.bindService(sid);
--            env.submitRpc(server, 0u, {}, 4u, 0u);
--            env.arm();
--            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "the exact 32-descriptor bound remains valid");
++                ps2x::iop::SifEeReply reply;
++                t.IsTrue(!env.iop().peekSifReply(reply), "failure cannot queue a partial reply behind the unarmed receiver");
++            }
 +            // One submission still owns at most 32 hardware tags. A callback
 +            // may finish and reuse that array; original MCSERV's 512 KiB read
 +            // needs 65 ordered snapshots. Verify the former limit, that observed
@@ -43,7 +44,14 @@ index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cbcee80bc675abd43faeaaaa7303148c
 +                         "completed submissions may reuse tags up to the 512-snapshot aggregate bound");
 +                t.Equals(word(env.rdram.data(), kResult), 0x76543210u,
 +                         "the ordinary result follows the complete accepted callback queue");
-+            }
+             }
+-            PacketEnv env;
+-            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 1u, 32u);
+-            t.IsTrue(env.iop().loadModuleImage("full-queue.irx", image.bytes).moduleId > 0, "register exact-bound producer");
+-            const auto server = env.bindService(sid);
+-            env.submitRpc(server, 0u, {}, 4u, 0u);
+-            env.arm();
+-            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "the exact 32-descriptor bound remains valid");
          });
  
          tc.Run("callback DMA with no ordinary receive bytes still precedes direct completion", [](TestCase &t)
