@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "original-main-menu-with-diagnostic-intro-skip",
+    "stage": "first-mission-video-with-diagnostic-intro-skip",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -25,7 +25,7 @@
     "current_blocker": {
       "subsystem": "Original MPEG/IPU video pipeline after frontend exit",
       "status": "bounded-run-timeout-under-investigation",
-      "description": "Without an intro skip, a bounded original-game run times out in MPEG/IPU. An isolated diagnostic lookup substitution reached the main menu and created a profile; movie playback and gameplay remain unverified.",
+      "description": "A private diagnostic skipped the startup and New Game videos, progressed past the card autosave path with the scoped metadata budget, and timed out in the first mission video; movie playback and gameplay remain unverified.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
     },
@@ -59,7 +59,7 @@
     "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0051",
+    "latest_reviewed_patch_set": "0001-0052",
     "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
       "programs_passed": 21,
@@ -195,6 +195,20 @@
       "input": "original controller; one explicit initial-animation lookup substitution",
       "png_sha256": "af582a7e315ffe713d6a08e5af3103327ab56fc8623f35661a2a2bb089b89f57",
       "screenshot_published": false
+    },
+    "patch_0052_sha256": "e4be4271ae17fb01223bacf545d52c27f5f9eb976294b30fc77bdf17c57d62b3",
+    "card_metadata_budget_validation": {
+      "original_driver_getinfo_cycles": 2391318,
+      "original_driver_open_cycles": 2842078,
+      "default_budget_cycles": 2000000,
+      "scoped_budget_cycles": 64000000,
+      "strict_loader_tests_passed": 66,
+      "full_game_mission_save_verified": false
+    },
+    "diagnostic_first_mission_video": {
+      "report_sha256": "593bdde64053b25f6592ecd7bb4b928b595494316e75a07ccdfbd1a377183fb4",
+      "gameplay_verified": false,
+      "scope": "private patch-0050 diagnostic with startup and New Game movie skips and scoped card metadata budget; timeout in first mission movie"
     }
   },
   "progress_report": "docs/PROGRESS.md",
