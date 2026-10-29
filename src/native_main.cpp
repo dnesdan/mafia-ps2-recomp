@@ -11,6 +11,7 @@
 #include "mafia_build_profile.hpp"
 #include "ps2_runtime.h"
 #include "ps2_host_backend.h"
+#include "mafia/intro_skip.hpp"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_controller.h"
 #include "runtime/ps2_memory_card.h"
@@ -42,7 +43,7 @@ struct Options {
     fs::path elf, iso, data_root, save_root, report, capture_frame, memory_card;
     std::uint64_t timeout_ms = 10000;
     std::vector<mafia::PadEvent> pad_events;
-    bool headless = false, validate_only = false, help = false, no_memory_card = false;
+    bool headless = false, validate_only = false, help = false, no_memory_card = false, skip_intro = false;
 };
 
 Options parse_options(int argc, char **argv) {
@@ -53,6 +54,7 @@ Options parse_options(int argc, char **argv) {
         else if (arg == "--headless") options.headless = true;
         else if (arg == "--validate-only") options.validate_only = true;
         else if (arg == "--no-memory-card") options.no_memory_card = true;
+        else if (arg == "--skip-intro") options.skip_intro = true;
         else {
             if (i + 1 == argc) throw std::runtime_error("Missing value for " + arg);
             const std::string value = argv[++i];
@@ -169,6 +171,18 @@ private:
 
 std::atomic<bool> entry_executed{false};
 PS2Runtime::RecompiledFunction original_entry = nullptr;
+PS2Runtime::RecompiledFunction original_animation_lookup = nullptr;
+mafia::IntroSkipState intro_skip;
+void skip_initial_animation(std::uint8_t *ram, R5900Context *context, PS2Runtime *runtime) {
+    const auto return_pc = static_cast<std::uint32_t>(_mm_cvtsi128_si32(context->r[31]));
+    if (intro_skip.should_skip(return_pc)) {
+        // Both verified zero-result branches precede movie resource setup.
+        context->r[2] = _mm_insert_epi64(context->r[2], 0, 0);
+        context->pc = return_pc;
+        return;
+    }
+    original_animation_lookup(ram, context, runtime);
+}
 void observe_entry(std::uint8_t *ram, R5900Context *context, PS2Runtime *runtime) {
     entry_executed.store(true, std::memory_order_release);
     runtime->replaceFunction(mafia::build::entry_point, original_entry);
@@ -323,6 +337,9 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"error\": " + mafia::json_string(report.error) +
         ",\n  \"elf_verified\": " + boolean(report.elf_verified) +
         ",\n  \"elf_loaded\": " + boolean(report.elf_loaded) +
+        ",\n  \"skip_intro\": {\"requested\": " + boolean(options.skip_intro) +
+            ", \"startup_substitutions\": " + std::to_string(intro_skip.startup_count()) +
+            ", \"new_game_substitutions\": " + std::to_string(intro_skip.new_game_count()) + "}" +
         ",\n  \"entry_executed\": " + boolean(report.entered) +
         ",\n  \"metrics_available\": " + boolean(report.metrics_available) +
         ",\n  \"last_guest_pc\": " + std::to_string(report.last_pc) +
@@ -687,6 +704,20 @@ void collect(PS2Runtime &runtime, Report &report) {
         raw("intc_stat", 0x1000f000u);
         raw("intc_mask", 0x1000f010u);
         raw("d_stat", 0x1000e010u);
+        // Preserve the cached register words without triggering MMIO reads,
+        // which may consume FIFO data or advance DMA in a future IPU model.
+        raw("ipu_cmd_data", 0x10002000u);
+        raw("ipu_cmd_high", 0x10002004u);
+        raw("ipu_ctrl", 0x10002010u);
+        raw("ipu_bp", 0x10002020u);
+        raw("ipu_top", 0x10002030u);
+        raw("ipu_from_chcr", 0x1000b000u);
+        raw("ipu_from_madr", 0x1000b010u);
+        raw("ipu_from_qwc", 0x1000b020u);
+        raw("ipu_to_chcr", 0x1000b400u);
+        raw("ipu_to_madr", 0x1000b410u);
+        raw("ipu_to_qwc", 0x1000b420u);
+        raw("ipu_to_tadr", 0x1000b430u);
         raw("vif1_dma_chcr", 0x10009000u);
         raw("vif1_dma_qwc", 0x10009020u);
         report.io_metrics_available = true;
@@ -742,7 +773,7 @@ int main(int argc, char **argv) {
         options = parse_options(argc, argv);
         if (options.help) {
             std::cout << "MafiaNative --elf PATH [--data-root PATH] [--iso PATH] [--save-root PATH]\n"
-                         "  [--headless] [--validate-only] [--timeout-ms 10000] [--report PATH]\n"
+                         "  [--headless] [--validate-only] [--skip-intro] [--timeout-ms 10000] [--report PATH]\n"
                          "  [--capture-frame NEW-PATH.ppm]\n"
                          "  [--memory-card IMAGE.ps2 | --no-memory-card]\n"
                          "  [--headless --pad-event AT_MS:BUTTON:DURATION_MS ...]\n"
@@ -751,6 +782,7 @@ int main(int argc, char **argv) {
                          "Pad events sample controller port 1 over SIO2; times are elapsed host milliseconds.\n"
                          "Card slot 1 uses SAVE-ROOT/slot1.ps2 by default; missing images are created blank.\n"
                          "Existing images are preserved; the original game owns formatting and save files.\n"
+                         "--skip-intro skips the first startup trailer and New Game intro before movie setup.\n"
                          "Keyboard: Enter START, X/Space Cross, C Circle, arrows/WASD directions.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;
@@ -766,6 +798,9 @@ int main(int argc, char **argv) {
             emit_report(options, report);
             return 0;
         }
+        if (options.skip_intro && std::string_view(mafia::build::elf_sha256) !=
+                "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f")
+            throw std::runtime_error("--skip-intro is only supported for the verified SLUS-20671 profile");
         VerifiedCopy copy(*image, options.elf);
         report.stage = "runtime-initialization";
         runtime = std::make_unique<PS2Runtime>();
@@ -780,6 +815,14 @@ int main(int argc, char **argv) {
         report.stage = "elf-loading";
         if (!runtime->loadELF(copy.path().string())) throw std::runtime_error("PS2Recomp rejected the verified ELF");
         report.elf_loaded = true;
+        if (options.skip_intro) {
+            constexpr std::uint32_t animation_lookup = 0x0038c190u;
+            if (!runtime->hasFunction(animation_lookup))
+                throw std::runtime_error("The verified intro animation lookup is unavailable");
+            original_animation_lookup = runtime->lookupFunction(animation_lookup);
+            if (!runtime->replaceFunction(animation_lookup, &skip_initial_animation))
+                throw std::runtime_error("Cannot install the optional intro skip");
+        }
         PS2Runtime::IoPaths paths;
         paths.elfPath = options.elf;
         paths.elfDirectory = options.elf.parent_path();

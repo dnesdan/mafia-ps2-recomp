@@ -2,13 +2,11 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: original frontend graphics, input and ordinary virtual-card storage verified on Linux; main menu and gameplay remain unverified.** Patch 0048 attaches a persistent 8 MiB card through SIO2 and the original Sony memory-card drivers. A 512 KiB file survived format/write/flush/close, full readback and reopening in a new process. This verifies the driver storage path; saving a Mafia mission remains unverified.
+**Status: the original main menu has been reached on Linux with a diagnostic intro skip; gameplay remains unverified.** Patch 0048 attaches a persistent 8 MiB card through SIO2 and the original Sony memory-card drivers. A 512 KiB file survived format/write/flush/close, full readback and reopening in a new process. The original game also created a profile on an isolated card during the menu test; saving a Mafia mission remains unverified.
 
-A current original-game run accepted the formatted card, left the frontend after Cross and reached movie initialization. Its 60-second diagnostic limit expired in `_waitIpuIdle64` with a black surface. Movie playback and the cause of that timeout remain under investigation. Local source, runtime, all 21 IOP programs and focused ASan/UBSan checks pass. Linux and ARM64 macOS CI are confirmed through patch 0047; current pull-request checks and detailed provenance are in [the progress report](docs/PROGRESS.md).
+A patch-0048 original-game run accepted the formatted card, left the frontend after Cross and reached movie initialization. Its 60-second diagnostic limit expired in `_waitIpuIdle64` with a black surface. Movie playback remains under investigation. Linux and ARM64 macOS CI passed through patch 0050; current checks and detailed provenance are in [the progress report](docs/PROGRESS.md).
 
-![Original Mafia autosave caution with a mounted virtual card, patch 0048 on Linux](docs/screenshots/mafia-linux-card-autosave.png)
-
-Actual patch-0048 640×448 GS capture, encoded as PNG with identical RGB pixels. This initial caution is normal game behavior: Cross continues. It appears before the game queries the card and is not an absent-card error.
+An isolated diagnostic build substituted the first animation lookup so the original game followed its no-animation branch, then original controller input created a profile and reached the main menu. Video playback and gameplay have not been established. The normal [autosave caution](docs/screenshots/mafia-linux-card-autosave.png) appears before the game queries the card.
 
 ## Build from your own disc
 
@@ -25,7 +23,7 @@ export MAFIA_PS2_ISO="/absolute/path/to/Mafia.iso"
 python3 tools/bootstrap.py --diagnostic
 bash tools/build_linux.sh
 bash tools/run_linux.sh --elf .work/extracted/SLUS_206.71 \
-  --data-root .work/extracted --iso "$MAFIA_PS2_ISO" --timeout-ms 0
+  --data-root .work/extracted --iso "$MAFIA_PS2_ISO" --skip-intro --timeout-ms 0
 ```
 
 On Apple Silicon:
@@ -36,7 +34,7 @@ export MAFIA_PS2_ISO="/absolute/path/to/Mafia.iso"
 python3 tools/bootstrap.py --diagnostic
 bash tools/build_macos.sh
 bash tools/run_macos.sh --elf .work/extracted/SLUS_206.71 \
-  --data-root .work/extracted --iso "$MAFIA_PS2_ISO" --timeout-ms 0
+  --data-root .work/extracted --iso "$MAFIA_PS2_ISO" --skip-intro --timeout-ms 0
 ```
 
 Bootstrap reads `SYSTEM.CNF`, verifies the boot ELF, extracts the disc locally, fetches exact dependency commits, applies the reviewed patches, builds the real analyzer/recompiler and generates C++. It does not download games or BIOS files. The generated corpus and extracted files stay in ignored directories. Allow several gigabytes for the disc, extracted data, generated C++, object files and dependencies.
@@ -46,6 +44,8 @@ The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA
 `MafiaNative.app` is a developer build using locally installed FFmpeg libraries. Packaging a self-contained app and running the original game corpus on Apple Silicon remain separate milestones. A desktop session is required for the window. F11 toggles fullscreen. When no desktop gamepad is available, the keyboard fallback maps Enter to Start, X or Space to Cross, C to Circle, and the arrows or WASD to directions. These samples feed controller port 1 through SIO2, allowing the original PADMAN module to process them. The host presents pixels produced by the upstream GS and preserves the framebuffer aspect ratio.
 
 Slot 1 uses `SAVE_ROOT/slot1.ps2` by default. Linux defaults to `.local/memory-cards` under the working directory; macOS uses `~/Library/Application Support/MafiaNative/memory-cards`. Use `--save-root PATH` to choose that directory, `--memory-card IMAGE.ps2` to select an existing raw card, or `--no-memory-card` for an intentional absent-card run. A missing image is created **blank and unformatted**; original drivers own formatting and save files. Existing images are preserved, and invalid geometry or an image already in use fails before guest entry. Supported raw images contain 8 MiB of data plus 16 spare bytes per 512-byte page (8,650,752 bytes total). Plain 8 MiB images are not converted automatically. Physical MagicGate authentication and protected files are unsupported.
+
+`--skip-intro` explicitly selects the verified SLUS-20671 game's existing no-animation branches before the startup trailer and the New Game intro are initialized. The startup substitution happens once; the New Game intro is skipped on each selection. The report records each count. This workaround allows startup to continue without claiming video playback; gameplay is still under investigation.
 
 For a bounded headless Linux run after building (use `run_macos.sh` on macOS):
 

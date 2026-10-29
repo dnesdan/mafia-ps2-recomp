@@ -1,8 +1,31 @@
 # Verified progress
 
-Updated **2026-10-29**. **Ordinary virtual memory-card storage is verified through original PS2 drivers. Main-menu entry, movie playback and gameplay remain unverified.** The exact-profile game has been regenerated, rebuilt and executed with production patches 0001–0048. Patch 0049 changes only the test helper name. The current formatted-card run leaves the frontend and reaches an MPEG/IPU wait at the diagnostic limit; no Mafia mission save/load milestone is claimed.
+Updated **2026-10-29**. **Ordinary virtual-card storage is verified through original PS2 drivers. An isolated intro-skip experiment reaches the original main menu after creating a profile; movie playback and gameplay remain unverified.** The exact-profile game has been regenerated, rebuilt and executed with production patches 0001–0048. Patch 0049 changes only the test helper name. The current formatted-card run leaves the frontend and reaches an MPEG/IPU wait at the diagnostic limit; no Mafia mission save/load milestone is claimed.
 
 The [patch-0045 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/f3d55ea43c21e88f33a029bb26e7a26e0e771f23/docs/PROGRESS.md) retains the direct/external blocking-sync tests. The [patch-0044 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/4af8b23c05a78e40dec0e0c46321c0b28520fbab/docs/PROGRESS.md), [patch-0043 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) and [earlier detailed history](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md) preserve the preceding test and screenshot provenance.
+
+## Current investigation: MPEG/IPU and startup
+
+The original game calls its own compiled MPEG routines. `_flushBuf` issues IPU FDEC commands and `_nextStartCode` expects real bitstream data, but the patch-0050 runtime stores IPU register writes without modeling the input FIFO or FDEC. A timeout PC is a bounded sample of that path, not proof of an infinite busy loop. The FFmpeg-backed MPEG stubs are not bound to the game's calls and include game-specific fixed addresses; an isolated adapter experiment required real NoData callbacks and still has unverified stream-callback and audio semantics. No movie playback is claimed.
+
+Independent comparison with [PCSX2's R5900 interpreter](https://github.com/PCSX2/pcsx2/blob/v2.4.0/pcsx2/Interpreter.cpp#L347) found a separate translation bug: signed zero-comparison branches tested the low 32 bits rather than the signed low 64-bit register. Patch 0051 corrects all 12 forms. The actual generated predicates pass 120 signed-64 checks under UBSan; the same tests on the unchanged emitter fail 68. The earlier 68 integer arithmetic cases still pass. The upper 64-bit SIMD lane is deliberately varied to check it is ignored. This correction alone does not implement IPU decoding.
+
+For a bounded startup experiment, a private build replaced only the exact-profile `GetAnimationPath` result at call return `0x002b6454` with zero. The original game's zero-result branch runs before movie initialization; other calls use the original lookup. One diagnostic substitution was logged. Using the original controller and a separate clean card, a 90-second run reached the title/press-start class, and a 150-second run with Start pulses reached **Profile Manager**, with Create New Profile focused. A later run reached **Enter Profile Name**, showing `DEFAULT`. A 260-second run then used the original Down/Cross navigation to confirm that name, wrote an isolated card, and reached the **main menu** with New Game selected. These are original GS captures and input paths with a deliberate lookup substitution, not evidence of video playback or gameplay. The current `--skip-intro` option exposes this explicit workaround for the exact verified profile and records its use. The startup substitution is one-shot. A subsequent isolated run selected New Game and entered `intro.pss`, where the original IPU path again stalled. Its verified caller has another zero-result branch at return `0x00377900`, before video setup; the option also selects that branch for each New Game. The game then calls original first-mission initialization, but that continuation has not yet been executed and verified with both substitutions.
+
+| Private diagnostic identity | SHA-256 |
+| --- | --- |
+| Diagnostic binary | `38eb92a9da6c1d915db008736edd44360275a34c4f9ac78476122bb7e672c7ae` |
+| Profile manager report | `66b2decd89095079062c533d7c502a3b7f4d5fece372b9e06cc3876315bf9c3c` |
+| Profile manager PPM | `64f9b01037c9e487ea669f7e24fa04b15ee496c2e1772a5eeacc3d50c3be3cd3` |
+| Local profile PNG (identical decoded RGB) | `6cefc8ccdacf7de9d7455794d8865afd8ee8866bea07c224939c3cf800e25589` |
+| Profile-name report | `72f768224fe1b91918035120e88f2a68b8955dc746af10ff6a2087da02d4061f` |
+| Main-menu report | `c05b69526f1d9cafed74f724a54ba540e4917c43b988e9688b12e84d081bf604` |
+| Main-menu PPM | `a7fcc282246b3ca34155828c48f723e2a3b601a52f94e160a1eddb87c7cd5b5e` |
+| Local main-menu PNG (identical decoded RGB) | `af582a7e315ffe713d6a08e5af3103327ab56fc8623f35661a2a2bb089b89f57` |
+| Isolated card after profile creation | `eaf1b2d3328ed547e5fcf65b0ac67fe1091fa58170fd378d4fce849f213affe2` |
+| Signed-branch patch 0051 | `8014bc03276eb9a5a24fe258c627064451c22d503beb64e897957bd3c052cd84` |
+
+The private diagnostic source was reconstructed from the retained original and recorded transformation after the build; it was not separately hashed before compilation. Its reports and raw inputs remain outside the repository. The next checks are selecting New Game and verifying actual gameplay, then testing the MPEG implementation separately.
 
 ## Latest source checkpoint: patches 0048–0050
 

@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "virtual-card-persistence-verified-mpeg-ipu-timeout-under-investigation",
+    "stage": "original-main-menu-with-diagnostic-intro-skip",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -25,7 +25,7 @@
     "current_blocker": {
       "subsystem": "Original MPEG/IPU video pipeline after frontend exit",
       "status": "bounded-run-timeout-under-investigation",
-      "description": "A 60-second formatted-card original-game run accepted ordinary virtual storage, left the frontend after Cross and timed out at _waitIpuIdle64 with a black GS surface. Movie playback, main-menu entry and Mafia mission saves remain unverified.",
+      "description": "Without an intro skip, a bounded original-game run times out in MPEG/IPU. An isolated diagnostic lookup substitution reached the main menu and created a profile; movie playback and gameplay remain unverified.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
     },
@@ -46,7 +46,7 @@
     "original_startup_graphics_verified": true,
     "startup_graphics_kind": "Gathering publisher splash",
     "startup_screenshot": "docs/screenshots/mafia-linux-gathering.png",
-    "menu_verified": false,
+    "menu_verified": true,
     "macos_arm64_synthetic_host_verified_patch_set": "0001-0047",
     "latest_runtime_patch_set": "0001-0048",
     "latest_runtime_platform": "linux-x86_64",
@@ -59,7 +59,7 @@
     "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0050",
+    "latest_reviewed_patch_set": "0001-0051",
     "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
       "programs_passed": 21,
@@ -174,10 +174,28 @@
     "latest_runtime_memory_card_missing_devices": 0,
     "patch_0049_sha256": "9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff",
     "patch_0049_scope": "Rename only the memory-card test helper to avoid std::exchange ADL; all production sources and tested runtime identities are unchanged.",
-    "latest_runtime_production_sources_match_current_patch_set": true,
+    "latest_runtime_production_sources_match_current_patch_set": false,
     "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks",
     "patch_0050_sha256": "b8d48abbadc681202e7a37db5581c1a14c7de2de942a672939672555eaa94c76",
-    "patch_0050_scope": "Runtime test only: distinguish the 32-tag per-submission limit from the 512-snapshot callback aggregate; verify exact acceptance and overflow rejection. Production sources unchanged."
+    "patch_0050_scope": "Runtime test only: distinguish the 32-tag per-submission limit from the 512-snapshot callback aggregate; verify exact acceptance and overflow rejection. Production sources unchanged.",
+    "menu_verification_scope": "Exact original ELF on Linux x86-64, with an explicit no-animation lookup substitution before startup video; main menu and profile creation observed. Normal movie playback and gameplay remain unverified.",
+    "skip_intro_diagnostic_verified": true,
+    "original_profile_created_with_skip_verified": true,
+    "patch_0051_sha256": "8014bc03276eb9a5a24fe258c627064451c22d503beb64e897957bd3c052cd84",
+    "branch_comparison_tests": {
+      "forms": 12,
+      "cases": 120,
+      "fixed_passed": 120,
+      "unchanged_failed": 68,
+      "sanitizer": "UBSan"
+    },
+    "diagnostic_main_menu": {
+      "report_sha256": "c05b69526f1d9cafed74f724a54ba540e4917c43b988e9688b12e84d081bf604",
+      "binary_sha256": "38eb92a9da6c1d915db008736edd44360275a34c4f9ac78476122bb7e672c7ae",
+      "input": "original controller; one explicit initial-animation lookup substitution",
+      "png_sha256": "af582a7e315ffe713d6a08e5af3103327ab56fc8623f35661a2a2bb089b89f57",
+      "screenshot_published": false
+    }
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,

@@ -1,4 +1,5 @@
 #include "mafia/verified_elf.hpp"
+#include "mafia/intro_skip.hpp"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -128,6 +129,11 @@ int main() {
         rejects([&]{mafia::verify_elf(b,mafia::sha256(b),0x100000);});
         require(mafia::json_string("a\n\"\\") == "\"a\\u000a\\\"\\\\\"","JSON escaping");
         test_symbols();
+        mafia::IntroSkipState intro;
+        require(!intro.should_skip(0x002b6450u) && !intro.should_skip(0x00377904u), "Unrelated animation lookup was skipped");
+        require(intro.should_skip(0x002b6454u) && !intro.should_skip(0x002b6454u), "Startup skip must be one-shot");
+        require(intro.should_skip(0x00377900u) && intro.should_skip(0x00377900u), "Each New Game intro should be skipped");
+        require(intro.startup_count() == 1u && intro.new_game_count() == 2u, "Intro skip accounting is wrong");
         test_frame_capture();
         test_controller_input();
         std::cout<<"Host verification tests passed (synthetic ELF, capture bytes and controller events; no game execution).\n";
