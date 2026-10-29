@@ -55,6 +55,12 @@ Patch 0054 subtracts the full 12.4 `XYOFFSET` from vertex coordinates in the CPU
 
 A separate instrumented first-mission run found HUD triangles and a black background, while the sampled offsets had zero fractional bits. Thus this correction is not established as the cause of the missing 3D world. The investigation continues before GS rasterization, including scene object queues and VIF-buffer dispatch.
 
+## DMA scratchpad payload correction and mission trace
+
+Patch 0055 honors the source-chain DMAtag SPR bit for REFE, REF and REFS payloads on VIF0, VIF1 and GIF, including scratchpad alignment and wrap. The native GIF image fast path declines SPR-addressed payloads without side effects so the generic path processes them. An isolated test of 126 combinations passed with the change; the unchanged backend failed 72. An additional eight fast-path and fallback cases passed with the change. REFS stall timing, ordinary MADR, SPR-addressed initial TADR, NEXT/CALL/ASR and their fast-path interactions remain unsupported and are not claimed by this patch.
+
+During a separate isolated first-mission capture, the original game queued object face groups and dispatched their cached VIF buffers. A sampled set of 64 scratchpad-to-RAM transfers had matching source and destination digests. The instrumented ordinary VIF1 and GIF source-chain decoders observed 101,439 and 53,556 tags respectively, with no SPR bit set in that captured interval. This does not rule out use elsewhere, but it does not establish patch 0055 as the fix for the black world. The HUD remained visible; rendered 3D gameplay and movie playback remain unverified.
+
 ## Latest source checkpoint: patches 0048–0050
 
 Patch 0048 implements persistent ordinary raw cards below the original Sony SIO2MAN/MCMAN/MCSERV stack. The host mounts slot 1 before guest execution and reports its image and mount state. New images are exclusively created, all-FF and unformatted; exact-size existing images are reopened without rewriting. Reads, staged writes and erase operations validate complete commands, NAND bit transitions, checksums and bounds. Completed mutations use atomic replacement and file/directory synchronization. A separate lock prevents concurrent writers; malformed images, symlinks and storage failures fail explicitly. IOP reset keeps the mounted image and discards unfinished protocol state.
