@@ -11,6 +11,7 @@
 #include "mafia_build_profile.hpp"
 #include "ps2_runtime.h"
 #include "ps2_host_backend.h"
+#include "mafia/intro_skip.hpp"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_controller.h"
 #include "runtime/ps2_memory_card.h"
@@ -171,13 +172,11 @@ private:
 std::atomic<bool> entry_executed{false};
 PS2Runtime::RecompiledFunction original_entry = nullptr;
 PS2Runtime::RecompiledFunction original_animation_lookup = nullptr;
-std::atomic<std::uint32_t> intro_skip_count{0};
+mafia::IntroSkipState intro_skip;
 void skip_initial_animation(std::uint8_t *ram, R5900Context *context, PS2Runtime *runtime) {
-    constexpr std::uint32_t return_pc = 0x002b6454u;
-    if (static_cast<std::uint32_t>(_mm_cvtsi128_si32(context->r[31])) == return_pc) {
-        // The verified game's existing zero-result branch continues load/save
-        // initialization before any movie resources have been allocated.
-        intro_skip_count.fetch_add(1u, std::memory_order_relaxed);
+    const auto return_pc = static_cast<std::uint32_t>(_mm_cvtsi128_si32(context->r[31]));
+    if (intro_skip.should_skip(return_pc)) {
+        // Both verified zero-result branches precede movie resource setup.
         context->r[2] = _mm_insert_epi64(context->r[2], 0, 0);
         context->pc = return_pc;
         return;
@@ -339,7 +338,8 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"elf_verified\": " + boolean(report.elf_verified) +
         ",\n  \"elf_loaded\": " + boolean(report.elf_loaded) +
         ",\n  \"skip_intro\": {\"requested\": " + boolean(options.skip_intro) +
-            ", \"substitutions\": " + std::to_string(intro_skip_count.load(std::memory_order_relaxed)) + "}" +
+            ", \"startup_substitutions\": " + std::to_string(intro_skip.startup_count()) +
+            ", \"new_game_substitutions\": " + std::to_string(intro_skip.new_game_count()) + "}" +
         ",\n  \"entry_executed\": " + boolean(report.entered) +
         ",\n  \"metrics_available\": " + boolean(report.metrics_available) +
         ",\n  \"last_guest_pc\": " + std::to_string(report.last_pc) +
@@ -782,7 +782,7 @@ int main(int argc, char **argv) {
                          "Pad events sample controller port 1 over SIO2; times are elapsed host milliseconds.\n"
                          "Card slot 1 uses SAVE-ROOT/slot1.ps2 by default; missing images are created blank.\n"
                          "Existing images are preserved; the original game owns formatting and save files.\n"
-                         "--skip-intro follows the verified game's no-animation path before movie setup.\n"
+                         "--skip-intro skips the first startup trailer and New Game intro before movie setup.\n"
                          "Keyboard: Enter START, X/Space Cross, C Circle, arrows/WASD directions.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;

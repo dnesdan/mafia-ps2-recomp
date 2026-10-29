@@ -45,7 +45,7 @@ The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA
 
 Slot 1 uses `SAVE_ROOT/slot1.ps2` by default. Linux defaults to `.local/memory-cards` under the working directory; macOS uses `~/Library/Application Support/MafiaNative/memory-cards`. Use `--save-root PATH` to choose that directory, `--memory-card IMAGE.ps2` to select an existing raw card, or `--no-memory-card` for an intentional absent-card run. A missing image is created **blank and unformatted**; original drivers own formatting and save files. Existing images are preserved, and invalid geometry or an image already in use fails before guest entry. Supported raw images contain 8 MiB of data plus 16 spare bytes per 512-byte page (8,650,752 bytes total). Plain 8 MiB images are not converted automatically. Physical MagicGate authentication and protected files are unsupported.
 
-`--skip-intro` explicitly selects the verified SLUS-20671 game's existing no-animation branch before the first trailer is initialized. The report records the requested option and number of substitutions. This workaround allows startup to continue without claiming video playback; subsequent movies and gameplay are still under investigation.
+`--skip-intro` explicitly selects the verified SLUS-20671 game's existing no-animation branches before the startup trailer and the New Game intro are initialized. The startup substitution happens once; the New Game intro is skipped on each selection. The report records each count. This workaround allows startup to continue without claiming video playback; gameplay is still under investigation.
 
 For a bounded headless Linux run after building (use `run_macos.sh` on macOS):
 
