@@ -13,6 +13,7 @@
 #include "ps2_host_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_controller.h"
+#include "runtime/ps2_memory_card.h"
 
 #include <algorithm>
 #include <array>
@@ -38,10 +39,10 @@ namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 struct Options {
-    fs::path elf, iso, data_root, save_root, report, capture_frame;
+    fs::path elf, iso, data_root, save_root, report, capture_frame, memory_card;
     std::uint64_t timeout_ms = 10000;
     std::vector<mafia::PadEvent> pad_events;
-    bool headless = false, validate_only = false, help = false;
+    bool headless = false, validate_only = false, help = false, no_memory_card = false;
 };
 
 Options parse_options(int argc, char **argv) {
@@ -51,6 +52,7 @@ Options parse_options(int argc, char **argv) {
         if (arg == "--help") options.help = true;
         else if (arg == "--headless") options.headless = true;
         else if (arg == "--validate-only") options.validate_only = true;
+        else if (arg == "--no-memory-card") options.no_memory_card = true;
         else {
             if (i + 1 == argc) throw std::runtime_error("Missing value for " + arg);
             const std::string value = argv[++i];
@@ -58,6 +60,7 @@ Options parse_options(int argc, char **argv) {
             else if (arg == "--iso") options.iso = value;
             else if (arg == "--data-root") options.data_root = value;
             else if (arg == "--save-root") options.save_root = value;
+            else if (arg == "--memory-card") options.memory_card = value;
             else if (arg == "--report") options.report = value;
             else if (arg == "--capture-frame") options.capture_frame = value;
             else if (arg == "--pad-event") {
@@ -94,6 +97,12 @@ Options parse_options(int argc, char **argv) {
 #endif
     }
     options.save_root = fs::absolute(options.save_root);
+    if (options.no_memory_card && !options.memory_card.empty())
+        throw std::runtime_error("--memory-card and --no-memory-card cannot be combined");
+    if (!options.no_memory_card) {
+        if (options.memory_card.empty()) options.memory_card = options.save_root / "slot1.ps2";
+        options.memory_card = fs::absolute(options.memory_card);
+    }
     if (!options.report.empty()) {
         options.report = fs::absolute(options.report);
         if (fs::weakly_canonical(options.report) == fs::weakly_canonical(options.elf) ||
@@ -113,6 +122,15 @@ Options parse_options(int argc, char **argv) {
         if (!options.report.empty() &&
             fs::weakly_canonical(options.capture_frame) == fs::weakly_canonical(options.report))
             throw std::runtime_error("Capture and report must use different output paths");
+    }
+    if (!options.memory_card.empty()) {
+        const auto same = [](const fs::path &a, const fs::path &b) {
+            return !b.empty() && (fs::weakly_canonical(a) == fs::weakly_canonical(b) ||
+                (fs::exists(a) && fs::exists(b) && fs::equivalent(a, b)));
+        };
+        if (same(options.memory_card, options.elf) || same(options.memory_card, options.iso) ||
+            same(options.memory_card, options.report) || same(options.memory_card, options.capture_frame))
+            throw std::runtime_error("Memory-card image must differ from input, report and capture files");
     }
     return options;
 }
@@ -176,6 +194,7 @@ struct Report {
     std::string frontend_snapshot = "null", frontend_snapshot_error;
     std::string capture_status = "not-executed", capture_error, capture_sha256;
     std::uint64_t controller_samples = 0;
+    bool memory_card_mounted = false;
     mafia::GsFrameCapture capture;
 };
 
@@ -323,6 +342,8 @@ void emit_report(const Options &options, const Report &report) {
             mafia::json_string(options.headless ? "headless-timeline" : "window-backend") +
             ", \"host_samples\": " + std::to_string(report.controller_samples) +
             ", \"time_base\": \"host-elapsed-ms\", \"events\": " + pad_events + "}" +
+        ",\n  \"memory_card\": {\"port\": 0, \"mounted\": " + boolean(report.memory_card_mounted) +
+            ", \"image\": " + (options.memory_card.empty() ? "null" : mafia::json_string(options.memory_card.string())) + "}" +
         ",\n  \"dma_starts\": " + std::to_string(report.dma) +
         ",\n  \"gif_copies\": " + std::to_string(report.gif) +
         ",\n  \"gs_writes\": " + std::to_string(report.gs) +
@@ -723,10 +744,13 @@ int main(int argc, char **argv) {
             std::cout << "MafiaNative --elf PATH [--data-root PATH] [--iso PATH] [--save-root PATH]\n"
                          "  [--headless] [--validate-only] [--timeout-ms 10000] [--report PATH]\n"
                          "  [--capture-frame NEW-PATH.ppm]\n"
+                         "  [--memory-card IMAGE.ps2 | --no-memory-card]\n"
                          "  [--headless --pad-event AT_MS:BUTTON:DURATION_MS ...]\n"
                          "Capture saves the unscaled GS surface after execution stops, including in headless mode.\n"
                          "No image is written if the guest did not configure a display surface.\n"
                          "Pad events sample controller port 1 over SIO2; times are elapsed host milliseconds.\n"
+                         "Card slot 1 uses SAVE-ROOT/slot1.ps2 by default; missing images are created blank.\n"
+                         "Existing images are preserved; the original game owns formatting and save files.\n"
                          "Keyboard: Enter START, X/Space Cross, C Circle, arrows/WASD directions.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;
@@ -764,6 +788,11 @@ int main(int argc, char **argv) {
         paths.cdImage = options.iso;
         fs::create_directories(paths.mcRoot);
         PS2Runtime::setIoPaths(paths);
+        report.stage = "memory-card-initialization";
+        if (!options.no_memory_card) {
+            ps2x::iop::mountMemoryCard(*runtime, 0u, options.memory_card, true);
+            report.memory_card_mounted = true;
+        }
         runtime->initializeEeKernelState(runtime->memory().getRDRAM());
         runtime->cpu().r[4] = _mm_setzero_si128();
         runtime->cpu().r[5] = _mm_setzero_si128();

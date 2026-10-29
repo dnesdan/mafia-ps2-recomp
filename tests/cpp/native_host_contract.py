@@ -164,6 +164,35 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
                 if service["name"] == "sio2_device")
     check(sio2["metrics"]["pio_transfers"] == 0 and sio2["metrics"]["controller_packets"] == 0,
           "Host sampling was falsely counted as original IOP controller traffic")
+
+    with tempfile.TemporaryDirectory(prefix="serial-card-contract-", dir=work) as temporary:
+        card_root = Path(temporary)
+        card = card_root / "slot1.ps2"
+        code, card_validation = run("card-validate-only", fixture, "--validate-only",
+                                    "--memory-card", str(card))
+        check(code == 0 and not card.exists() and not card_validation["memory_card"]["mounted"],
+              "Validation-only created or mounted persistent card storage")
+        code, attached = run("card-created", fixture, "--memory-card", str(card))
+        check(code == 1 and attached["status"] == "missing-dispatch"
+              and attached["memory_card"]["mounted"] and card.stat().st_size == 8_650_752,
+              "Native card attachment hid the guest result or created incorrect geometry")
+        original_card_digest = hashlib.sha256(card.read_bytes()).hexdigest()
+        code, reopened = run("card-reopened", fixture, "--memory-card", str(card))
+        check(code == 1 and reopened["memory_card"]["mounted"]
+              and hashlib.sha256(card.read_bytes()).hexdigest() == original_card_digest,
+              "Reopening a card without guest writes changed its persistent bytes")
+        damaged = card_root / "existing-data.ps2"
+        damaged.write_bytes(b"existing user data must survive")
+        code, bad_card = run("card-invalid-image", fixture, "--memory-card", str(damaged))
+        check(code == 1 and not bad_card["entry_executed"]
+              and not bad_card["memory_card"]["mounted"]
+              and damaged.read_bytes() == b"existing user data must survive",
+              "Invalid existing card storage was overwritten or reached guest execution")
+        absent_root = card_root / "absent"
+        code, absent = run("card-disabled", fixture, "--no-memory-card", "--save-root", str(absent_root))
+        check(code == 1 and absent["status"] == "missing-dispatch"
+              and not absent["memory_card"]["mounted"] and not (absent_root / "slot1.ps2").exists(),
+              "The absent-card option attached or created a physical card")
     code, pulse = run("scheduled-controller", fixture, "--pad-event", "0:start:10",
                       "--pad-event", "5:cross:20")
     check(code == 1 and pulse["status"] == "missing-dispatch"
@@ -198,7 +227,7 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
           "Rejected input produced framebuffer evidence")
     verify_default_launcher(Path(__file__).resolve().parents[2], work)
     checks = ["SHA gate", "validation", "verified ELF symbols", "synthetic entry", "strict return", "absent-frame refusal",
-              "launcher symlink containment"]
+              "launcher symlink containment", "persistent serial-card mount and input preservation"]
     if sys.platform == "darwin":
         checks.insert(0, "ARM64 application bundle")
     print("Native host contract passed: " + ", ".join(checks) + "; no game execution.")
