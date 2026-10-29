@@ -1,8 +1,8 @@
 diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
-index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cb985686a2e4b541b2e3549084a5ddc7a5fc0d27 100644
+index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..74fb770704b2c38490a92f6605a81aeb867ae58d 100644
 --- a/ps2xTest/src/ps2_sif_packet_tests.cpp
 +++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
-@@ -1321,9 +1321,10 @@ void register_ps2_sif_packet_tests()
+@@ -1321,27 +1321,55 @@ void register_ps2_sif_packet_tests()
          tc.Run("callback DMA validates complete descriptor ownership and bounded queue capacity", [](TestCase &t)
          {
              constexpr uint32_t sid = 0x80001234u;
@@ -15,17 +15,32 @@ index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cb985686a2e4b541b2e3549084a5ddc7
              {
                  PacketEnv env;
                  const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, count, calls, address);
-@@ -1331,17 +1332,31 @@ void register_ps2_sif_packet_tests()
+                 t.IsTrue(env.iop().loadModuleImage("descriptor-bounds.irx", image.bytes).moduleId > 0, "register bounds producer");
                  const auto server = env.bindService(sid);
-                 bool failed = false;
+-                bool failed = false;
++                std::string failure;
                  try { env.submitRpc(server, 0u, {}, 4u); }
 -                catch (const std::runtime_error &) { failed = true; }
-+                catch (const std::runtime_error &error)
-+                { failed = std::string(error.what()).find("callback SIF DMA") != std::string::npos; }
-                 t.IsTrue(failed, "invalid array or exhausted queue must fail before publication");
+-                t.IsTrue(failed, "invalid array or exhausted queue must fail before publication");
++                catch (const std::runtime_error &error) { failure = error.what(); }
++                t.IsTrue(failure.find("callback SIF DMA") != std::string::npos,
++                         "invalid array or exhausted queue must fail before publication");
                  t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "queued captures cannot escape a later failed descriptor call");
-+                ps2x::iop::SifEeReply reply;
-+                t.IsTrue(!env.iop().peekSifReply(reply), "failure cannot queue a partial reply behind the unarmed receiver");
++                // Public reply queries rethrow a stored execution failure.
++                // Arm the real receiver and verify observable no-publication
++                // instead of claiming access to its private reply queue.
++                env.installHandler();
++                std::string receiverFailure;
++                try { env.arm(); }
++                catch (const std::runtime_error &error) { receiverFailure = error.what(); }
++                t.IsTrue(!receiverFailure.empty() &&
++                         (receiverFailure == failure || receiverFailure == "Strict IOP execution: " + failure),
++                         "arming the receiver must retain the exact sticky DMA failure cause");
++                t.IsTrue((env.runtime.memory().readIORegister(0x1000C000u) & 0x100u) != 0u,
++                         "failure control must actually arm the receiver");
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "armed failed receiver cannot publish partial captures");
++                t.Equals(word(env.rdram.data(), kResult), 0u, "armed failed receiver cannot publish an ordinary result");
++                t.Equals(env.rdram[kReceive], uint8_t{0u}, "armed failed receiver cannot publish an END packet");
 +            }
 +            // One submission still owns at most 32 hardware tags. A callback
 +            // may finish and reuse that array; original MCSERV's 512 KiB read
