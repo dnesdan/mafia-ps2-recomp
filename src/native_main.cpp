@@ -43,6 +43,7 @@ struct Options {
     fs::path elf, iso, data_root, save_root, report, capture_frame, memory_card;
     std::uint64_t timeout_ms = 10000;
     std::vector<mafia::PadEvent> pad_events;
+    std::vector<mafia::PadAxisEvent> pad_axis_events;
     bool headless = false, validate_only = false, help = false, no_memory_card = false, skip_intro = false;
 };
 
@@ -66,9 +67,14 @@ Options parse_options(int argc, char **argv) {
             else if (arg == "--report") options.report = value;
             else if (arg == "--capture-frame") options.capture_frame = value;
             else if (arg == "--pad-event") {
-                if (options.pad_events.size() >= 256)
-                    throw std::runtime_error("At most 256 --pad-event pulses are supported per run");
+                if (options.pad_events.size() + options.pad_axis_events.size() >= 256)
+                    throw std::runtime_error("At most 256 controller pulses are supported per run");
                 options.pad_events.push_back(mafia::parse_pad_event(value));
+            }
+            else if (arg == "--pad-axis-event") {
+                if (options.pad_events.size() + options.pad_axis_events.size() >= 256)
+                    throw std::runtime_error("At most 256 controller pulses are supported per run");
+                options.pad_axis_events.push_back(mafia::parse_pad_axis_event(value));
             }
             else if (arg == "--timeout-ms") {
                 const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.timeout_ms);
@@ -78,8 +84,9 @@ Options parse_options(int argc, char **argv) {
         }
     }
     if (options.help) return options;
-    if (!options.pad_events.empty() && (!options.headless || options.validate_only))
-        throw std::runtime_error("--pad-event requires --headless guest execution");
+    if ((!options.pad_events.empty() || !options.pad_axis_events.empty()) &&
+        (!options.headless || options.validate_only))
+        throw std::runtime_error("--pad-event and --pad-axis-event require --headless guest execution");
     if (options.elf.empty()) throw std::runtime_error("Pass --elf with the original executable matching this build");
     options.elf = fs::absolute(options.elf);
     if (options.data_root.empty()) options.data_root = options.elf.parent_path();
@@ -279,6 +286,15 @@ void emit_report(const Options &options, const Report &report) {
             ", \"button_mask\": " + std::to_string(event.button) + "}";
     }
     pad_events += "]";
+    std::string pad_axis_events = "[";
+    for (const auto &event : options.pad_axis_events) {
+        if (pad_axis_events.size() != 1) pad_axis_events += ", ";
+        pad_axis_events += "{\"at_ms\": " + std::to_string(event.at_ms) +
+            ", \"duration_ms\": " + std::to_string(event.duration_ms) +
+            ", \"axis\": " + mafia::json_string(mafia::pad_axis_name(event.axis)) +
+            ", \"value\": " + std::to_string(event.value) + "}";
+    }
+    pad_axis_events += "]";
     std::string io_json = "{";
     for (const auto &[name, value] : report.io_registers) {
         if (io_json.size() != 1) io_json += ", ";
@@ -360,7 +376,8 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"controller_input\": {\"route\": \"iop-sio2\", \"port\": 0, \"source\": " +
             mafia::json_string(options.headless ? "headless-timeline" : "window-backend") +
             ", \"host_samples\": " + std::to_string(report.controller_samples) +
-            ", \"time_base\": \"host-elapsed-ms\", \"events\": " + pad_events + "}" +
+            ", \"time_base\": \"host-elapsed-ms\", \"events\": " + pad_events +
+            ", \"axis_events\": " + pad_axis_events + "}" +
         ",\n  \"memory_card\": {\"port\": 0, \"mounted\": " + boolean(report.memory_card_mounted) +
             ", \"image\": " + (options.memory_card.empty() ? "null" : mafia::json_string(options.memory_card.string())) + "}" +
         ",\n  \"dma_starts\": " + std::to_string(report.dma) +
@@ -745,6 +762,8 @@ void sample_controller(PS2Runtime &runtime, const Options &options,
     state.connected = true;
     if (options.headless) {
         state.buttons = mafia::pad_buttons_at(options.pad_events, elapsed_ms);
+        const auto stick = mafia::pad_left_stick_at(options.pad_axis_events, elapsed_ms);
+        state.leftX = stick.x; state.leftY = stick.y;
     } else {
         // Raylib input belongs to the window thread. Only a synchronized device
         // snapshot crosses to the executor; the original PADMAN polls SIO2.
@@ -779,13 +798,16 @@ int main(int argc, char **argv) {
                          "  [--capture-frame NEW-PATH.ppm]\n"
                          "  [--memory-card IMAGE.ps2 | --no-memory-card]\n"
                          "  [--headless --pad-event AT_MS:BUTTON:DURATION_MS ...]\n"
+                         "  [--headless --pad-axis-event AT_MS:AXIS:VALUE:DURATION_MS ...]\n"
                          "Capture saves the unscaled GS surface after execution stops, including in headless mode.\n"
                          "No image is written if the guest did not configure a display surface.\n"
                          "Pad events sample controller port 1 over SIO2; times are elapsed host milliseconds.\n"
+                         "Axes: lx/ly (left-x/left-y), byte 0..255; 128 centers. Latest active start wins.\n"
                          "Card slot 1 uses SAVE-ROOT/slot1.ps2 by default; missing images are created blank.\n"
                          "Existing images are preserved; the original game owns formatting and save files.\n"
                          "--skip-intro skips the startup trailer, New Game intro and first mission movie.\n"
-                         "Keyboard: Enter START, X/Space Cross, C Circle, arrows/WASD directions.\n"
+                         "Keyboard: arrows D-pad, WASD left stick, Ctrl L3/R3, Enter START, X/Space Cross, C Circle.\n"
+                         "A connected gamepad 0 takes priority; Escape closes the window.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;
         }

@@ -214,6 +214,25 @@ def verify_host(executable: Path, fixture: Path, work: Path) -> None:
               {"at_ms": 5, "duration_ms": 20, "button_mask": 16384}],
           "Scheduled controller input concealed the guest result or lost its reproducible timeline")
 
+    code, axis_pulse = run("scheduled-analog-controller", fixture, "--pad-event", "0:start:10",
+                           "--pad-axis-event", "0:left-x:0:10", "--pad-axis-event", "5:ly:255:20")
+    check(code == 1 and axis_pulse["status"] == "missing-dispatch"
+          and axis_pulse["controller_input"]["events"] == [{"at_ms": 0, "duration_ms": 10, "button_mask": 8}]
+          and axis_pulse["controller_input"]["axis_events"] == [
+              {"at_ms": 0, "duration_ms": 10, "axis": "lx", "value": 0},
+              {"at_ms": 5, "duration_ms": 20, "axis": "ly", "value": 255}],
+          "Analog timeline or simultaneous button input changed the guest outcome")
+    for extra in (["--pad-axis-event", "0:lx:0:1"],
+                  ["--headless", "--validate-only", "--pad-axis-event", "0:lx:0:1"],
+                  ["--headless", "--pad-axis-event", "0:lx:256:1"],
+                  ["--headless", "--pad-event", "0:start:1"] + ["--pad-axis-event", "0:lx:0:1"] * 256):
+        rejected_axis = subprocess.run([str(executable), "--elf", str(fixture), *extra],
+                                       capture_output=True, text=True, timeout=8)
+        rejected_data = json.loads(rejected_axis.stdout)
+        check(rejected_axis.returncode == 1 and rejected_data["stage"] == "arguments"
+              and not rejected_data["elf_loaded"] and not rejected_data["entry_executed"],
+              "Invalid, non-headless or oversized analog input reached guest execution")
+
     capture = work / "no-surface.ppm"
     capture.unlink(missing_ok=True)
     code, no_surface = run("capture-no-surface", fixture, "--capture-frame", str(capture))
