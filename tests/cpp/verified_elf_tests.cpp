@@ -10,6 +10,59 @@ void test_controller_input();
 
 namespace {
 void require(bool condition, const char *message) { if (!condition) throw std::runtime_error(message); }
+void test_intro_skip() {
+    mafia::IntroSkipState intro;
+    std::vector<std::uint8_t> ram(64u, 0xffu);
+    const auto set = [&](std::size_t offset, const std::string &value) {
+        std::copy(value.begin(), value.end(), ram.begin() + static_cast<std::ptrdiff_t>(offset));
+    };
+    set(8u, std::string("01a.pss\0", 8));
+    set(24u, std::string("01A.PsS\0", 8));
+    set(40u, std::string("01a.pssx\0", 9));
+    set(56u, std::string("01a.pss\0", 8));
+    const auto before = ram;
+    unsigned skipped = 0, delegated = 0;
+    const auto call = [&](std::uint32_t pc, std::uint32_t address) {
+        mafia::dispatch_intro_lookup(intro, pc, ram, address, [&] { ++skipped; }, [&] { ++delegated; });
+    };
+    call(0x001d1df0u, 8u);
+    call(0x001d1df0u, 24u);
+    call(0x001d1df0u, 56u); // terminator is the final byte of RAM
+    call(0x001d1df0u, 0x80000008u); // KSEG0 alias
+    call(0x001d1df0u, 0xa0000008u); // KSEG1 alias
+    call(0x001d1df0u, 0x20000008u); // uncached alias
+    require(skipped == 6u && delegated == 0u && intro.first_mission_count() == 6u,
+            "First mission movie or RAM alias was not recognized");
+    call(0x001d1df0u, 40u);          // no exact terminator
+    call(0x001d1df0u, 57u);          // insufficient bytes remaining
+    call(0x001d1df0u, 0u);           // null
+    call(0x001d1df0u, 0xffffffffu);  // invalid / overflowing address
+    call(0x001d1df0u, 0x10000008u);  // MMIO, not main RAM
+    call(0x001d1df0u, 0x30000008u);  // MMIO must not wrap into RAM
+    call(0x001d1df0u, 0x90000008u);  // KSEG0 MMIO
+    call(0x001d1df0u, 0xb0000008u);  // KSEG1 MMIO
+    call(0x001d1df0u, 0x02000008u);  // above physical RAM
+    call(0x001d1df0u, 0x22000008u);  // above uncached RAM alias
+    call(0x001d1df0u, 0xa2000008u);  // above KSEG1 RAM alias
+    call(0x001d1df0u, 0xc0000008u);  // TLB address
+    call(0x001d1df4u, 8u);          // same string, wrong call site
+    require(skipped == 6u && delegated == 13u && intro.first_mission_count() == 6u,
+            "Invalid or unrelated animation lookup did not delegate unchanged");
+    ram[8] = 'x';
+    call(0x001d1df0u, 8u);
+    require(delegated == 14u && intro.first_mission_count() == 6u,
+            "Different movie was skipped or counted");
+    ram[8] = before[8];
+    require(ram == before, "Intro skip changed guest string memory");
+    require(!intro.should_skip(0x002b6450u) && !intro.should_skip(0x00377904u),
+            "Unrelated animation lookup was skipped");
+    require(intro.should_skip(0x002b6454u) && !intro.should_skip(0x002b6454u),
+            "Startup skip must be one-shot");
+    require(intro.should_skip(0x00377900u) && intro.should_skip(0x00377900u),
+            "Each New Game intro should be skipped");
+    require(intro.startup_count() == 1u && intro.new_game_count() == 2u &&
+            intro.first_mission_count() == 6u, "Intro skip accounting is wrong");
+}
 void put16(std::vector<std::uint8_t> &b, std::size_t p, std::uint16_t n) {
     b[p]=static_cast<std::uint8_t>(n); b[p+1]=static_cast<std::uint8_t>(n>>8);
 }
@@ -129,11 +182,7 @@ int main() {
         rejects([&]{mafia::verify_elf(b,mafia::sha256(b),0x100000);});
         require(mafia::json_string("a\n\"\\") == "\"a\\u000a\\\"\\\\\"","JSON escaping");
         test_symbols();
-        mafia::IntroSkipState intro;
-        require(!intro.should_skip(0x002b6450u) && !intro.should_skip(0x00377904u), "Unrelated animation lookup was skipped");
-        require(intro.should_skip(0x002b6454u) && !intro.should_skip(0x002b6454u), "Startup skip must be one-shot");
-        require(intro.should_skip(0x00377900u) && intro.should_skip(0x00377900u), "Each New Game intro should be skipped");
-        require(intro.startup_count() == 1u && intro.new_game_count() == 2u, "Intro skip accounting is wrong");
+        test_intro_skip();
         test_frame_capture();
         test_controller_input();
         std::cout<<"Host verification tests passed (synthetic ELF, capture bytes and controller events; no game execution).\n";
