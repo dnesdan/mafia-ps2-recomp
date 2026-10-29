@@ -59,7 +59,7 @@
     "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0049",
+    "latest_reviewed_patch_set": "0001-0050",
     "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
       "programs_passed": 21,
@@ -175,7 +175,9 @@
     "patch_0049_sha256": "9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff",
     "patch_0049_scope": "Rename only the memory-card test helper to avoid std::exchange ADL; all production sources and tested runtime identities are unchanged.",
     "latest_runtime_production_sources_match_current_patch_set": true,
-    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks"
+    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks",
+    "patch_0050_sha256": "d0f0415209483c6cd09dce98ff18ed3a561131d05dfd686c415bdaf14c13850c",
+    "patch_0050_scope": "Runtime test only: distinguish the 32-tag per-submission limit from the 512-snapshot callback aggregate; verify exact acceptance and overflow rejection. Production sources unchanged."
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,

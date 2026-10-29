@@ -1,0 +1,49 @@
+diff --git a/ps2xTest/src/ps2_sif_packet_tests.cpp b/ps2xTest/src/ps2_sif_packet_tests.cpp
+index 4c8f8ac4796815e70c7168a62a6413848d7f67a5..cbcee80bc675abd43faeaaaa7303148c9bd27942 100644
+--- a/ps2xTest/src/ps2_sif_packet_tests.cpp
++++ b/ps2xTest/src/ps2_sif_packet_tests.cpp
+@@ -1321,9 +1321,10 @@ void register_ps2_sif_packet_tests()
+         tc.Run("callback DMA validates complete descriptor ownership and bounded queue capacity", [](TestCase &t)
+         {
+             constexpr uint32_t sid = 0x80001234u;
+-            for (const auto [address, count, calls] : std::array<std::array<uint32_t, 3>, 6>{{
++            for (const auto [address, count, calls] : std::array<std::array<uint32_t, 3>, 7>{{
+                 {0x10601u, 1u, 1u}, {0x40010600u, 1u, 1u}, {0x107F0u, 2u, 1u},
+-                {0x10600u, 0u, 1u}, {0x10600u, 33u, 1u}, {0x10600u, 1u, 33u}}})
++                {0x10600u, 0u, 1u}, {0x10600u, 33u, 1u},
++                {0x10600u, 1u, 513u}, {0x10600u, 32u, 17u}}})
+             {
+                 PacketEnv env;
+                 const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, count, calls, address);
+@@ -1335,13 +1336,24 @@ void register_ps2_sif_packet_tests()
+                 t.IsTrue(failed, "invalid array or exhausted queue must fail before publication");
+                 t.Equals(word(env.rdram.data(), kSecondaryResult), 0u, "queued captures cannot escape a later failed descriptor call");
+             }
+-            PacketEnv env;
+-            const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, 1u, 32u);
+-            t.IsTrue(env.iop().loadModuleImage("full-queue.irx", image.bytes).moduleId > 0, "register exact-bound producer");
+-            const auto server = env.bindService(sid);
+-            env.submitRpc(server, 0u, {}, 4u, 0u);
+-            env.arm();
+-            t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu, "the exact 32-descriptor bound remains valid");
++            // One submission still owns at most 32 hardware tags. A callback
++            // may finish and reuse that array; original MCSERV's 512 KiB read
++            // needs 65 ordered snapshots. Verify the former limit, that observed
++            // driver shape, and the exact independent 512-snapshot boundary.
++            for (const auto [count, calls] : std::array<std::array<uint32_t, 2>, 5>{{
++                {1u, 32u}, {1u, 33u}, {1u, 65u}, {1u, 512u}, {32u, 16u}}})
++            {
++                PacketEnv env;
++                const auto image = secondaryDmaServer(sid, {0x10420u, kSecondaryResult, 16u, 0u}, count, calls);
++                t.IsTrue(env.iop().loadModuleImage("full-queue.irx", image.bytes).moduleId > 0, "register bounded producer");
++                const auto server = env.bindService(sid);
++                env.submitRpc(server, 0u, {}, 4u, 0u);
++                env.arm();
++                t.Equals(word(env.rdram.data(), kSecondaryResult), 0xAABBCCDDu,
++                         "completed submissions may reuse tags up to the 512-snapshot aggregate bound");
++                t.Equals(word(env.rdram.data(), kResult), 0x76543210u,
++                         "the ordinary result follows the complete accepted callback queue");
++            }
+         });
+ 
+         tc.Run("callback DMA with no ordinary receive bytes still precedes direct completion", [](TestCase &t)
