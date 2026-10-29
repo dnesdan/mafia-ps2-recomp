@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "first-mission-driving-tutorial-with-diagnostic-movie-skips",
+    "stage": "first-mission-hud-world-rendering-under-investigation",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -23,9 +23,9 @@
     "game_initialization_complete": false,
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
-      "subsystem": "Original MPEG/IPU video pipeline after frontend exit",
-      "status": "bounded-run-timeout-under-investigation",
-      "description": "A private diagnostic skipped the startup, New Game and first-mission opening movies, passed the card autosave path and reached the original driving tutorial. Movie playback and interactive gameplay remain unverified.",
+      "subsystem": "First-mission 3D rendering and MPEG/IPU video",
+      "status": "first-mission-hud-visible-world-black",
+      "description": "The rebuilt game with three explicit video skips and original card drivers reaches the first-mission HUD, but the world behind it is black. Video playback, interactive controls and gameplay remain unverified.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
     },
@@ -59,7 +59,7 @@
     "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0052",
+    "latest_reviewed_patch_set": "0001-0053",
     "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
       "programs_passed": 21,
@@ -175,7 +175,7 @@
     "patch_0049_sha256": "9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff",
     "patch_0049_scope": "Rename only the memory-card test helper to avoid std::exchange ADL; all production sources and tested runtime identities are unchanged.",
     "latest_runtime_production_sources_match_current_patch_set": false,
-    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/5/checks",
+    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/6/checks",
     "patch_0050_sha256": "b8d48abbadc681202e7a37db5581c1a14c7de2de942a672939672555eaa94c76",
     "patch_0050_scope": "Runtime test only: distinguish the 32-tag per-submission limit from the 512-snapshot callback aggregate; verify exact acceptance and overflow rejection. Production sources unchanged.",
     "menu_verification_scope": "Exact original ELF on Linux x86-64, with an explicit no-animation lookup substitution before startup video; main menu and profile creation observed. Normal movie playback and gameplay remain unverified.",
@@ -215,7 +215,15 @@
       "frame_sha256": "f03decc2fb1be8fd7b0e845a624080ce78b1d6e9482c0619d63e54a09d096711",
       "gameplay_verified": false,
       "scope": "private diagnostic: three explicit original no-animation branches and scoped card metadata budget"
-    }
+    },
+    "first_mission_hud": {
+      "report_sha256": "2e6183f57db3ce1f9ead22d99c94759ff8c8781e2d297ee5a5be30ce6f67789",
+      "frame_sha256": "6f8f0fdd506a32035e0d6630b4817261df810e8eacccbf3707183ba716c7d4cd",
+      "rea_evidence_id": "ev_ad97dbecb913cd65cd1a30bf3ba54349aa7093afabbfe35479ca03af0f5c5659",
+      "scope": "rebuilt production binary, explicit --skip-intro, isolated card; HUD visible, 3D world black",
+      "gameplay_verified": false
+    },
+    "patch_0053_sha256": "a6285754ed36a73dbf7250ca5a5e880b32e67d5bdf1a638663a92f643692e754"
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,

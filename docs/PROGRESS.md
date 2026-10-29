@@ -39,6 +39,16 @@ An isolated private diagnostic selected the original no-animation branch at scri
 
 The `--skip-intro` option now exposes this narrowly scoped third substitution for the exact verified ELF. It checks the return address and bounded, NUL-terminated movie name; unrelated lookups use the original function. The game's existing no-video branch advances its script but also bypasses movie-success sound/indicator operations, so later behavioral equivalence is not established. The workaround omits story footage and does not decode movies.
 
+## Rebuilt executable reaches first-mission HUD
+
+An isolated REA capture of the rebuilt executable with `--skip-intro` recorded one substitution at each of the three verified sites and displayed the original first-mission HUD: `Lose the tail!`, a speedometer and health 100. The 3D world behind the HUD was black, and a single image does not establish response to input or gameplay. The bounded run ended on its diagnostic timeout; the capture was not truncated and REA verified process and temporary-root cleanup. The report SHA-256 is `2e6183f57db3ce1f9ead22d99c94759ff8c8781e2d297ee5a5be30ce6f67789`; the local frame SHA-256 is `6f8f0fdd506a32035e0d6630b4817261df810e8eacccbf3707183ba716c7d4cd`; REA evidence ID `ev_ad97dbecb913cd65cd1a30bf3ba54349aa7093afabbfe35479ca03af0f5c5659`. No image is published.
+
+A later private diagnostic reached the original Game Over menu. Its captured call stack points to a script-created menu, but does not identify why the mission failed. Investigation of 3D rendering and input remains open.
+
+## Analog controls for driving
+
+The window backend passes physical gamepad axes through the original controller path. Patch 0053 maps keyboard WASD to the left analog stick, retains arrows for the D-pad, and maps left/right Ctrl to L3/R3; a connected gamepad still takes priority. Opposite keyboard directions cancel, and Escape closes the window. Headless runs can schedule left-stick byte values with `--pad-axis-event AT_MS:lx|ly:VALUE:DURATION_MS`, independently of digital button events. Focused backend, timeline and host-contract tests exercise neutral, opposing, simultaneous and overlapping input as well as validation. These synthetic tests establish input transport, not gameplay response.
+
 ## Latest source checkpoint: patches 0048–0050
 
 Patch 0048 implements persistent ordinary raw cards below the original Sony SIO2MAN/MCMAN/MCSERV stack. The host mounts slot 1 before guest execution and reports its image and mount state. New images are exclusively created, all-FF and unformatted; exact-size existing images are reopened without rewriting. Reads, staged writes and erase operations validate complete commands, NAND bit transitions, checksums and bounds. Completed mutations use atomic replacement and file/directory synchronization. A separate lock prevents concurrent writers; malformed images, symlinks and storage failures fail explicitly. IOP reset keeps the mounted image and discards unfinished protocol state.

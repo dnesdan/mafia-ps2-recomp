@@ -55,6 +55,16 @@ if(MAFIA_BUILD_RUNTIME)
             COMMAND "${CMAKE_COMMAND}" "-DEXECUTABLE=$<TARGET_FILE:mafia_runtime_contract_tests>"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/unwind_timeout_test.cmake")
         set_tests_properties(mafia_exception_shutdown_timeout PROPERTIES TIMEOUT 12)
+        # Exercise the actual backend with isolated authored Raylib input
+        # functions. This target opens no window and cannot sample real devices.
+        add_executable(mafia_pad_backend_tests tests/cpp/pad_backend_tests.cpp
+            "${MAFIA_PS2RECOMP_SOURCE_DIR}/ps2xRuntime/src/lib/ps2_pad.cpp")
+        target_include_directories(mafia_pad_backend_tests PRIVATE
+            "${MAFIA_PS2RECOMP_SOURCE_DIR}/ps2xRuntime/include")
+        target_link_libraries(mafia_pad_backend_tests PRIVATE raylib)
+        add_dependencies(mafia_pad_backend_tests mafia_verify_runtime_source)
+        add_test(NAME mafia_pad_backend_tests COMMAND mafia_pad_backend_tests)
+        set_tests_properties(mafia_pad_backend_tests PROPERTIES TIMEOUT 10)
         include(cmake/NativeHostContract.cmake)
         mafia_add_native_host_contract()
     endif()
