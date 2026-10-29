@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "first-mission-hud-world-rendering-under-investigation",
+    "stage": "first-mission-3d-corruption-under-investigation",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -24,8 +24,8 @@
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
       "subsystem": "First-mission 3D rendering and MPEG/IPU video",
-      "status": "first-mission-hud-visible-world-black",
-      "description": "The rebuilt game with three explicit video skips and original card drivers reaches the first-mission HUD, but the world behind it is black. Video playback, interactive controls and gameplay remain unverified.",
+      "status": "first-mission-diagnostic-3d-corrupted",
+      "description": "A private instrumented host with the full patch-0056 game, explicit movie skips and an isolated card reached the first-mission HUD, map and 3D output; the scene is dark and corrupted. A separate timed production-0056 run loaded a profile but timed out before the mission. Movie playback and gameplay remain unverified.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
     },
@@ -94,7 +94,7 @@
     "original_no_card_dialog_verified": true,
     "original_iop_controller_input_verified": true,
     "latest_runtime_evidence_kind": "original-full-game-headless-rea-process-capture",
-    "latest_runtime_patch_set_is_historical": false,
+    "latest_runtime_patch_set_is_historical": true,
     "latest_runtime_uses_current_reconstructed_patch_set": false,
     "controller_input_verified_buttons_in_original_frontend": [
       "Up",
@@ -251,7 +251,43 @@
         3,
         4
       ],
-      "gameplay_verified": false
+      "gameplay_verified": false,
+      "limited_game_collision_diagnostic": {
+        "modified_instruction_sites": 10,
+        "modified_generated_functions": 4,
+        "selected_car_completed_hits": 134,
+        "selected_car_completed_misses": 0,
+        "selected_car_yields": 2,
+        "control_completed_hits": 0,
+        "control_completed_misses": 4630,
+        "control_yields": 2,
+        "scope": "Separate bounded runs with the same wheel host and initial card state, differing in ten generated SQRT sites and runtime duration; not frame-synchronized or proof of gameplay. The second control used a related collision host.",
+        "separate_collision_host_control": {
+          "completed_hits": 0,
+          "completed_misses": 4646,
+          "yields": 2
+        }
+      }
+    },
+    "patch_0056_game_observations": {
+      "instrumented_host": {
+        "full_regeneration": true,
+        "private_diagnostic_host": true,
+        "movie_skips": 3,
+        "first_mission_hud_and_map": true,
+        "three_dimensional_output": "dark and visibly corrupted",
+        "gameplay_verified": false
+      },
+      "production_host": {
+        "binary_sha256": "276644dc04485dd0033191092700aea66b0b1301f3b99061ea19218e7bb88c45",
+        "timed_replay": "loaded profile; timed out before mission",
+        "gameplay_verified": false
+      }
+    },
+    "pcsx2_reference": {
+      "version": "2.8.2",
+      "scope": "Independent reference with supplied ISO and BIOS; EETiming, MTVU and two GameDB EE code patches enabled. Street, car and map displayed; acceleration observed. Fresh-boot control disabling automatic game fixes and GameDB patches remained on logo; the responsible setting is undetermined. Native and reference captures are not synchronized. Private evidence remains outside the repository.",
+      "gameplay_verified_in_native_runtime": false
     }
   },
   "progress_report": "docs/PROGRESS.md",
