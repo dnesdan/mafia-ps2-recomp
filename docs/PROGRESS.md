@@ -1,10 +1,10 @@
 # Verified progress
 
-Updated **2026-10-29**. **Ordinary virtual memory-card storage is verified through original PS2 drivers. Main-menu entry, movie playback and gameplay remain unverified.** The exact-profile game has been regenerated, rebuilt and executed with patches 0001–0048. The current formatted-card run leaves the frontend and reaches an MPEG/IPU wait at the diagnostic limit; no Mafia mission save/load milestone is claimed.
+Updated **2026-10-29**. **Ordinary virtual memory-card storage is verified through original PS2 drivers. Main-menu entry, movie playback and gameplay remain unverified.** The exact-profile game has been regenerated, rebuilt and executed with production patches 0001–0048. Patch 0049 changes only the test helper name. The current formatted-card run leaves the frontend and reaches an MPEG/IPU wait at the diagnostic limit; no Mafia mission save/load milestone is claimed.
 
 The [patch-0045 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/f3d55ea43c21e88f33a029bb26e7a26e0e771f23/docs/PROGRESS.md) retains the direct/external blocking-sync tests. The [patch-0044 checkpoint](https://github.com/dnesdan/mafia-ps2-recomp/blob/4af8b23c05a78e40dec0e0c46321c0b28520fbab/docs/PROGRESS.md), [patch-0043 report](https://github.com/dnesdan/mafia-ps2-recomp/blob/59a0d214599524a6229235f9fa1e1880bc21269f/docs/PROGRESS.md) and [earlier detailed history](https://github.com/dnesdan/mafia-ps2-recomp/blob/8c4b294c26ab24daadac57f8f7f677a9e90d051d/docs/PROGRESS.md) preserve the preceding test and screenshot provenance.
 
-## Latest source checkpoint: patch 0048
+## Latest source checkpoint: patches 0048–0049
 
 Patch 0048 implements persistent ordinary raw cards below the original Sony SIO2MAN/MCMAN/MCSERV stack. The host mounts slot 1 before guest execution and reports its image and mount state. New images are exclusively created, all-FF and unformatted; exact-size existing images are reopened without rewriting. Reads, staged writes and erase operations validate complete commands, NAND bit transitions, checksums and bounds. Completed mutations use atomic replacement and file/directory synchronization. A separate lock prevents concurrent writers; malformed images, symlinks and storage failures fail explicitly. IOP reset keeps the mounted image and discards unfinished protocol state.
 
@@ -13,6 +13,8 @@ The original transport uses SIO2 descriptors and DMA channels 11/12, including d
 Original MCMAN also requires synchronous `sifcmd:23` GetOtherData, bounded external semaphore/event waits, and longer per-operation RPC execution for format/flush/close and large reads/writes. These changes retain strict buffer ownership, reset epochs and rejection of destructive reentry. A callback cannot publish retired DMA after reset. Read/write budgets depend on validated request size; the default budget for unrelated services is unchanged. Per-submission DMA limits remain 32 tags, with a bounded callback aggregate for the original driver's larger reads. Asynchronous GetOtherData and blocking a nested callback inside an already active managed caller remain unsupported.
 
 Ordinary virtual-card admission is explicit in diagnostics. It requires a mounted card, live original driver callbacks and successful protocol probes. This is a modeled storage contract, **not physical MagicGate authentication or BIOS execution**; protected operations remain unsupported. Compatible supplied exports retain precedence. There is no HLE replacement for the original memory-card file operations.
+
+Patch 0049 fixes an Apple libc++ compile failure in the new test helper: unqualified `exchange(card, vector)` could select `std::exchange` through argument-dependent lookup. The helper is now named `exchangeCard`; production sources and the runtime binary are unchanged. An explicit `<utility>` compile control reproduces the old failure with GCC and passes after the rename. The 21-program IOP suite is rerun for this final test source. The first final-head CI attempt is retained in [run 40857634019](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40857634019); current checks are on [PR #3](https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks).
 
 ### Original-driver storage acceptance
 
@@ -27,7 +29,8 @@ A separate clean image was formatted through the same original drivers, verified
 
 | Acceptance identity | SHA-256 |
 | --- | --- |
-| Final patch 0048 | `1e6b0002b39ba1c34b341d0599c7e8712e5b98eae8f0c8c4eb420f7a45e2214b` |
+| Production patch 0048 | `1e6b0002b39ba1c34b341d0599c7e8712e5b98eae8f0c8c4eb420f7a45e2214b` |
+| Test portability patch 0049 | `9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff` |
 | Final tested IOP library | `5305490b928a5d16ec582dba69a2c58d1115e22efbf475332e68794e3159a357` |
 | Private authored probe source | `0946b208afbf757ff9dd32d918cad0e98d668dab11d3aa05e643749aada4f917` |
 | Probe executable | `e9a4c0dcffc44a53b0a9b0c9d993106c7fd42b59045d8bbb569d0afed1fe61ee` |
@@ -47,10 +50,10 @@ The private probe and commercial inputs remain outside this source repository. T
 | Focused memory-card, SIO2, DMACMAN, strict-loader and import programs | 5/5 passed under ASan/UBSan. Leak detection disabled because the environment does not support LSan under ptrace. |
 | Generated integer operations | 68 arithmetic cases passed under UBSan. |
 | Independent negative controls | Old SIO2 source fails only the two new heap-boundary/interrupt-callback regression groups (27/29); corrected source passes 29/29. Old DMAC span capture also fails its new boundary case. |
-| Exact final dependency source | Verified against the pinned upstream and patches 0001–0048. |
+| Exact final dependency source | Verified against the pinned upstream and patches 0001–0049; patch 0049 changes only a test helper. |
 | Original driver 512 KiB acceptance and cold process reopen | Both exit 0 with exact full readback. |
 | Full Linux and ARM64 macOS CI, patch 0047 | All four final-head jobs passed in [run 40846058172](https://github.com/dnesdan/mafia-ps2-recomp/actions/runs/40846058172). |
-| Patch-0048 CI | See the current [pull-request checks](https://github.com/dnesdan/mafia-ps2-recomp/pulls). CI includes the new memory-card test executable; no commercial fixtures are uploaded. |
+| Patch-0048 CI | See the [PR #3 checks](https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks). CI includes the new memory-card test executable; no commercial fixtures are uploaded. |
 
 ## Current original run: patch 0048
 

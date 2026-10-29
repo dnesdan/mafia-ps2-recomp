@@ -1,0 +1,202 @@
+diff --git a/ps2xIOP/tests/iop_memory_card_tests.cpp b/ps2xIOP/tests/iop_memory_card_tests.cpp
+index 9e94d17a7893a7eec354df50e2df62b89e505de5..a37afdd435254c477f1427039a59fd23ccff5e86 100644
+--- a/ps2xIOP/tests/iop_memory_card_tests.cpp
++++ b/ps2xIOP/tests/iop_memory_card_tests.cpp
+@@ -79,13 +79,13 @@ namespace
+         return tx;
+     }
+ 
+-    Bytes exchange(IopMemoryCard &card, const Bytes &tx) { return card.exchange(tx, tx.size()); }
++    Bytes exchangeCard(IopMemoryCard &card, const Bytes &tx) { return card.exchange(tx, tx.size()); }
+ 
+     Bytes read(IopMemoryCard &card, size_t count)
+     {
+         auto tx = packet(0x43u, count + 6u);
+         tx[2u] = static_cast<uint8_t>(count);
+-        const auto rx = exchange(card, tx);
++        const auto rx = exchangeCard(card, tx);
+         Bytes data(rx.begin() + 4u, rx.begin() + 4u + count);
+         require(rx[0u] == 0u && rx[1u] == 0u && rx[2u] == 0u && rx[3u] == 0x2Bu,
+                 "read data ACK layout is wrong");
+@@ -113,18 +113,18 @@ namespace
+             require(raw.size() == IopMemoryCard::ImageBytes &&
+                 std::all_of(raw.begin(), raw.end(), [](uint8_t b) { return b == 0xFFu; }),
+                 "new raw card is sized incorrectly or falsely formatted");
+-            require(exchange(card, packet(0x11u, 4u)) == Bytes({0u, 0u, 0x2Bu, 0x55u}),
++            require(exchangeCard(card, packet(0x11u, 4u)) == Bytes({0u, 0u, 0x2Bu, 0x55u}),
+                     "probe ACK or initial terminator is wrong");
+             auto set = packet(0x27u, 5u); set[2u] = 0x5Au;
+-            require(exchange(card, set) == Bytes({0u, 0u, 0u, 0x2Bu, 0x5Au}), "set terminator failed");
+-            require(exchange(card, packet(0x28u, 5u)) == Bytes({0u, 0u, 0x2Bu, 0x5Au, 0x5Au}),
++            require(exchangeCard(card, set) == Bytes({0u, 0u, 0u, 0x2Bu, 0x5Au}), "set terminator failed");
++            require(exchangeCard(card, packet(0x28u, 5u)) == Bytes({0u, 0u, 0x2Bu, 0x5Au, 0x5Au}),
+                     "get terminator compatibility bytes are wrong");
+-            require(exchange(card, packet(0x26u, 13u)) ==
++            require(exchangeCard(card, packet(0x26u, 13u)) ==
+                 Bytes({0u, 0u, 0x2Bu, 0u, 2u, 16u, 0u, 0u, 64u, 0u, 0u, 0x52u, 0x5Au}),
+                 "geometry, flags or geometry XOR is wrong");
+-            require(exchange(card, packet(0xF3u, 5u)).back() == 0x55u, "auth reset did not reset terminator");
++            require(exchangeCard(card, packet(0xF3u, 5u)).back() == 0x55u, "auth reset did not reset terminator");
+             for (uint8_t command : {0xF0u, 0xF1u, 0xF2u, 0xF7u})
+-                rejected([&] { (void)exchange(card, packet(command, 5u)); }, "unsupported authentication reported success");
++                rejected([&] { (void)exchangeCard(card, packet(command, 5u)); }, "unsupported authentication reported success");
+             IopMemoryCard conflicting;
+             rejected([&] { conflicting.mount(temporary.image(), true); }, "concurrent image mount succeeded");
+         }
+@@ -140,20 +140,20 @@ namespace
+         card.mount(temporary.image(), true);
+         auto setTerminator = packet(0x27u, 5u);
+         setTerminator[2u] = 0x6Bu;
+-        (void)exchange(card, setTerminator);
+-        (void)exchange(card, address(0x22u, 17u));
++        (void)exchangeCard(card, setTerminator);
++        (void)exchangeCard(card, address(0x22u, 17u));
+         const Bytes data{0x13u, 0x57u, 0x9Bu, 0xDFu};
+-        (void)exchange(card, writePacket(data));
++        (void)exchangeCard(card, writePacket(data));
+         const auto before = disk(temporary.image());
+         auto status = packet(0xBFu, 5u);
+         status[2u] = 0x55u; // Original MCMAN supplies this byte; it is not a reset.
+         rejected([&] { (void)card.exchange(status, 4u); }, "boot/status accepted a short response frame");
+-        require(exchange(card, status) == Bytes({0u, 0u, 0u, 0x2Bu, 0x6Bu}),
++        require(exchangeCard(card, status) == Bytes({0u, 0u, 0u, 0x2Bu, 0x6Bu}),
+                 "boot/status changed the terminator or returned the wrong ACK layout");
+-        require(exchange(card, packet(0x28u, 5u))[3u] == 0x6Bu && disk(temporary.image()) == before,
++        require(exchangeCard(card, packet(0x28u, 5u))[3u] == 0x6Bu && disk(temporary.image()) == before,
+                 "boot/status reset protocol or committed unfinished storage");
+-        rejected([&] { (void)exchange(card, packet(0xF0u, 5u)); }, "boot/status admitted unsupported authentication");
+-        (void)exchange(card, packet(0x81u, 4u));
++        rejected([&] { (void)exchangeCard(card, packet(0xF0u, 5u)); }, "boot/status admitted unsupported authentication");
++        (void)exchangeCard(card, packet(0x81u, 4u));
+         const auto after = disk(temporary.image());
+         const size_t offset = 17u * IopMemoryCard::PageBytes;
+         require(std::equal(data.begin(), data.end(), after.begin() + offset) && after[offset + data.size()] == 0xFFu,
+@@ -168,26 +168,26 @@ namespace
+         const size_t offset = (IopMemoryCard::PageCount - 1u) * IopMemoryCard::PageBytes;
+         {
+             IopMemoryCard card; card.mount(temporary.image(), true);
+-            (void)exchange(card, address(0x22u, IopMemoryCard::PageCount - 1u));
++            (void)exchangeCard(card, address(0x22u, IopMemoryCard::PageCount - 1u));
+             for (size_t i = 0; i < expected.size(); i += 128u)
+             {
+                 Bytes chunk(expected.begin() + i, expected.begin() + std::min(i + 128u, expected.size()));
+-                const auto rx = exchange(card, writePacket(chunk));
++                const auto rx = exchangeCard(card, writePacket(chunk));
+                 require(rx[3u] == 0x2Bu && rx[chunk.size() + 4u] == xorBytes(chunk), "write ACK/XOR is wrong");
+             }
+             const auto uncommitted = disk(temporary.image());
+             require(std::all_of(uncommitted.begin() + offset, uncommitted.end(), [](uint8_t b) { return b == 0xFFu; }),
+                     "write chunks persisted before end command");
+             auto overrun = writePacket(Bytes{0u});
+-            rejected([&] { (void)exchange(card, overrun); }, "card-end write exceeded storage");
+-            (void)exchange(card, packet(0x81u, 4u));
++            rejected([&] { (void)exchangeCard(card, overrun); }, "card-end write exceeded storage");
++            (void)exchangeCard(card, packet(0x81u, 4u));
+             const auto committed = disk(temporary.image());
+             require(std::equal(expected.begin(), expected.end(), committed.begin() + offset),
+                     "committed page or authored spare/ECC bytes were lost");
+             require(committed[offset - 1u] == 0xFFu, "page commit damaged a neighboring page");
+         }
+         IopMemoryCard reopened; reopened.mount(temporary.image(), false);
+-        (void)exchange(reopened, address(0x23u, IopMemoryCard::PageCount - 1u));
++        (void)exchangeCard(reopened, address(0x23u, IopMemoryCard::PageCount - 1u));
+         Bytes observed;
+         for (size_t i = 0; i < expected.size(); i += 128u)
+         {
+@@ -202,20 +202,20 @@ namespace
+     {
+         Temporary temporary;
+         IopMemoryCard card; card.mount(temporary.image(), true);
+-        (void)exchange(card, address(0x22u, 7u));
++        (void)exchangeCard(card, address(0x22u, 7u));
+         auto wrongAddress = address(0x22u, 8u); wrongAddress[6u] ^= 1u;
+-        rejected([&] { (void)exchange(card, wrongAddress); }, "bad address XOR accepted");
+-        rejected([&] { (void)exchange(card, address(0x22u, 0xFFFFFFFFu)); }, "out-of-range page accepted");
++        rejected([&] { (void)exchangeCard(card, wrongAddress); }, "bad address XOR accepted");
++        rejected([&] { (void)exchangeCard(card, address(0x22u, 0xFFFFFFFFu)); }, "out-of-range page accepted");
+         auto badWrite = writePacket(Bytes{1u, 2u, 3u}); badWrite[6u] ^= 1u;
+-        rejected([&] { (void)exchange(card, badWrite); }, "bad data XOR accepted");
++        rejected([&] { (void)exchangeCard(card, badWrite); }, "bad data XOR accepted");
+         auto valid = writePacket(Bytes{0x31u, 0x42u, 0x53u});
+         rejected([&] { (void)card.exchange(valid, valid.size() - 1u); }, "truncated receive packet accepted");
+         auto shortTx = valid; shortTx.pop_back();
+         rejected([&] { (void)card.exchange(shortTx, valid.size()); }, "truncated transmit packet accepted");
+         auto large = packet(0x43u, 135u); large[2u] = 129u;
+-        rejected([&] { (void)exchange(card, large); }, "oversized data transaction accepted");
+-        (void)exchange(card, valid);
+-        (void)exchange(card, packet(0x81u, 4u));
++        rejected([&] { (void)exchangeCard(card, large); }, "oversized data transaction accepted");
++        (void)exchangeCard(card, valid);
++        (void)exchangeCard(card, packet(0x81u, 4u));
+         const auto raw = disk(temporary.image());
+         require(raw[7u * IopMemoryCard::PageBytes] == 0x31u && raw[7u * IopMemoryCard::PageBytes + 3u] == 0xFFu &&
+             raw[8u * IopMemoryCard::PageBytes] == 0xFFu, "rejected packet mutated cursor or pending data");
+@@ -228,7 +228,7 @@ namespace
+             {setAddress, setAddress.size()}, {goodWrite, goodWrite.size()}, {end, end.size()},
+             {badWrite, badWrite.size()}}};
+         rejected([&] { card.validateExchanges(queue); }, "queue with a later invalid packet accepted");
+-        require(disk(temporary.image()) == raw && exchange(card, packet(0x28u, 5u))[3u] == 0x55u,
++        require(disk(temporary.image()) == raw && exchangeCard(card, packet(0x28u, 5u))[3u] == 0x55u,
+                 "queue preflight changed persistent data or terminator");
+         card.validateExchanges(std::span(queue).first(4u));
+         require(disk(temporary.image()) == raw, "successful preflight committed storage");
+@@ -240,27 +240,27 @@ namespace
+         IopMemoryCard card; card.mount(temporary.image(), true);
+         for (uint32_t page : {15u, 16u, 31u, 32u})
+         {
+-            (void)exchange(card, address(0x22u, page));
+-            (void)exchange(card, writePacket(Bytes(128u, 0u)));
+-            (void)exchange(card, packet(0x81u, 4u));
++            (void)exchangeCard(card, address(0x22u, page));
++            (void)exchangeCard(card, writePacket(Bytes(128u, 0u)));
++            (void)exchangeCard(card, packet(0x81u, 4u));
+         }
+-        (void)exchange(card, address(0x22u, 15u));
+-        (void)exchange(card, writePacket(Bytes(128u, 0xFFu)));
+-        (void)exchange(card, packet(0x81u, 4u));
++        (void)exchangeCard(card, address(0x22u, 15u));
++        (void)exchangeCard(card, writePacket(Bytes(128u, 0xFFu)));
++        (void)exchangeCard(card, packet(0x81u, 4u));
+         require(disk(temporary.image())[15u * IopMemoryCard::PageBytes] == 0u,
+                 "NAND programming incorrectly restored zero bits before erase");
+-        (void)exchange(card, address(0x21u, 23u));
+-        (void)exchange(card, packet(0x82u, 4u));
++        (void)exchangeCard(card, address(0x21u, 23u));
++        (void)exchangeCard(card, packet(0x82u, 4u));
+         auto raw = disk(temporary.image());
+         require(raw[15u * IopMemoryCard::PageBytes] == 0u && raw[32u * IopMemoryCard::PageBytes] == 0u,
+                 "erase damaged adjacent blocks");
+         require(std::all_of(raw.begin() + 16u * IopMemoryCard::PageBytes,
+             raw.begin() + 32u * IopMemoryCard::PageBytes, [](uint8_t b) { return b == 0xFFu; }),
+                 "erase did not clear the whole selected block and spare bytes");
+-        (void)exchange(card, address(0x22u, 17u));
+-        (void)exchange(card, writePacket(Bytes(128u, 0u)));
++        (void)exchangeCard(card, address(0x22u, 17u));
++        (void)exchangeCard(card, writePacket(Bytes(128u, 0u)));
+         card.resetProtocol();
+-        (void)exchange(card, packet(0x81u, 4u));
++        (void)exchangeCard(card, packet(0x81u, 4u));
+         require(disk(temporary.image()) == raw, "reset retained an unfinished write");
+         require(card.attached(), "reset detached storage");
+     }
+@@ -281,16 +281,16 @@ namespace
+         require(disk(temporary.image()) == wrong, "symlink mount changed target");
+         std::filesystem::remove(temporary.image());
+         card.mount(temporary.image(), true);
+-        (void)exchange(card, address(0x22u, 0u));
+-        (void)exchange(card, writePacket(Bytes(128u, 0x42u)));
++        (void)exchangeCard(card, address(0x22u, 0u));
++        (void)exchangeCard(card, writePacket(Bytes(128u, 0x42u)));
+         const auto moved = temporary.directory / "preserved.ps2";
+         std::filesystem::rename(temporary.image(), moved);
+-        rejected([&] { (void)exchange(card, packet(0x81u, 4u)); }, "missing mounted path reported committed success");
++        rejected([&] { (void)exchangeCard(card, packet(0x81u, 4u)); }, "missing mounted path reported committed success");
+         const auto preserved = disk(moved);
+         require(std::all_of(preserved.begin(), preserved.end(), [](uint8_t b) { return b == 0xFFu; }),
+                 "failed commit modified preserved image");
+         card.resetProtocol();
+-        rejected([&] { (void)exchange(card, packet(0x11u, 4u)); }, "storage error was cleared into successful probe");
++        rejected([&] { (void)exchangeCard(card, packet(0x11u, 4u)); }, "storage error was cleared into successful probe");
+     }
+ }
+ 

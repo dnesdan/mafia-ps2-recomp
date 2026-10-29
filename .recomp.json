@@ -59,8 +59,8 @@
     "frontend_screenshot": "docs/screenshots/mafia-linux-card-autosave.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0048",
-    "latest_local_iop_test_patch_set": "0001-0048",
+    "latest_reviewed_patch_set": "0001-0049",
+    "latest_local_iop_test_patch_set": "0001-0049",
     "latest_local_iop_tests": {
       "programs_passed": 21,
       "programs_failed": 0,
@@ -95,7 +95,7 @@
     "original_iop_controller_input_verified": true,
     "latest_runtime_evidence_kind": "original-full-game-headless-rea-process-capture",
     "latest_runtime_patch_set_is_historical": false,
-    "latest_runtime_uses_current_reconstructed_patch_set": true,
+    "latest_runtime_uses_current_reconstructed_patch_set": false,
     "controller_input_verified_buttons_in_original_frontend": [
       "Up",
       "Cross"
@@ -171,7 +171,11 @@
       "physical_authentication": "modeled ordinary virtual storage admission only"
     },
     "latest_runtime_memory_card_packets": 595,
-    "latest_runtime_memory_card_missing_devices": 0
+    "latest_runtime_memory_card_missing_devices": 0,
+    "patch_0049_sha256": "9c8cfca9f1efc7b86a08001c16452729f52b7ee4047dcd6803b3010194abf7ff",
+    "patch_0049_scope": "Rename only the memory-card test helper to avoid std::exchange ADL; all production sources and tested runtime identities are unchanged.",
+    "latest_runtime_production_sources_match_current_patch_set": true,
+    "current_ci_checks_url": "https://github.com/dnesdan/mafia-ps2-recomp/pull/3/checks"
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,
