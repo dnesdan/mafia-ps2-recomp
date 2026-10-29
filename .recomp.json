@@ -13,7 +13,7 @@
     "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0"
   },
   "status": {
-    "stage": "blocking-cdvd-sync-tested-original-game-revalidation-pending",
+    "stage": "original-mpeg-start-code-scan-timeout-under-investigation",
     "playable": false,
     "input_verified": true,
     "static_translation_verified": true,
@@ -23,19 +23,21 @@
     "game_initialization_complete": false,
     "verified_game_execution_platform": "linux-x86_64",
     "current_blocker": {
-      "subsystem": "Fresh original-game integration of the current streaming services",
-      "status": "original-data-workspace-unavailable",
-      "description": "Alarms, deferred Nop completion, stream1 reads, cancellation and blocking sceCdSync modes 0/5 pass constructed-input tests. Retried downloads did not recover the original data or BIOS. The original machine tunnel remains inactive. Timed/stream-wide waits and blocking synchronous host invocations nested inside managed threads remain unsupported.",
+      "subsystem": "Original MPEG/video pipeline after frontend exit",
+      "status": "bounded-run-timeout-under-investigation",
+      "description": "A 90-second original-game headless run with Cross/Up/Cross reached this PC, with an empty active menu chain and a black GS surface. No strict unsupported-import error occurred; the underlying cause and eventual progress remain unestablished.",
       "original_iop_driver_transport_verified": true,
       "native_game_input_consumption_verified": true
     },
     "last_observed_original_blocker": {
-      "patch_set": "0001-0039",
-      "subsystem": "Original CDVDSTM stream start",
-      "import": "cdvdman:46 version=0x0101",
-      "iop_pc": "0x9D2B8",
-      "iop_ra": "0x9C188",
-      "description": "sceCdNop was unsupported in the last recorded original-game executable. Later patches implement it, but a newer original-game run remains unverified."
+      "patch_set": "0001-0047",
+      "kind": "bounded-execution-timeout",
+      "subsystem": "Original MPEG start-code scanning",
+      "ee_pc": "0x003c3914",
+      "symbol": "_nextStartCode",
+      "symbol_offset": 92,
+      "branch_symbol": "_peepBit",
+      "description": "A 90-second original-game headless run with Cross/Up/Cross reached this PC, with an empty active menu chain and a black GS surface. No strict unsupported-import error occurred; the underlying cause and eventual progress remain unestablished."
     },
     "macos_arm64_synthetic_host_verified": true,
     "first_game_frame_verified": false,
@@ -45,52 +47,60 @@
     "startup_graphics_kind": "Gathering publisher splash",
     "startup_screenshot": "docs/screenshots/mafia-linux-gathering.png",
     "menu_verified": false,
-    "macos_arm64_synthetic_host_verified_patch_set": "0001-0044",
-    "latest_runtime_patch_set": "0001-0039",
+    "macos_arm64_synthetic_host_verified_patch_set": "0001-0047",
+    "latest_runtime_patch_set": "0001-0047",
     "latest_runtime_platform": "linux-x86_64",
-    "latest_runtime_binary_sha256": "457d2f9d80f5ad66c270a284b77e662490559d5f01bb080ffeba25167407bf92",
+    "latest_runtime_binary_sha256": "98de4944215cc5b99dacd93cd5086588e3ccc7d3c2908bab66727f15a966ad4c",
     "updated_macos_ci_verified": true,
     "linux_arm64_game_execution_verified": false,
-    "last_verified_ci_patch_set": "0001-0044",
-    "last_verified_ci_run": 40757496945,
+    "last_verified_ci_patch_set": "0001-0047",
+    "last_verified_ci_run": 40841887834,
     "original_frontend_screen_verified": true,
     "frontend_screenshot": "docs/screenshots/mafia-linux-no-card.png",
     "controller_input_verified": true,
     "original_caution_auto_dismiss_verified": true,
-    "latest_reviewed_patch_set": "0001-0045",
-    "latest_local_iop_test_patch_set": "0001-0045",
+    "latest_reviewed_patch_set": "0001-0047",
+    "latest_local_iop_test_patch_set": "0001-0047",
     "latest_local_iop_tests": {
       "programs_passed": 20,
       "programs_failed": 0,
       "gcc_version": "14.2.0",
-      "optimized_clang_version": "17.0.0",
-      "asan_ubsan_leak_detection_passed": true,
-      "ncmd_stream_cases_passed": 51,
-      "ncmd_stream_cases_total": 51,
-      "same_cases_passed_on_preceding_source": 37,
-      "new_cases_failing_on_preceding_source": 14,
-      "remote_ci_source_parity_files": 94,
+      "optimized_clang_run": false,
+      "asan_ubsan_run": false,
+      "ncmd_stream_cases_passed": 64,
+      "ncmd_stream_cases_total": 64,
+      "preceding_source_patch_set": "0001-0046",
+      "same_cases_passed_on_preceding_source": 63,
+      "new_cases_failing_on_preceding_source": 1,
+      "preceding_runtime_source_verified_files": 95,
+      "preceding_runtime_changed_test_files": 2,
       "original_game_execution": false
     },
-    "blocking_cdvd_sync_supported_modes": [0, 5],
+    "blocking_cdvd_sync_supported_modes": [
+      0,
+      5
+    ],
     "blocking_cdvd_sync_managed_direct_import_tested": true,
     "blocking_cdvd_sync_external_driver_invocation_tested": true,
-    "blocking_cdvd_sync_nested_managed_invocation_supported": false,
+    "blocking_cdvd_sync_nested_managed_invocation_supported": true,
     "patch_0043_ci_run": 40733776289,
     "patch_0043_ci_verified": true,
     "patch_0044_ci_run": 40757496945,
     "patch_0044_ci_verified": true,
     "patch_0044_ci_status_at_checkpoint": "success",
     "patch_0045_ci_run": 40762352805,
-    "patch_0045_ci_verified": false,
-    "patch_0045_ci_status_at_checkpoint": "in_progress",
+    "patch_0045_ci_verified": true,
+    "patch_0045_ci_status_at_checkpoint": "success",
     "original_memory_card_query_completed": true,
     "original_no_card_dialog_verified": true,
     "original_iop_controller_input_verified": true,
-    "latest_runtime_evidence_kind": "original-full-game-window-xvfb-software-opengl",
-    "latest_runtime_patch_set_is_historical": true,
-    "latest_runtime_uses_current_reconstructed_patch_set": false,
-    "controller_input_verified_buttons_in_original_frontend": ["Up", "Cross"],
+    "latest_runtime_evidence_kind": "original-full-game-headless-rea-process-capture",
+    "latest_runtime_patch_set_is_historical": false,
+    "latest_runtime_uses_current_reconstructed_patch_set": true,
+    "controller_input_verified_buttons_in_original_frontend": [
+      "Up",
+      "Cross"
+    ],
     "original_movie_initialization_entered": true,
     "original_cdvdstm_startup_completed": true,
     "original_cdvdstm_stream_initialization_completed": true,
@@ -99,25 +109,93 @@
     "audio_output_verified": false,
     "frontend_screenshot_kind": "original-no-card-dialog-with-Yes-selected",
     "original_video_file_metadata_received": true,
-    "original_stream_start_entered": true
+    "original_stream_start_entered": true,
+    "latest_local_source_tests": {
+      "python_tests_passed": 118,
+      "ctest_checks_passed": 2
+    },
+    "latest_local_runtime_contract_tests": {
+      "ctest_checks_passed": 5,
+      "ctest_checks_failed": 0
+    },
+    "latest_generated_integer_ubsan_tests": {
+      "arithmetic_cases_passed": 68
+    },
+    "blocking_cdvd_sync_independent_concurrent_native_waits_supported": false,
+    "blocking_cdvd_sync_nested_managed_invocation_scope": "One synchronous guest driver invocation inside a managed IOP thread; independently resumable concurrent native waits remain unsupported.",
+    "patch_0046_ci_run": 40837524243,
+    "patch_0046_ci_verified": true,
+    "patch_0046_ci_status_at_checkpoint": "success",
+    "patch_0047_ci_run": 40841887834,
+    "patch_0047_ci_verified": true,
+    "patch_0047_ci_status_at_checkpoint": "success",
+    "patch_0047_pull_request": 2,
+    "patch_0047_sha256": "da9a393a32a9e5664309e35caad9b80088e03a2e394a3c4ec928600ac647df0e",
+    "historical_patch_0039_strict_blocker": {
+      "patch_set": "0001-0039",
+      "subsystem": "Original CDVDSTM stream start",
+      "import": "cdvdman:46 version=0x0101",
+      "iop_pc": "0x9D2B8",
+      "iop_ra": "0x9C188",
+      "description": "sceCdNop was unsupported in the last recorded original-game executable. Later patches implement it, but a newer original-game run remains unverified."
+    },
+    "latest_runtime_report_sha256": "8d3af3641263ca28ee72fa3ddd75743870ed4aae13820e6db96e67ff6211a2e5",
+    "latest_runtime_rea_evidence_id": "ev_1af817d09fc94fa30ab4dd40adbf9a90a337618c8a00586240b83fe8416547a0",
+    "latest_runtime_diagnostic_limit_ms": 90000,
+    "latest_runtime_frontend_active_menu": 0,
+    "latest_runtime_frame_nonblack_pixels": 0,
+    "latest_runtime_iop_instructions": 9650165,
+    "latest_runtime_iop_loaded_modules": 12,
+    "latest_runtime_sio2_transfers": 688,
+    "current_patch_startup_graphics_verified": true,
+    "current_patch_autosave_capture_sha256": "fe1033ac946a2a5f8cb7a5cb3a2404320ceda20e75a3f8cbb58ba8e184c512ec",
+    "current_patch_bios_execution_verified": false
   },
   "progress_report": "docs/PROGRESS.md",
   "commercial_inputs_in_repository": false,
   "generated_game_code_in_repository": false,
   "targets": [
-    {"os": "macOS", "architecture": "arm64", "application": "MafiaNative.app"},
-    {"os": "Linux", "architectures": ["x86_64", "arm64"], "application": "MafiaNative"}
+    {
+      "os": "macOS",
+      "architecture": "arm64",
+      "application": "MafiaNative.app"
+    },
+    {
+      "os": "Linux",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "application": "MafiaNative"
+    }
   ],
   "retained_local_inputs": {
-    "complete_installation": false,
-    "complete_iso_retained": false,
-    "bios_available": false,
-    "workspace_status": "Current workspace has verified public IOP sources only. User-authorized downloads failed in this environment and the original-data machine tunnel remains inactive."
+    "complete_installation": true,
+    "complete_iso_retained": true,
+    "bios_available": true,
+    "workspace_status": "User-supplied PS2 archive recovered and CRC-validated. Exact-profile ISO and ELF hashes verified; all 281 disc files extracted locally. Supplied BIOS available. Private input files and share credentials remain outside the repository.",
+    "iso_sha256": "2cabb2b619bb7d43da2ded3fcdaf496b6f237385e05a9922d3bcf1cc82d4a5c0",
+    "elf_sha256": "adf4944c5cdac23fcc4e9af9ef3ec1ba6234497e57cec2af2ff1a7a15c62a46f",
+    "bios_sha256": "6d23d001daf2a0fa8b381a5d49f51753c36e3622d0f04be46af1a0c548be4744",
+    "bios_bytes": 4194304,
+    "bios_execution_verified": false
   },
   "last_verified_original_installation": {
     "files": 281,
     "bytes": 4126918314,
     "complete_installation_verified": true,
-    "available_in_current_workspace": false
+    "available_in_current_workspace": true
+  },
+  "latest_regenerated_original_corpus": {
+    "patch_set": "0001-0047",
+    "functions": 7791,
+    "cpp_units": 7792,
+    "unresolved_source_lines": 0,
+    "explicit_stubs": 0,
+    "instruction_patches": 0,
+    "sources_manifest_sha256": "ae9f147aedbf649ab7f0dc4b862269a9d3085dd960724c3ed6938dbaaa8056a9",
+    "matches_historical_manifest": true,
+    "current_game_execution_verified": true,
+    "current_game_execution_scope": "Bounded startup and frontend-to-MPEG flow only; menu, movie playback, gameplay and saves unverified."
   }
 }
