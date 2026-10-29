@@ -1,0 +1,276 @@
+--- a/ps2xRuntime/include/runtime/gs/ps2_gs_common.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gs_common.h
+@@ -3,9 +3,24 @@
+ 
+ #include "runtime/gs/gs_types.h"
+ #include <cstdint>
++#include <cmath>
+ 
+ namespace GSInternal
+ {
++// Input positions and XYOFFSET are both 12.4 fixed point. All input
++// values and their signed differences are exactly representable in float.
++static inline float gsOffsetCoordinate(float vertex, uint16_t offset)
++{
++    return vertex - static_cast<float>(offset) * (1.0f / 16.0f);
++}
++
++// This retains the existing floor coverage policy, including negative
++// coordinates. It does not assert hardware-accurate point/sprite coverage.
++static inline int gsOffsetPixel(float vertex, uint16_t offset)
++{
++    return static_cast<int>(std::floor(gsOffsetCoordinate(vertex, offset)));
++}
++
+ static inline uint32_t bitsPerPixel(uint8_t psm)
+ {
+     switch (psm)
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -836,8 +836,8 @@
+     {
+         const GSVertex &v = batch.vertices[0];
+         const auto &ctx = state.context;
+-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
+-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
++        int px = gsOffsetPixel(v.x, ctx.xyoffset.ofx);
++        int py = gsOffsetPixel(v.y, ctx.xyoffset.ofy);
+         WritePixel(state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+         break;
+     }
+@@ -1166,13 +1166,10 @@
+     const GSVertex &v1 = batch.vertices[1];
+     const auto &ctx = state.context;
+ 
+-    int ofx = ctx.xyoffset.ofx >> 4;
+-    int ofy = ctx.xyoffset.ofy >> 4;
+-
+-    int x0 = static_cast<int>(v0.x) - ofx;
+-    int y0 = static_cast<int>(v0.y) - ofy;
+-    int x1 = static_cast<int>(v1.x) - ofx;
+-    int y1 = static_cast<int>(v1.y) - ofy;
++    int x0 = gsOffsetPixel(v0.x, ctx.xyoffset.ofx);
++    int y0 = gsOffsetPixel(v0.y, ctx.xyoffset.ofy);
++    int x1 = gsOffsetPixel(v1.x, ctx.xyoffset.ofx);
++    int y1 = gsOffsetPixel(v1.y, ctx.xyoffset.ofy);
+     u32 z1 = static_cast<u32>(v1.z);
+ 
+     if (x0 > x1)
+@@ -1283,15 +1280,12 @@
+     const GSVertex &v2 = batch.vertices[2];
+     const auto &ctx = state.context;
+ 
+-    int ofx = ctx.xyoffset.ofx >> 4;
+-    int ofy = ctx.xyoffset.ofy >> 4;
+-
+-    float fx0 = v0.x - static_cast<float>(ofx);
+-    float fy0 = v0.y - static_cast<float>(ofy);
+-    float fx1 = v1.x - static_cast<float>(ofx);
+-    float fy1 = v1.y - static_cast<float>(ofy);
+-    float fx2 = v2.x - static_cast<float>(ofx);
+-    float fy2 = v2.y - static_cast<float>(ofy);
++    float fx0 = gsOffsetCoordinate(v0.x, ctx.xyoffset.ofx);
++    float fy0 = gsOffsetCoordinate(v0.y, ctx.xyoffset.ofy);
++    float fx1 = gsOffsetCoordinate(v1.x, ctx.xyoffset.ofx);
++    float fy1 = gsOffsetCoordinate(v1.y, ctx.xyoffset.ofy);
++    float fx2 = gsOffsetCoordinate(v2.x, ctx.xyoffset.ofx);
++    float fy2 = gsOffsetCoordinate(v2.y, ctx.xyoffset.ofy);
+ 
+     int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
+     int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
+@@ -1400,13 +1394,10 @@
+     const GSVertex &v1 = batch.vertices[1];
+     const auto &ctx = state.context;
+ 
+-    int ofx = ctx.xyoffset.ofx >> 4;
+-    int ofy = ctx.xyoffset.ofy >> 4;
+-
+-    int x0 = static_cast<int>(v0.x) - ofx;
+-    int y0 = static_cast<int>(v0.y) - ofy;
+-    int x1 = static_cast<int>(v1.x) - ofx;
+-    int y1 = static_cast<int>(v1.y) - ofy;
++    int x0 = gsOffsetPixel(v0.x, ctx.xyoffset.ofx);
++    int y0 = gsOffsetPixel(v0.y, ctx.xyoffset.ofy);
++    int x1 = gsOffsetPixel(v1.x, ctx.xyoffset.ofx);
++    int y1 = gsOffsetPixel(v1.y, ctx.xyoffset.ofy);
+ 
+     int dx = std::abs(x1 - x0);
+     int dy = -std::abs(y1 - y0);
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/ps2_gs_common.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+@@ -1713,10 +1714,10 @@
+ 
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+-    int x0 = static_cast<int>(v0.x) - (ctx.xyoffset.ofx >> 4);
+-    int y0 = static_cast<int>(v0.y) - (ctx.xyoffset.ofy >> 4);
+-    int x1 = static_cast<int>(v1.x) - (ctx.xyoffset.ofx >> 4);
+-    int y1 = static_cast<int>(v1.y) - (ctx.xyoffset.ofy >> 4);
++    int x0 = GSInternal::gsOffsetPixel(v0.x, ctx.xyoffset.ofx);
++    int y0 = GSInternal::gsOffsetPixel(v0.y, ctx.xyoffset.ofy);
++    int x1 = GSInternal::gsOffsetPixel(v1.x, ctx.xyoffset.ofx);
++    int y1 = GSInternal::gsOffsetPixel(v1.y, ctx.xyoffset.ofy);
+     if (x0 > x1) std::swap(x0, x1);
+     if (y0 > y1) std::swap(y0, y1);
+     const int xEnd = x0 + std::max(1, x1 - x0) - 1;
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -35,6 +35,7 @@
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
++    src/ps2_gs_xyoffset_tests.cpp
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -16,6 +16,7 @@
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
++void register_ps2_gs_xyoffset_tests();
+ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+@@ -43,6 +44,7 @@
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
++    register_ps2_gs_xyoffset_tests();
+     register_ps2_iop_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
+--- /dev/null
++++ b/ps2xTest/src/ps2_gs_xyoffset_tests.cpp
+@@ -0,0 +1,123 @@
++// These tests preserve the current CPU backend floor coverage policy.
++// They do not assert that its pixel-center coverage is hardware-accurate.
++#include "MiniTest.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/ps2_gs_psmct32.h"
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <utility>
++#include <vector>
++
++namespace {
++using Image = std::array<uint32_t, 64>;
++Image render(uint64_t primitive, int32_t baseX, int32_t baseY,
++             int32_t shiftX, int32_t shiftY, int32_t left, int32_t top) {
++    std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++    GS gs;
++    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++    gs.writeRegister(GS_REG_FRAME_1, 1ull << 16);
++    gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
++    gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
++    const auto ox = baseX + shiftX, oy = baseY + shiftY;
++    gs.writeRegister(GS_REG_XYOFFSET_1, uint64_t(ox) | (uint64_t(oy) << 32));
++    gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++    gs.writeRegister(GS_REG_PRMODECONT, 1ull);
++    gs.writeRegister(GS_REG_PRIM, primitive);
++    gs.writeRegister(GS_REG_RGBAQ, 0x800000ffull);
++    auto xyz = [ox, oy](int32_t x, int32_t y) {
++        return uint64_t(x + ox) | (uint64_t(y + oy) << 16) | (1ull << 32);
++    };
++    gs.writeRegister(GS_REG_XYZ2, xyz(left, top));
++    if (primitive != GS_PRIM_POINT)
++        gs.writeRegister(GS_REG_XYZ2, xyz(left + 64, top + (primitive == GS_PRIM_SPRITE ? 64 : 0)));
++    if (primitive == GS_PRIM_TRIANGLE)
++        gs.writeRegister(GS_REG_XYZ2, xyz(left, top + 64));
++    Image pixels{};
++    for (uint32_t y = 0; y < 8; ++y)
++        for (uint32_t x = 0; x < 8; ++x) {
++            const auto addr = GSPSMCT32::addrPSMCT32(0u, 1u, x, y);
++            std::memcpy(&pixels[y * 8 + x], vram.data() + addr, sizeof(uint32_t));
++        }
++    return pixels;
++}
++uint32_t count(const Image& image) {
++    uint32_t result = 0;
++    for (auto pixel : image) result += pixel != 0;
++    return result;
++}
++struct Preferred { bool exists; GSFrameReg frame; uint32_t dest; };
++Preferred displayCopy(bool full) {
++    std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++    GS gs;
++    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++    const uint32_t ox = (1728u << 4) + 8u, oy = 1808u << 4;
++    const uint32_t x0 = full ? (1728u << 4) + 16u : ox;
++    const uint32_t x1 = ox + 640u * 16u - (full ? 0u : 1u);
++    const uint32_t y0 = oy, y1 = oy + 448u * 16u;
++    gs.writeRegister(GS_REG_FRAME_2, 150ull | (10ull << 16));
++    // Small scissor keeps this unit test cheap; preferred-source detection
++    // depends on primitive geometry, as in the production frontend.
++    gs.writeRegister(GS_REG_SCISSOR_2, 0ull);
++    gs.writeRegister(GS_REG_XYOFFSET_2, uint64_t(ox) | (uint64_t(oy) << 32));
++    gs.writeRegister(GS_REG_ALPHA_2, 0x6000000064ull);
++    gs.writeRegister(GS_REG_TEST_2, 0x30000ull);
++    gs.writeRegister(GS_REG_TEX0_2, (10ull << 14) | (10ull << 26) | (9ull << 30) | (1ull << 34));
++    gs.writeRegister(GS_REG_PRMODECONT, 1ull);
++    gs.writeRegister(GS_REG_PRIM, uint64_t(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 6) | (1ull << 8) | (1ull << 9));
++    gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
++    gs.writeRegister(GS_REG_UV, 0ull);
++    gs.writeRegister(GS_REG_XYZ2, uint64_t(x0) | (uint64_t(y0) << 16) | (1ull << 32));
++    gs.writeRegister(GS_REG_UV, 0ull);
++    gs.writeRegister(GS_REG_XYZ2, uint64_t(x1) | (uint64_t(y1) << 16) | (1ull << 32));
++    Preferred p{};
++    p.exists = gs.getPreferredDisplaySource(p.frame, p.dest);
++    return p;
++}
++}
++void register_ps2_gs_xyoffset_tests() {
++    MiniTest::Case("GSSubpixelXYOffset", [](TestCase &tests) {
++        tests.Run("independent X/Y translations and clipped negative positions", [](TestCase &t) {
++            for (uint64_t prim : {uint64_t(GS_PRIM_POINT), uint64_t(GS_PRIM_LINE),
++                                  uint64_t(GS_PRIM_SPRITE), uint64_t(GS_PRIM_TRIANGLE)}) {
++                for (const auto& base : {std::pair{0x20, 0x30}, std::pair{0x7ff0, 0x3ff0}, std::pair{0xff00, 0xfe00}}) {
++                    for (const auto& origin : {std::pair{24,24}, std::pair{-8,24}, std::pair{24,-8}}) {
++                        const auto reference = render(prim, base.first, base.second, 0, 0, origin.first, origin.second);
++                        const bool fullyClipped = (prim == GS_PRIM_POINT &&
++                                                   (origin.first < 0 || origin.second < 0)) ||
++                                                  (prim == GS_PRIM_LINE && origin.second < 0);
++                        if (fullyClipped)
++                            t.Equals(count(reference), 0u, "negative primitive clipped under current floor policy");
++                        else
++                            t.IsTrue(count(reference) != 0, "expected visible baseline");
++                        for (const auto& shift : {std::pair{1,0}, std::pair{0,1}, std::pair{8,15}, std::pair{15,8}}) {
++                            const auto actual = render(prim, base.first, base.second, shift.first, shift.second, origin.first, origin.second);
++                            for (size_t i=0;i<reference.size();++i)
++                                t.Equals(actual[i], reference[i], "independent XYZ and offset translation must not move geometry");
++                        }
++                    }
++                }
++            }
++        });
++        tests.Run("reference footprint under current policy", [](TestCase &t) {
++            t.Equals(count(render(GS_PRIM_POINT, 0x8008, 0x7ff3, 0,0,-1,8)), 0u, "negative X point clipped by floor policy");
++            t.Equals(count(render(GS_PRIM_POINT, 0x8008, 0x7ff3, 0,0,0,8)), 1u, "control point stays visible");
++            const auto sprite = render(GS_PRIM_SPRITE, 0x8008, 0x7ff3, 0,0,-1,-1);
++            // For this fixed-size helper, endpoints are [-1/16,63/16) on both
++            // axes, so clipped coverage is x,y=0..2 under the current policy.
++            t.Equals(count(sprite), 9u, "clipped sprite footprint follows current integer floor policy");
++        });
++        tests.Run("preferred display copy matches fractional sprite bounds", [](TestCase &t) {
++            const auto shortCopy = displayCopy(false);
++            const auto fullCopy = displayCopy(true);
++            t.IsFalse(shortCopy.exists, "639px copy must not be treated as full display");
++            t.IsTrue(fullCopy.exists, "full display copy must be recognized");
++            if (fullCopy.exists) {
++                t.Equals(fullCopy.frame.fbp, 0u, "preferred source");
++                t.Equals(fullCopy.frame.fbw, 10u, "preferred width");
++                t.Equals(fullCopy.dest, 150u, "preferred destination");
++            }
++        });
++    });
++}
