@@ -1,0 +1,651 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index c41d595..a1fb684 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -27,6 +27,8 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::reset()
+     {
++        if (hasNativeWaits())
++            throw std::runtime_error("IOP reset cannot retire a live native-call owner");
+         m_threads.clear();
+         m_semaphores.clear();
+         m_eventFlags.clear();
+@@ -81,6 +83,8 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (it->second.nativeWait)
++                throw std::runtime_error("IOP thread lifecycle change targets a live native-call owner");
+             if (it->second.stackBase != 0u)
+                 (void)m_memory.freeAllocation(it->second.stackBase);
+             m_threads.erase(it);
+@@ -97,6 +101,8 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (it->second.nativeWait)
++                throw std::runtime_error("IOP thread lifecycle change targets a live native-call owner");
+             IopThread &thread = it->second;
+             thread.cpu = {};
+             thread.cpu.pc = thread.entry;
+@@ -133,6 +139,8 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (it->second.nativeWait)
++                throw std::runtime_error("IOP thread lifecycle change targets a live native-call owner");
+             it->second.state = IopThreadState::Dormant;
+             setV0(0);
+             return true;
+@@ -300,6 +308,8 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (it->second.nativeWait)
++                throw std::runtime_error("IOP thread lifecycle change targets a live native-call owner");
+             it->second.state = (it->second.state == IopThreadState::Mailbox ||
+                                 it->second.state == IopThreadState::MailboxSuspended) ?
+                 IopThreadState::MailboxSuspended : IopThreadState::Suspended;
+@@ -318,6 +328,8 @@ namespace ps2x::iop::detail
+                 setV0(-1);
+                 return true;
+             }
++            if (it->second.nativeWait)
++                throw std::runtime_error("IOP thread lifecycle change targets a live native-call owner");
+             if (it->second.state == IopThreadState::Suspended)
+                 makeReady(it->second);
+             else if (it->second.state == IopThreadState::MailboxSuspended)
+@@ -740,6 +752,92 @@ namespace ps2x::iop::detail
+         cpu.yielded = true;
+     }
+ 
++    IopKernel::NativeWaitToken IopKernel::parkNativeCaller(int eventId)
++    {
++        // Native frames unwind in LIFO order, unlike independently scheduled
++        // guest threads. Do not silently reverse two waiting callers' priority.
++        if (hasNativeWaits())
++            throw std::runtime_error("IOP concurrent native waits require independently resumable call frames");
++        if (m_currentThread == nullptr || m_currentThread->nativeWait ||
++            m_currentThread->state != IopThreadState::Running)
++            throw std::runtime_error("IOP native wait requires a running managed caller");
++        if (m_eventFlags.find(eventId) == m_eventFlags.end())
++            throw std::runtime_error("IOP native wait requires a live completion event");
++        if (m_nextReadyOrder == std::numeric_limits<uint64_t>::max())
++            throw std::runtime_error("IOP thread ready ordering exhausted");
++        const NativeWaitToken token{m_currentThread->id, m_currentThread->cpu};
++        m_currentThread->nativeWait = true;
++        ++m_nativeWaitCount;
++        rearmNativeCaller(token, eventId);
++        m_currentThread = nullptr;
++        m_reschedulePending = true;
++        return token;
++    }
++
++    void IopKernel::rearmNativeCaller(const NativeWaitToken &token, int eventId)
++    {
++        const auto found = m_threads.find(token.threadId);
++        const auto event = m_eventFlags.find(eventId);
++        if (found == m_threads.end() || !found->second.nativeWait || event == m_eventFlags.end())
++            throw std::runtime_error("IOP native wait lost its caller or completion event");
++        IopThread &thread = found->second;
++        const bool ready = eventSatisfied(event->second, 1u, 0u);
++        if (ready && thread.state != IopThreadState::Ready)
++            makeReady(thread);
++        else if (!ready)
++            thread.state = IopThreadState::EventFlag;
++        thread.waitId = eventId;
++        thread.waitBits = 1u;
++        thread.waitMode = 0u;
++        thread.waitResultAddress = 0u;
++    }
++
++    bool IopKernel::nativeCallerCanResume(const NativeWaitToken &token) const noexcept
++    {
++        const auto found = m_threads.find(token.threadId);
++        if (found == m_threads.end() || !found->second.nativeWait ||
++            found->second.state != IopThreadState::Ready || m_memory.interruptControl() == 0u)
++            return false;
++        const IopThread &owner = found->second;
++        for (const auto &[id, peer] : m_threads)
++        {
++            if (peer.nativeWait)
++                continue;
++            // Same-priority running work keeps its timeslice. Ready work uses
++            // the same FIFO order as beginNextReady, not native call depth.
++            if (peer.state == IopThreadState::Running && peer.priority <= owner.priority)
++                return false;
++            if (peer.state == IopThreadState::Ready &&
++                (peer.priority < owner.priority ||
++                 (peer.priority == owner.priority && peer.readyOrder < owner.readyOrder)))
++                return false;
++        }
++        return true;
++    }
++
++    void IopKernel::restoreNativeCaller(const NativeWaitToken &token) noexcept
++    {
++        // Reset, deletion, restart and module retirement reject pinned owners.
++        // No allocation or throwing queue operation is allowed during unwind.
++        const auto found = m_threads.find(token.threadId);
++        if (found == m_threads.end() || !found->second.nativeWait)
++            return;
++        for (auto &[id, peer] : m_threads)
++            if (peer.state == IopThreadState::Running)
++                peer.state = IopThreadState::Ready;
++        IopThread &thread = found->second;
++        thread.cpu = token.callerCpu;
++        thread.state = IopThreadState::Running;
++        thread.waitId = 0;
++        thread.waitBits = 0u;
++        thread.waitMode = 0u;
++        thread.waitResultAddress = 0u;
++        thread.nativeWait = false;
++        --m_nativeWaitCount;
++        m_currentThread = &thread;
++        m_reschedulePending = true;
++    }
++
+     void IopKernel::sleepCurrent(IopCpuState &cpu)
+     {
+         if (m_currentThread == nullptr)
+@@ -778,7 +876,8 @@ namespace ps2x::iop::detail
+             return false;
+         m_reschedulePending = false;
+         for (const auto &[id, thread] : m_threads)
+-            if (thread.state == IopThreadState::Ready && thread.priority < m_currentThread->priority)
++            if (!thread.nativeWait && thread.state == IopThreadState::Ready &&
++                thread.priority < m_currentThread->priority)
+                 return true;
+         return false;
+     }
+@@ -795,6 +894,8 @@ namespace ps2x::iop::detail
+         IopThread *next = nullptr;
+         for (auto &[id, thread] : m_threads)
+         {
++            if (thread.nativeWait)
++                continue;
+             if (thread.state == IopThreadState::Running)
+                 running = &thread;
+             if (thread.state != IopThreadState::Ready)
+@@ -857,7 +958,7 @@ namespace ps2x::iop::detail
+     {
+         for (auto thread = m_threads.begin(); thread != m_threads.end();)
+         {
+-            if (thread->second.state != IopThreadState::Dead)
++            if (thread->second.state != IopThreadState::Dead || thread->second.nativeWait)
+             {
+                 ++thread;
+                 continue;
+@@ -870,6 +971,12 @@ namespace ps2x::iop::detail
+ 
+     void IopKernel::terminateThreadsInRange(uint32_t base, uint32_t size)
+     {
++        for (const auto &[id, thread] : m_threads)
++        {
++            const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
++            if (thread.nativeWait && pc >= base && uint64_t{pc} < uint64_t{base} + size)
++                throw std::runtime_error("IOP module retirement targets a live native-call owner");
++        }
+         for (auto &[id, thread] : m_threads)
+         {
+             const uint32_t pc = IopMemory::physicalAddress(thread.cpu.pc);
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 971919e..ec6b414 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -47,6 +47,7 @@ namespace ps2x::iop::detail
+         uint64_t mailboxWaitOrder = 0u;
+         uint64_t mailboxWaitOwner = 0u;
+         int wakeupCount = 0;
++        bool nativeWait = false;
+     };
+ 
+     class IopKernel
+@@ -71,6 +72,19 @@ namespace ps2x::iop::detail
+         // CPU. The importer retries its condition after this event wakes it.
+         void waitCurrentEvent(IopCpuState &cpu, int eventId, uint32_t bits);
+ 
++        // A synchronous guest driver has a separate CPU/native call frame. Its
++        // managed caller must not be redispatched while that frame is alive.
++        struct NativeWaitToken
++        {
++            int threadId;
++            IopCpuState callerCpu;
++        };
++        [[nodiscard]] NativeWaitToken parkNativeCaller(int eventId);
++        void rearmNativeCaller(const NativeWaitToken &token, int eventId);
++        void restoreNativeCaller(const NativeWaitToken &token) noexcept;
++        [[nodiscard]] bool nativeCallerCanResume(const NativeWaitToken &token) const noexcept;
++        [[nodiscard]] bool hasNativeWaits() const noexcept { return m_nativeWaitCount != 0u; }
++
+         void sleepCurrent(IopCpuState &cpu);
+         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
+ 
+@@ -132,6 +146,7 @@ namespace ps2x::iop::detail
+         uint64_t m_nextMailboxWaitOrder = 1u;
+         uint64_t m_nextReadyOrder = 1u;
+         bool m_reschedulePending = false;
++        size_t m_nativeWaitCount = 0u;
+         IopThread *m_currentThread = nullptr;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 1c0e8f5..0095fb1 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -367,6 +367,10 @@ namespace ps2x::iop::detail
+ 
+         void reset()
+         {
++            // A reentrant host hook must fail before clearing RAM or the map
++            // containing a managed CPU still referenced by a native call frame.
++            if (kernel.hasNativeWaits())
++                throw std::runtime_error("IOP reset cannot retire a live native-call owner");
+             memory.reset();
+             // Direct guest calls use this reserved kernel stack, including the
+             // caller's O32 argument home area. Own the whole bounded arena once
+@@ -567,14 +571,23 @@ namespace ps2x::iop::detail
+                 kernel.waitCurrentEvent(cpu, wait.eventId, 1u);
+                 return ImportDisposition::RetryAfterWait;
+             }
+-            // External startup/RPC calls own a separate CPU and native call
+-            // stack. Do not park an unrelated managed caller on their behalf.
+-            if (kernel.hasCurrentThread())
+-                executionFailure("blocking CDVD sync in a nested managed-thread invocation is unsupported", cpu);
+             if (!activeInvocationBudget)
+                 executionFailure("blocking CDVD sync has no owned invocation budget", cpu);
++            // The driver CPU is not its managed caller's CPU. Pin that caller
++            // until this native frame unwinds, while scheduling real peer CPUs.
++            // Event wakeup may make the owner ready, but must never redispatch
++            // its still-active IOMAN import or overwrite its saved registers.
++            struct NativeWaitScope
++            {
++                IopKernel &kernel;
++                std::optional<IopKernel::NativeWaitToken> token;
++                ~NativeWaitScope() { if (token) kernel.restoreNativeCaller(*token); }
++            } owner{kernel, {}};
++            if (kernel.hasCurrentThread())
++                owner.token = kernel.parkNativeCaller(wait.eventId);
+             const InvocationBudget budget = *activeInvocationBudget;
+-            while (!cdvd.syncWaitComplete(wait))
++            while (!cdvd.syncWaitComplete(wait) ||
++                   (owner.token && !kernel.nativeCallerCanResume(*owner.token)))
+             {
+                 if (totalCycles >= budget.cycleLimit ||
+                     totalInstructions - budget.instructionStart >= budget.instructions)
+@@ -582,7 +595,10 @@ namespace ps2x::iop::detail
+                 // Preserve this invocation CPU/stack while normal IOP threads,
+                 // alarms and device IRQs make progress. Idle cycles count too:
+                 // a permanently masked IRQ cannot hang the host indefinitely.
+-                runCycles(std::min<uint64_t>(kDefaultSlice, budget.cycleLimit - totalCycles));
++                if (owner.token)
++                    kernel.rearmNativeCaller(*owner.token, wait.eventId);
++                runCycles(std::min<uint64_t>(kDefaultSlice, budget.cycleLimit - totalCycles),
++                          owner.token ? &wait : nullptr, owner.token ? &*owner.token : nullptr);
+                 checkExecutionFailure();
+             }
+             cpu.gpr[2] = 0u;
+@@ -954,7 +970,9 @@ namespace ps2x::iop::detail
+             return running;
+         }
+ 
+-        uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
++        uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget,
++                        const IopCdvd::SyncWait *nativeSync = nullptr,
++                        const IopKernel::NativeWaitToken *nativeOwner = nullptr)
+         {
+             const RestoreValue activeGuard(activeCpu, &cpu);
+             const uint64_t start = totalInstructions;
+@@ -972,6 +990,9 @@ namespace ps2x::iop::detail
+                         servicePendingDmaInterrupts();
+                     if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                         servicePendingGuestCallbacks();
++                    if (nativeOwner && cdvd.syncWaitComplete(*nativeSync) &&
++                        kernel.nativeCallerCanResume(*nativeOwner))
++                        break;
+                     if (kernel.shouldReschedule(cpu))
+                         break;
+                 }
+@@ -1209,7 +1230,8 @@ namespace ps2x::iop::detail
+             servicingGuestCallbacks = false;
+         }
+ 
+-        void runCycles(uint64_t cycles) noexcept
++        void runCycles(uint64_t cycles, const IopCdvd::SyncWait *nativeSync = nullptr,
++                       const IopKernel::NativeWaitToken *nativeOwner = nullptr) noexcept
+         {
+             if (!lastError.empty())
+                 return;
+@@ -1227,7 +1249,9 @@ namespace ps2x::iop::detail
+                     timrman.serviceDue(totalCycles, *this, intrman);
+                     // Guest interrupt/callback instructions count toward this
+                     // budget and may already have consumed its final cycles.
+-                    if (totalCycles >= target)
++                    if (totalCycles >= target ||
++                        (nativeOwner && cdvd.syncWaitComplete(*nativeSync) &&
++                         kernel.nativeCallerCanResume(*nativeOwner)))
+                         break;
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+@@ -1246,7 +1270,8 @@ namespace ps2x::iop::detail
+                     }
+                     const uint64_t before = totalCycles;
+                     const RestoreValue strictGuard(strictExecution, strictExecution || strictAddress(next->entry));
+-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)),
++                           nativeSync, nativeOwner);
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
+@@ -1254,6 +1279,8 @@ namespace ps2x::iop::detail
+             }
+             catch (const std::exception &error)
+             {
++                if (nativeOwner)
++                    rememberExecutionFailure(std::string("Strict IOP native wait: ") + error.what());
+                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
+                 // runCpu and strict callbacks preserve the first strict error before
+                 // their context guards unwind. The next packet/poll gate reports it.
+diff --git a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+index c3132e2..1b76411 100644
+--- a/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
++++ b/ps2xIOP/tests/iop_cdvd_ncmd_tests.cpp
+@@ -12,6 +12,8 @@
+ #include "iop_cdvd_sync_fixtures.h"
+ #include "iop_cdvd_break_fixtures.h"
+ 
++#include "iop_cdvd_nested_sync_fixtures.h"
++
+ namespace
+ {
+     using namespace ps2x::iop;
+@@ -470,6 +472,18 @@ namespace
+ int main()
+ {
+     const iop_test::Test tests[] = {
++        {"Native completion respects priority and same-priority continuations", iop_cdvd_nested_sync_test::nativeResumeRespectsPriorityAndRunningPeers},
++        {"Managed Devctl sync preserves caller and driver CPUs", iop_cdvd_nested_sync_test::managedDriverPreservesBothCpus},
++        {"Nested driver waits schedule peers without redispatching their owner", iop_cdvd_nested_sync_test::maskedDriverWaitRunsPeersWithoutReenteringOwner},
++        {"Nested sync rechecks successor read completion", iop_cdvd_nested_sync_test::successorReadMustFinishBeforeManagedDriverReturns},
++        {"Concurrent native waits retain an explicit scheduling boundary", iop_cdvd_nested_sync_test::concurrentNativeWaitsRemainAnExplicitBoundary},
++        {"Managed driver sync retains completed media errors", iop_cdvd_nested_sync_test::mediaErrorIsNotLostInsideTheDriver},
++        {"Callback failure unwinds pinned callers and remains sticky", iop_cdvd_nested_sync_test::callbackFailureUnwindsThePinnedCaller},
++        {"Deleted events cannot release a native continuation", iop_cdvd_nested_sync_test::deletedEventCannotReleaseNativeContinuation},
++        {"Pinned caller lifecycle changes fail before invalidating live frames", iop_cdvd_nested_sync_test::pinnedCallerLifecycleChangesFailBeforeMutation},
++        {"Reentrant reset fails before clearing native-owner RAM", iop_cdvd_nested_sync_test::resetDuringNativeHostIoFailsBeforeClearingRam},
++        {"Permanently masked nested waits remain bounded", iop_cdvd_nested_sync_test::permanentMaskCannotHangOrLeakNativeWait},
++        {"Forced wake cannot redispatch an active driver import", iop_cdvd_nested_sync_test::forcedWakeDoesNotRedispatchTheBorrowedCaller},
+         {"External sync retains callback failures until a clean reset", iop_cdvd_sync_test::callbackFailureDuringExternalWaitStaysSticky},
+         {"A CPU-disabled sync wait cannot fabricate interrupt progress", iop_cdvd_sync_test::disabledCpuWaitCannotInventInterruptProgress},
+         {"Sync returns to the same authored caller after read/Nop/abort completion", iop_cdvd_sync_test::directWaitsPreserveTheCaller},
+@@ -481,7 +495,7 @@ int main()
+         {"Deleting the shared event cannot fabricate completed sync", iop_cdvd_sync_test::deletionCannotMasqueradeAsCompletion},
+         {"Full IOP reset discards sleeping sync callers", iop_cdvd_sync_test::fullResetDiscardsSleepingSyncCallers},
+         {"Supplied sync exports and major versions remain authoritative", iop_cdvd_sync_test::suppliedExportsKeepTheirOwnSyncSemantics},
+-        {"IRQ and nested managed blocking calls preserve explicit boundaries", iop_cdvd_sync_test::interruptAndNestedManagedWaitsStayExplicit},
++        {"IRQ blocking calls preserve their explicit boundary", iop_cdvd_sync_test::interruptWaitsStayExplicit},
+         {"Permanently masked external sync stops at its owned budget", iop_cdvd_sync_test::permanentlyMaskedExternalWaitIsBoundedAndSticky},
+         {"Unsupported timed and stream-wide waits remain strict", iop_cdvd_sync_test::unsupportedWaitModesAreNotPretendedComplete},
+         {"Completed read errors do not turn into successful sync payload", iop_cdvd_sync_test::mediaFailureCompletesWaitWithoutSuccessfulPayload},
+diff --git a/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h b/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h
+new file mode 100644
+index 0000000..f7feb5b
+--- /dev/null
++++ b/ps2xIOP/tests/iop_cdvd_nested_sync_fixtures.h
+@@ -0,0 +1,224 @@
++#pragma once
++
++#include "iop_cdvd_sync_fixtures.h"
++
++namespace iop_cdvd_nested_sync_test
++{
++    using namespace iop_cdvd_sync_test;
++
++    struct NestedProgram : SyncProgram
++    {
++        NestedProgram() { imports(0x1900u, "thbase", {20u, 5u, 6u, 10u, 29u, 31u, 18u, 14u}); }
++        void entry(bool peer = false)
++        {
++            begin(); driver(); thread(0x400u, 0x2500u, 20u, 0x70u);
++            if (peer) thread(0x800u, 0x2540u, 60u, 0x74u);
++            finish();
++        }
++        void caller(uint32_t code = 0x400u, uint32_t result = 0x90u)
++        {
++            begin(code); constant(28u, 0x55667788u); store(29u, data(result));
++            devctl(); store(2u, data(result + 4u)); store(28u, data(result + 8u));
++            store(29u, data(result + 12u)); mark(1u, result + 16u); finish();
++        }
++        void driverBody(uint32_t mode = 0u, unsigned command = 1u, bool masked = false)
++        {
++            begin(0x600u); store(29u, data(0xB0u)); store(28u, data(0xB4u));
++            call(stub(0x1900u)); store(2u, data(0xB8u));
++            load(8u, data(0xC0u)); emit(0x25080001u); store(8u, data(0xC0u));
++            stream(); if (masked) mask(false);
++            if (command == 0u) cd(0u); else read();
++            if (command == 2u) cd(5u);
++            sync(mode); call(stub(0x1900u)); store(2u, data(0xBCu)); finish(0x456u);
++            recordingHandler(0xA00u, 0u);
++        }
++    };
++
++    void returned(IopEmulator &iop, const NestedProgram &p, uint32_t result = 0x90u)
++    {
++        require(word(iop, p.data(result + 4u)) == 0x456u &&
++                    word(iop, p.data(result + 8u)) == 0x55667788u &&
++                    word(iop, p.data(result)) == word(iop, p.data(result + 12u)) &&
++                    word(iop, p.data(result + 16u)) == 1u,
++                "managed Devctl lost its caller's return value, GP, stack or continuation");
++    }
++
++    void managedDriverPreservesBothCpus()
++    {
++        for (uint32_t mode : {0u, 5u})
++        for (unsigned command = 0u; command < 3u; ++command)
++        {
++            DiscHost host; IopEmulator iop(host); NestedProgram p;
++            p.entry(); p.caller(); p.driverBody(mode, command);
++            prepare(iop); start(iop, p); advance(iop, 10000u);
++            returned(iop, p); continued(iop, p);
++            require(word(iop, p.data(0xB8u)) == word(iop, p.data(0x70u)) &&
++                        word(iop, p.data(0xBCu)) == word(iop, p.data(0x70u)) &&
++                        word(iop, p.data(0xB4u)) == 0x11223344u &&
++                        word(iop, p.data(0xB0u)) != word(iop, p.data(0x90u)) &&
++                        word(iop, p.data(0xC0u)) == 1u && host.reads == (command == 1u ? 1u : 0u),
++                    "driver sync changed thread identity, reused the caller stack or replayed its import");
++            if (command == 1u) matches(iop, host);
++        }
++    }
++
++    void maskedDriverWaitRunsPeersWithoutReenteringOwner()
++    {
++        for (uint64_t chunk : {1u, 17u, 10000u})
++        {
++            DiscHost host; IopEmulator iop(host); NestedProgram p;
++            p.entry(true); p.caller(); p.driverBody(0u, 1u, true);
++            p.begin(0x800u);
++            p.load(4u, p.data(0x70u)); p.constant(5u, p.data(0x600u)); p.call(p.stub(0x1600u, 1u));
++            p.mark(1u, 0xD0u); p.delay(100u); p.load(8u, p.data(0xA0u)); p.store(8u, p.data(0xD4u));
++            p.mask(true); p.finish();
++            prepare(iop); start(iop, p);
++            for (uint64_t elapsed = 0; elapsed < 10000u; elapsed += chunk) advance(iop, chunk);
++            returned(iop, p); matches(iop, host);
++            require(word(iop, p.data(0xD0u)) == 1u && word(iop, p.data(0xD4u)) == 0u &&
++                        word(iop, p.data(0x608u)) == 4u && word(iop, p.data(0x624u)) == 4u &&
++                        word(iop, p.data(0xC0u)) == 1u && host.reads == 1u,
++                    "nested sync starved a peer, hid the event wait or redispatched the active Devctl");
++        }
++    }
++
++    void successorReadMustFinishBeforeManagedDriverReturns()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.entry(); p.caller(); p.driverBody();
++        p.begin(0xA00u); p.load(8u, p.data()); p.emit(0x25080001u); p.store(8u, p.data());
++        p.constant(9u, 1u);
++        const uint32_t branch = p.cursor; p.emit(0u); p.emit(0u);
++        p.read(3u, buffer + 0x2000u);
++        const uint32_t done = p.cursor;
++        p.image.words(branch, {0x15090000u | static_cast<uint16_t>((done - branch - 4u) / 4u)});
++        p.finish();
++        prepare(iop); start(iop, p); advance(iop, 10000u);
++        returned(iop, p); continued(iop, p, 2u); matches(iop, host); matches(iop, host, 3u, buffer + 0x2000u);
++        require(host.reads == 2u && word(iop, p.data(0xC0u)) == 1u,
++                "successor wakeup replayed a managed import or returned before the second read");
++    }
++
++    void concurrentNativeWaitsRemainAnExplicitBoundary()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.begin(); p.driver(); p.thread(0x400u, 0x2500u, 20u, 0x70u);
++        p.thread(0x800u, 0x2540u, 40u, 0x74u); p.finish();
++        p.caller(); p.caller(0x800u, 0xE0u); p.driverBody(0u, 1u, true);
++        prepare(iop); start(iop, p);
++        rejects([&] { advance(iop, 12000u); }, "concurrent native waits");
++        require(word(iop, p.data(0xA0u)) == 0u && word(iop, p.data(0xF0u)) == 0u &&
++                    word(iop, p.data(0xC0u)) == 2u,
++                "independent guest callers were incorrectly resumed in native LIFO order");
++        iop.reset();
++    }
++
++    void mediaErrorIsNotLostInsideTheDriver()
++    {
++        DiscHost host; host.failRead = true; IopEmulator iop(host); NestedProgram p;
++        p.entry(); p.caller(); p.driverBody();
++        // Replace only the driver's final return; preserve the sync body.
++        p.cursor = 0x600u;
++        p.begin(0x600u); p.stream(); p.read(); p.sync(); p.cd(6u); p.store(2u, p.data(0xD0u)); p.finish(0x456u);
++        prepare(iop); start(iop, p); advance(iop, 10000u); returned(iop, p);
++        require(word(iop, p.data(0xD0u)) == 0x30u && word(iop, buffer) == 0xCCCCCCCCu && host.reads == 1u,
++                "nested sync turned a completed read error into a successful payload");
++    }
++
++    void callbackFailureUnwindsThePinnedCaller()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.entry(); p.caller(); p.driverBody();
++        p.begin(0xA00u); p.call(p.stub(0x1400u)); p.finish();
++        prepare(iop); start(iop, p);
++        rejects([&] { advance(iop, 10000u); }, "missing import absent:42");
++        const auto count = iop.instructions(); iop.runEeCycles(100000u);
++        rejects([&] { iop.checkExecutionFailure(); }, "missing import absent:42");
++        require(iop.instructions() == count && word(iop, p.data(0xA0u)) == 0u && host.reads == 1u,
++                "callback failure resumed the owner or lost the sticky failure");
++        iop.reset(); NestedProgram clean; clean.entry(); clean.caller(); clean.driverBody();
++        prepare(iop); start(iop, clean); advance(iop, 10000u); returned(iop, clean);
++    }
++
++    void deletedEventCannotReleaseNativeContinuation()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.entry(true); p.caller(); p.driverBody(0u, 1u, true);
++        p.begin(0x800u); p.cd(2u, uint32_t(-11)); p.move(4u, 2u); p.call(p.stub(0x1300u)); p.finish();
++        prepare(iop); start(iop, p);
++        rejects([&] { advance(iop, 10000u); }, "event flag was deleted");
++        require(word(iop, p.data(0xA0u)) == 0u, "deleted event let a native caller continue");
++        iop.reset();
++    }
++
++    void pinnedCallerLifecycleChangesFailBeforeMutation()
++    {
++        for (uint32_t operation : {1u, 2u, 3u, 4u, 5u})
++        {
++            DiscHost host; IopEmulator iop(host); NestedProgram p;
++            p.entry(true); p.caller(); p.driverBody(0u, 1u, true);
++            p.begin(0x800u); p.load(4u, p.data(0x70u)); p.call(p.stub(0x1900u, operation));
++            p.mark(1u, 0xD0u); p.finish();
++            prepare(iop); start(iop, p);
++            rejects([&] { advance(iop, 10000u); }, "live native-call owner");
++            require(word(iop, p.data(0xA0u)) == 0u && word(iop, p.data(0xD0u)) == 0u,
++                    "lifecycle change resumed or erased a CPU with an active native frame");
++            iop.reset();
++        }
++    }
++
++    void resetDuringNativeHostIoFailsBeforeClearingRam()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.entry(); p.caller(); p.driverBody();
++        prepare(iop); start(iop, p); host.onRead = [&] { iop.reset(); };
++        rejects([&] { advance(iop, 10000u); }, "live native-call owner");
++        require(word(iop, buffer) == 0xCCCCCCCCu && word(iop, p.data(0xC0u)) == 1u &&
++                    word(iop, p.data(0xA0u)) == 0u, "reset partly cleared RAM before rejecting the live frame");
++        host.onRead = {}; iop.reset();
++        NestedProgram clean; clean.entry(); clean.caller(); clean.driverBody();
++        prepare(iop); start(iop, clean); advance(iop, 10000u); returned(iop, clean);
++    }
++
++    void permanentMaskCannotHangOrLeakNativeWait()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.entry(); p.caller(); p.driverBody(0u, 1u, true);
++        prepare(iop); start(iop, p);
++        rejects([&] { advance(iop, 10000u); }, "blocking CDVD sync exhausted its invocation budget");
++        require(host.reads == 1u && word(iop, p.data(0xA0u)) == 0u && word(iop, p.data(0xC0u)) == 1u,
++                "masked wait replayed the driver or invented completion");
++        iop.reset();
++    }
++
++    void forcedWakeDoesNotRedispatchTheBorrowedCaller()
++    {
++        DiscHost host; IopEmulator iop(host); NestedProgram p;
++        p.entry(true); p.caller(); p.driverBody(0u, 1u, true);
++        p.begin(0x800u); p.load(4u, p.data(0x70u)); p.call(p.stub(0x1900u, 6u));
++        p.delay(100u); p.mask(true); p.finish();
++        prepare(iop); start(iop, p); advance(iop, 10000u); returned(iop, p); matches(iop, host);
++        require(word(iop, p.data(0xC0u)) == 1u && host.reads == 1u,
++                "forced event wake redispatched the active native caller");
++    }
++    void nativeResumeRespectsPriorityAndRunningPeers()
++    {
++        for (uint32_t peerPriority : {10u, 20u, 60u})
++        {
++            DiscHost host; IopEmulator iop(host); NestedProgram p;
++            p.begin(); p.driver(); p.thread(0x400u, 0x2500u, 20u, 0x70u);
++            p.thread(0x800u, 0x2540u, peerPriority, 0x74u); p.finish();
++            p.begin(0x400u); p.constant(28u, 0x55667788u); p.store(29u, p.data(0x90u));
++            p.devctl(); p.store(2u, p.data(0x94u)); p.store(28u, p.data(0x98u)); p.store(29u, p.data(0x9Cu));
++            p.load(8u, p.data(0xD0u)); p.store(8u, p.data(0xD8u)); p.mark(1u, 0xA0u); p.finish();
++            p.driverBody(0u, 1u, true);
++            p.begin(0x800u); p.delay(100u); p.mask(true); p.mark(1u, 0xD0u); p.finish();
++            prepare(iop); start(iop, p); advance(iop, 12000u); returned(iop, p); matches(iop, host);
++            require(word(iop, p.data(0xD0u)) == 1u &&
++                        word(iop, p.data(0xD8u)) == (peerPriority <= 20u ? 1u : 0u),
++                    "native completion preempted equal/higher-priority work or ran a lower-priority peer past wakeup");
++            require(word(iop, p.data(0xC0u)) == 1u, "priority handoff redispatched the borrowed import");
++        }
++    }
++
++}
+diff --git a/ps2xIOP/tests/iop_cdvd_sync_fixtures.h b/ps2xIOP/tests/iop_cdvd_sync_fixtures.h
+index cf89a15..bddbfe4 100644
+--- a/ps2xIOP/tests/iop_cdvd_sync_fixtures.h
++++ b/ps2xIOP/tests/iop_cdvd_sync_fixtures.h
+@@ -251,7 +251,7 @@ namespace iop_cdvd_sync_test
+         rejects([&] { start(iop, p); }, "missing import cdvdman:11");
+     }
+ 
+-    void interruptAndNestedManagedWaitsStayExplicit()
++    void interruptWaitsStayExplicit()
+     {
+         {
+             DiscHost host; IopEmulator iop(host); SyncProgram p;
+@@ -260,16 +260,7 @@ namespace iop_cdvd_sync_test
+             rejects([&] { advance(iop, 10000u); }, "blocking CDVD sync requires interruptible thread context");
+             require(word(iop, p.data(0x84u)) == 0u && host.reads == 0u, "IRQ wait ran beyond its strict boundary");
+         }
+-        {
+-            DiscHost host; IopEmulator iop(host); SyncProgram p;
+-            p.begin(); p.driver(); p.thread(0x400u, 0x2500u, 40u, 0x70u); p.finish();
+-            p.begin(0x400u); p.devctl(); p.mark(1u, 0x88u); p.finish();
+-            p.begin(0x600u); p.stream(); p.read(); p.sync(); p.finish(); p.recordingHandler(0xA00u, 0u);
+-            prepare(iop); start(iop, p);
+-            rejects([&] { advance(iop, 10000u); }, "nested managed-thread invocation is unsupported");
+-            require(word(iop, p.data(0x88u)) == 0u && host.reads == 0u,
+-                    "nested blocking invocation parked or resumed the wrong managed CPU");
+-        }
++
+     }
+ 
+     void callbackFailureDuringExternalWaitStaysSticky()
