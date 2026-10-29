@@ -175,13 +175,14 @@ PS2Runtime::RecompiledFunction original_animation_lookup = nullptr;
 mafia::IntroSkipState intro_skip;
 void skip_initial_animation(std::uint8_t *ram, R5900Context *context, PS2Runtime *runtime) {
     const auto return_pc = static_cast<std::uint32_t>(_mm_cvtsi128_si32(context->r[31]));
-    if (intro_skip.should_skip(return_pc)) {
-        // Both verified zero-result branches precede movie resource setup.
+    const auto argument = static_cast<std::uint32_t>(_mm_cvtsi128_si32(context->r[4]));
+    const auto guest_ram = ram ? std::span<const std::uint8_t>(ram, PS2_RAM_SIZE)
+                               : std::span<const std::uint8_t>{};
+    mafia::dispatch_intro_lookup(intro_skip, return_pc, guest_ram, argument, [&] {
+        // The verified zero-result branches precede movie resource setup.
         context->r[2] = _mm_insert_epi64(context->r[2], 0, 0);
         context->pc = return_pc;
-        return;
-    }
-    original_animation_lookup(ram, context, runtime);
+    }, [&] { original_animation_lookup(ram, context, runtime); });
 }
 void observe_entry(std::uint8_t *ram, R5900Context *context, PS2Runtime *runtime) {
     entry_executed.store(true, std::memory_order_release);
@@ -339,7 +340,8 @@ void emit_report(const Options &options, const Report &report) {
         ",\n  \"elf_loaded\": " + boolean(report.elf_loaded) +
         ",\n  \"skip_intro\": {\"requested\": " + boolean(options.skip_intro) +
             ", \"startup_substitutions\": " + std::to_string(intro_skip.startup_count()) +
-            ", \"new_game_substitutions\": " + std::to_string(intro_skip.new_game_count()) + "}" +
+            ", \"new_game_substitutions\": " + std::to_string(intro_skip.new_game_count()) +
+            ", \"first_mission_substitutions\": " + std::to_string(intro_skip.first_mission_count()) + "}" +
         ",\n  \"entry_executed\": " + boolean(report.entered) +
         ",\n  \"metrics_available\": " + boolean(report.metrics_available) +
         ",\n  \"last_guest_pc\": " + std::to_string(report.last_pc) +
@@ -782,7 +784,7 @@ int main(int argc, char **argv) {
                          "Pad events sample controller port 1 over SIO2; times are elapsed host milliseconds.\n"
                          "Card slot 1 uses SAVE-ROOT/slot1.ps2 by default; missing images are created blank.\n"
                          "Existing images are preserved; the original game owns formatting and save files.\n"
-                         "--skip-intro skips the first startup trailer and New Game intro before movie setup.\n"
+                         "--skip-intro skips the startup trailer, New Game intro and first mission movie.\n"
                          "Keyboard: Enter START, X/Space Cross, C Circle, arrows/WASD directions.\n"
                          "F11 toggles fullscreen. A timeout/guest stop is a diagnostic failure, not gameplay success.\n";
             return 0;

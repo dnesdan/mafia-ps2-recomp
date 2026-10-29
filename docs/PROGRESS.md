@@ -33,6 +33,12 @@ Patch 0052 gives only MCSERV GetInfo (function 1, 48-byte request) and Open (fun
 
 A private patch-0050 diagnostic used both earlier video substitutions plus the scoped budget, with an isolated copy of a game-created profile. It passed the prior autosave failure and reached `/video/01/01a.pss`, then timed out in `_nextStartCode` with a black frame. Its report SHA-256 is `593bdde64053b25f6592ecd7bb4b928b595494316e75a07ccdfbd1a377183fb4`. The game did not reach a verified playable scene; the actual movie decoder remains unimplemented.
 
+## First-mission driving tutorial
+
+An isolated private diagnostic selected the original no-animation branch at script lookup return `0x001d1df0` only after confirming the exact input `01a.pss`. With the startup and New Game substitutions and patch-0052 card budget, it progressed past the previously blocked first-mission movie to the original driving tutorial, which asks the player to continue with Cross. The final image and report were captured locally (report SHA-256 `f944563d3c268a195697a234f7abcfa652cc42346cef059d5b88557262ce5136`; frame SHA-256 `f03decc2fb1be8fd7b0e845a624080ce78b1d6e9482c0619d63e54a09d096711`). No 3D gameplay or response to driving input is established by this capture.
+
+The `--skip-intro` option now exposes this narrowly scoped third substitution for the exact verified ELF. It checks the return address and bounded, NUL-terminated movie name; unrelated lookups use the original function. The game's existing no-video branch advances its script but also bypasses movie-success sound/indicator operations, so later behavioral equivalence is not established. The workaround omits story footage and does not decode movies.
+
 ## Latest source checkpoint: patches 0048–0050
 
 Patch 0048 implements persistent ordinary raw cards below the original Sony SIO2MAN/MCMAN/MCSERV stack. The host mounts slot 1 before guest execution and reports its image and mount state. New images are exclusively created, all-FF and unformatted; exact-size existing images are reopened without rewriting. Reads, staged writes and erase operations validate complete commands, NAND bit transitions, checksums and bounds. Completed mutations use atomic replacement and file/directory synchronization. A separate lock prevents concurrent writers; malformed images, symlinks and storage failures fail explicitly. IOP reset keeps the mounted image and discards unfinished protocol state.

@@ -2,11 +2,11 @@
 
 Static recompilation of the original PlayStation 2 **Mafia** executable for Linux and Apple Silicon macOS. The original EE game program is translated to C++ by a pinned [PS2Recomp](https://github.com/ran-j/PS2Recomp) revision and linked with its PS2 runtime.
 
-**Status: the original main menu has been reached on Linux with a diagnostic intro skip; gameplay remains unverified.** Patch 0048 attaches a persistent 8 MiB card through SIO2 and the original Sony memory-card drivers. A 512 KiB file survived format/write/flush/close, full readback and reopening in a new process. The original game also created a profile on an isolated card during the menu test; saving a Mafia mission remains unverified.
+**Status: the original first-mission driving tutorial has been reached on Linux with diagnostic movie skips; gameplay remains unverified.** Patch 0048 attaches a persistent 8 MiB card through SIO2 and the original Sony memory-card drivers. A 512 KiB file survived format/write/flush/close, full readback and reopening in a new process. The original game also created a profile on an isolated card during the menu test; saving a Mafia mission remains unverified.
 
 A patch-0048 original-game run accepted the formatted card, left the frontend after Cross and reached movie initialization. Its 60-second diagnostic limit expired in `_waitIpuIdle64` with a black surface. Movie playback remains under investigation. Linux and ARM64 macOS CI passed through patch 0050; current checks and detailed provenance are in [the progress report](docs/PROGRESS.md).
 
-An isolated diagnostic build used original no-animation branches for the startup and New Game movies, then continued past the earlier card autosave error with the scoped metadata budget in patch 0052. It subsequently reached another first-mission movie and timed out in the unimplemented IPU path. Video playback and gameplay have not been established. The normal [autosave caution](docs/screenshots/mafia-linux-card-autosave.png) appears before the game queries the card.
+An isolated diagnostic build used original no-animation branches for the startup and New Game movies, then continued past the earlier card autosave error with the scoped metadata budget in patch 0052. A subsequent diagnostic also skipped the first-mission opening movie and reached the original driving tutorial. Video playback and gameplay have not been established. The normal [autosave caution](docs/screenshots/mafia-linux-card-autosave.png) appears before the game queries the card.
 
 ## Build from your own disc
 
@@ -45,7 +45,7 @@ The current profile accepts **SLUS-20671, VER 1.01**, and only the exact ELF SHA
 
 Slot 1 uses `SAVE_ROOT/slot1.ps2` by default. Linux defaults to `.local/memory-cards` under the working directory; macOS uses `~/Library/Application Support/MafiaNative/memory-cards`. Use `--save-root PATH` to choose that directory, `--memory-card IMAGE.ps2` to select an existing raw card, or `--no-memory-card` for an intentional absent-card run. A missing image is created **blank and unformatted**; original drivers own formatting and save files. Existing images are preserved, and invalid geometry or an image already in use fails before guest entry. Supported raw images contain 8 MiB of data plus 16 spare bytes per 512-byte page (8,650,752 bytes total). Plain 8 MiB images are not converted automatically. Physical MagicGate authentication and protected files are unsupported.
 
-`--skip-intro` explicitly selects the verified SLUS-20671 game's existing no-animation branches before the startup trailer and the New Game intro are initialized. The startup substitution happens once; the New Game intro is skipped on each selection. The report records each count. This workaround allows startup to continue without claiming video playback; gameplay is still under investigation.
+`--skip-intro` explicitly selects the verified SLUS-20671 game's existing no-animation branches for the startup trailer, New Game intro and `01a.pss` opening movie in the first mission. The startup substitution happens once; the other two are skipped when selected. The report records each count. This workaround omits those story videos and may affect movie-related sound state; it does not implement video playback, and gameplay is still under investigation.
 
 For a bounded headless Linux run after building (use `run_macos.sh` on macOS):
 
