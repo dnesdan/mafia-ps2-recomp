@@ -50,7 +50,7 @@
      register_ps2_sif_dma_tests();
 --- /dev/null
 +++ b/ps2xTest/src/ps2_gs_triangle_z_tests.cpp
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,78 @@
 +// Triangle depth invariance and bounded interpolation for Z32.
 +#include "MiniTest.h"
 +#include "runtime/ps2_memory.h"
@@ -91,9 +91,11 @@
 +                             (uint64_t(y) << 20) | (uint64_t(value) << 32));
 +        }
 +    };
++    const bool extremeGradient = z.z0 != z.z1 && (z.z0 == 0xffffffffu || z.z1 == 0xffffffffu);
++    const uint32_t extent = extremeGradient ? 8 : 7;
 +    vertex(0, 0, z.z0);
-+    if (reverse) { vertex(0, 7, z.z2); vertex(7, 0, z.z1); }
-+    else { vertex(7, 0, z.z1); vertex(0, 7, z.z2); }
++    if (reverse) { vertex(0, extent, z.z2); vertex(extent, 0, z.z1); }
++    else { vertex(extent, 0, z.z1); vertex(0, extent, z.z2); }
 +    for (uint32_t y = 0; y < 7; ++y) for (uint32_t x = 0; x < 7; ++x) {
 +        if (x + y > 5) continue; // 21 strictly interior pixel centers
 +        t.Equals(gs.ReadVram(GS_PSM_CT32, 0, 1, x, y), 0x800000ffu, "interior pixel drawn");
@@ -102,6 +104,9 @@
 +    }
 +    if (z.z0 == 1000 && z.z1 == 3000 && z.z2 == 5000)
 +        t.Equals(gs.ReadVram(GS_PSM_Z32, 32, 1, 1, 1), 2286u, "ordinary interpolated depth");
++    if (extremeGradient)
++        t.Equals(gs.ReadVram(GS_PSM_Z32, 32, 1, 1, 1),
++                 z.z0 == 0 ? 0x60000000u : 0x9fffffffu, "extreme interpolated depth");
 +}
 +}
 +void register_ps2_gs_triangle_z_tests() {
