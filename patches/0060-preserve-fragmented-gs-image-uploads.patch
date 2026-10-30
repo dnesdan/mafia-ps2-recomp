@@ -1,10 +1,10 @@
 diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
 --- a/ps2xTest/CMakeLists.txt
 +++ b/ps2xTest/CMakeLists.txt
-@@ -34,6 +34,7 @@
-     src/ps2_vu1_tests.cpp
-     src/ps2_vu_tests.cpp
-     src/ps2_gs_tests.cpp
+@@ -39,6 +39,7 @@
+     src/ps2_gs_xyoffset_tests.cpp
+     src/ps2_gs_packed_z_tests.cpp
+     src/ps2_gs_triangle_z_tests.cpp
 +    src/ps2_gs_upload_tests.cpp
      src/ps2_iop_tests.cpp
      src/ps2_sif_rpc_tests.cpp
@@ -12,18 +12,18 @@ diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
 diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
 --- a/ps2xTest/src/main.cpp
 +++ b/ps2xTest/src/main.cpp
-@@ -13,6 +13,7 @@
- void register_ps2_vu1_tests();
- void register_ps2_vu_tests();
- void register_ps2_gs_tests();
+@@ -20,6 +20,7 @@
+ void register_ps2_gs_xyoffset_tests();
+ void register_ps2_gs_packed_z_tests();
+ void register_ps2_gs_triangle_z_tests();
 +void register_ps2_gs_upload_tests();
  void register_ps2_iop_tests();
  void register_ps2_sif_rpc_tests();
  void register_ps2_sif_dma_tests();
-@@ -35,6 +36,7 @@
-     register_ps2_vu1_tests();
-     register_ps2_vu_tests();
-     register_ps2_gs_tests();
+@@ -50,6 +51,7 @@
+     register_ps2_gs_xyoffset_tests();
+     register_ps2_gs_packed_z_tests();
+     register_ps2_gs_triangle_z_tests();
 +    register_ps2_gs_upload_tests();
      register_ps2_iop_tests();
      register_ps2_sif_rpc_tests();
@@ -32,13 +32,15 @@ diff --git a/ps2xTest/src/ps2_gs_upload_tests.cpp b/ps2xTest/src/ps2_gs_upload_t
 new file mode 100644
 --- /dev/null
 +++ b/ps2xTest/src/ps2_gs_upload_tests.cpp
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,296 @@
 +#include "MiniTest.h"
 +#include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_frontend.h"
 +
 +#include <algorithm>
 +#include <array>
 +#include <cstdint>
++#include <cstring>
 +#include <stdexcept>
 +#include <vector>
 +
@@ -117,6 +119,72 @@ new file mode 100644
 +{
 +    MiniTest::Case("GS fragmented image uploads", [](TestCase &tc)
 +    {
++        tc.Run("Real GIF IMAGE packets share one 24-bit pixel stream", [](TestCase &)
++        {
++            for (const auto psm : {GS_PSM_CT24, GS_PSM_Z24})
++            {
++                std::vector<uint8_t> vram(4u * 1024u * 1024u, 0xA5u);
++                GS gs;
++                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++                gs.writeRegister(GS_REG_BITBLTBUF, (32ull << 32u) | (1ull << 48u) | (uint64_t{psm} << 56u));
++                gs.writeRegister(GS_REG_TRXPOS, (3ull << 32u) | (5ull << 48u));
++                gs.writeRegister(GS_REG_TRXREG, 8ull | (3ull << 32u));
++                gs.writeRegister(GS_REG_TRXDIR, 0u);
++                const auto bytes = uploadBytes(80u);
++                for (uint32_t offset = 0u; offset < bytes.size(); offset += 16u)
++                {
++                    std::array<uint8_t, 32u> packet{};
++                    const uint64_t tag = 1ull | (1ull << 15u) | (2ull << 58u); // IMAGE, one QW, EOP.
++                    std::memcpy(packet.data(), &tag, sizeof(tag));
++                    std::memcpy(packet.data() + 16u, bytes.data() + offset, 16u);
++                    gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
++                }
++                for (uint32_t i = 0u; i < 24u; ++i)
++                {
++                    const uint32_t expected = uint32_t{bytes[i * 3u]} |
++                        (uint32_t{bytes[i * 3u + 1u]} << 8u) | (uint32_t{bytes[i * 3u + 2u]} << 16u);
++                    requireUpload(gs.ReadVram(psm, 32u, 1u, 3u + i % 8u, 5u + i / 8u) == expected,
++                                  "GIF packet boundaries or EOP discarded part of a pixel");
++                }
++            }
++        });
++        tc.Run("Real HWREG writes retain 24-bit pixel tails", [](TestCase &)
++        {
++            for (const auto psm : {GS_PSM_CT24, GS_PSM_Z24})
++            {
++                std::vector<uint8_t> vram(4u * 1024u * 1024u, 0u);
++                GS gs;
++                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++                gs.writeRegister(GS_REG_BITBLTBUF, (32ull << 32u) | (1ull << 48u) | (uint64_t{psm} << 56u));
++                gs.writeRegister(GS_REG_TRXPOS, 0u);
++                gs.writeRegister(GS_REG_TRXREG, 5ull | (3ull << 32u));
++                gs.writeRegister(GS_REG_TRXDIR, 0u);
++                const auto bytes = uploadBytes(48u);
++                for (uint32_t offset = 0u; offset < bytes.size(); offset += 8u)
++                {
++                    uint64_t word = 0u;
++                    std::memcpy(&word, bytes.data() + offset, sizeof(word));
++                    gs.writeRegister(GS_REG_HWREG, word);
++                }
++                for (uint32_t i = 0u; i < 15u; ++i)
++                {
++                    const uint32_t expected = uint32_t{bytes[i * 3u]} |
++                        (uint32_t{bytes[i * 3u + 1u]} << 8u) | (uint32_t{bytes[i * 3u + 2u]} << 16u);
++                    requireUpload(gs.ReadVram(psm, 32u, 1u, i % 5u, i / 5u) == expected,
++                                  "HWREG writes lost or reordered partial pixels");
++                }
++            }
++        });
++        tc.Run("A caller may reuse the input buffer after a partial upload", [](TestCase &)
++        {
++            UploadFixture f;
++            const auto expected = uploadBytes(21u);
++            auto first = expected;
++            f.backend.UploadImage(first.data(), 2u);
++            std::fill(first.begin(), first.end(), 0u);
++            f.backend.UploadImage(expected.data() + 2u, 19u);
++            f.check(expected, 3u);
++        });
 +        tc.Run("RGB24 and Z24 retain partial pixels across GIF-sized blocks", [](TestCase &)
 +        {
 +            for (const auto psm : {GS_PSM_CT24, GS_PSM_Z24})
