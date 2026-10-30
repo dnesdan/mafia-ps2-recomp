@@ -110,6 +110,13 @@ jobs:
             task_flags+=(--sse2neon .deps/sse2neon)
           fi
           python3 patches/tests/check_integer_codegen.py --source .deps/PS2Recomp --build build/upstream "${task_flags[@]}"
+      - name: GS upload contracts under ASan and UBSan
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 patches/tests/check_gs_uploads.py --source .deps/PS2Recomp \
+            --build build/gs-upload-sanitizers 2>&1 | tee build/gs-upload-sanitizers.log
+          python3 tools/verify_upstream.py .deps/PS2Recomp
       - name: Retain test diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -117,6 +124,7 @@ jobs:
           name: runtime-test-logs-${{ matrix.os }}-${{ github.sha }}
           path: |
             build/upstream-runtime-tests.log
+            build/gs-upload-sanitizers.log
             build/runtime/Testing/Temporary/*.log
             build/upstream-tests/ps2xIOP/Testing/Temporary/*.log
           if-no-files-found: warn
