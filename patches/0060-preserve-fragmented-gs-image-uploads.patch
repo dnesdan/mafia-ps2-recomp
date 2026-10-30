@@ -1,3 +1,106 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -78,5 +78,8 @@
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
++    // Upload calls are byte-stream fragments, not necessarily whole pixels.
++    std::array<uint8_t, 4> m_uploadPixel{};
++    uint32_t m_uploadPixelBytes = 0u;
+     std::vector<uint8_t> m_localToHostBuffer;
+     size_t m_localToHostReadPos = 0;
+ };
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -544,5 +544,6 @@
+     m_transferState = {};
+     m_transferState.direction = 3u;
++    m_uploadPixelBytes = 0u;
+     m_localToHostBuffer.clear();
+     m_localToHostReadPos = 0u;
+ }
+@@ -1480,5 +1480,6 @@
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
++    m_uploadPixelBytes = 0u;
+ 
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+@@ -1527,3 +1527,23 @@
++    // GIF IMAGE and HWREG calls can end inside a pixel (notably RGB24).
++    // Keep only that tail; complete pixels retain the direct input fast path.
++    auto readPixel = [&](uint32_t byteCount) -> const uint8_t *
++    {
++        if (m_uploadPixelBytes == 0u && sizeBytes - offset >= byteCount)
++        {
++            const uint8_t *pixel = data + offset;
++            offset += byteCount;
++            return pixel;
++        }
++        const uint32_t copied = std::min(byteCount - m_uploadPixelBytes, sizeBytes - offset);
++        std::memcpy(m_uploadPixel.data() + m_uploadPixelBytes, data + offset, copied);
++        m_uploadPixelBytes += copied;
++        offset += copied;
++        if (m_uploadPixelBytes < byteCount)
++            return nullptr;
++        m_uploadPixelBytes = 0u;
++        return m_uploadPixel.data();
++    };
++
+     while (offset < sizeBytes && m_transferState.direction == 0u)
+     {
+         switch (dpsm)
+@@ -1531,25 +1551,25 @@
+         case GS_PSM_CT32:
+         case GS_PSM_Z32:
+         {
+-            if (sizeBytes - offset < 4u)
++            const uint8_t *pixel = readPixel(4u);
++            if (!pixel)
+                 return;
+             uint32_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
++            std::memcpy(&value, pixel, sizeof(value));
+             WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 4u;
+             advancePixel(1u);
+             break;
+         }
+         case GS_PSM_CT24:
+         case GS_PSM_Z24:
+         {
+-            if (sizeBytes - offset < 3u)
++            const uint8_t *pixel = readPixel(3u);
++            if (!pixel)
+                 return;
+-            const uint32_t value = static_cast<uint32_t>(data[offset]) |
+-                                   (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+-                                   (static_cast<uint32_t>(data[offset + 2u]) << 16u);
++            const uint32_t value = static_cast<uint32_t>(pixel[0]) |
++                                   (static_cast<uint32_t>(pixel[1]) << 8u) |
++                                   (static_cast<uint32_t>(pixel[2]) << 16u);
+             WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 3u;
+             advancePixel(1u);
+             break;
+         }
+@@ -1559,12 +1579,12 @@
+         case GS_PSM_Z16:
+         case GS_PSM_Z16S:
+         {
+-            if (sizeBytes - offset < 2u)
++            const uint8_t *pixel = readPixel(2u);
++            if (!pixel)
+                 return;
+             uint16_t value = 0u;
+-            std::memcpy(&value, data + offset, sizeof(value));
++            std::memcpy(&value, pixel, sizeof(value));
+             WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
+-            offset += 2u;
+             advancePixel(1u);
+             break;
+         }
 diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
 --- a/ps2xTest/CMakeLists.txt
 +++ b/ps2xTest/CMakeLists.txt
