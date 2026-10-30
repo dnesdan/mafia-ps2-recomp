@@ -1,0 +1,263 @@
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -34,6 +34,7 @@
+     src/ps2_vu1_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
++    src/ps2_gs_upload_tests.cpp
+     src/ps2_iop_tests.cpp
+     src/ps2_sif_rpc_tests.cpp
+     src/ps2_sif_dma_tests.cpp
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -13,6 +13,7 @@
+ void register_ps2_vu1_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
++void register_ps2_gs_upload_tests();
+ void register_ps2_iop_tests();
+ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+@@ -35,6 +36,7 @@
+     register_ps2_vu1_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
++    register_ps2_gs_upload_tests();
+     register_ps2_iop_tests();
+     register_ps2_sif_rpc_tests();
+     register_ps2_sif_dma_tests();
+diff --git a/ps2xTest/src/ps2_gs_upload_tests.cpp b/ps2xTest/src/ps2_gs_upload_tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/ps2xTest/src/ps2_gs_upload_tests.cpp
+@@ -0,0 +1,228 @@
++#include "MiniTest.h"
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <stdexcept>
++#include <vector>
++
++namespace
++{
++    void requireUpload(bool value, const char *message)
++    {
++        if (!value)
++            throw std::runtime_error(message);
++    }
++
++    struct UploadFixture
++    {
++        std::vector<uint8_t> vram = std::vector<uint8_t>(4u * 1024u * 1024u, 0xA5u);
++        GSCpuBackend backend;
++        GSTransferCommand command{};
++
++        UploadFixture(uint8_t psm = GS_PSM_CT24, uint32_t width = 7u, uint32_t height = 1u)
++        {
++            backend.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
++            command.direction = 0u;
++            command.bitbltbuf.dpsm = psm;
++            command.bitbltbuf.dbp = 32u;
++            command.bitbltbuf.dbw = 1u;
++            command.trxpos.dsax = 3u;
++            command.trxpos.dsay = 5u;
++            command.trxreg.rrw = width;
++            command.trxreg.rrh = height;
++            backend.BeginTransfer(command);
++        }
++
++        uint32_t pixel(uint32_t index, uint32_t psm) const
++        {
++            return backend.ReadVram(psm, command.bitbltbuf.dbp, command.bitbltbuf.dbw,
++                command.trxpos.dsax + index % command.trxreg.rrw,
++                command.trxpos.dsay + index / command.trxreg.rrw);
++        }
++
++        void check(const std::vector<uint8_t> &bytes, uint32_t bytesPerPixel) const
++        {
++            const uint32_t count = command.trxreg.rrw * command.trxreg.rrh;
++            for (uint32_t i = 0u; i < count; ++i)
++            {
++                uint32_t expected = 0u;
++                for (uint32_t b = 0u; b < bytesPerPixel; ++b)
++                    expected |= uint32_t{bytes[i * bytesPerPixel + b]} << (8u * b);
++                requireUpload(pixel(i, command.bitbltbuf.dpsm) == expected,
++                              "fragmented upload lost or reordered pixel bytes");
++            }
++            const auto state = backend.GetTransferSnapshot();
++            requireUpload(state.direction == 3u && state.copiedPixels == count,
++                          "upload did not finish at the requested pixel count");
++        }
++    };
++
++    std::vector<uint8_t> uploadBytes(uint32_t count)
++    {
++        std::vector<uint8_t> bytes(count);
++        for (uint32_t i = 0u; i < count; ++i)
++            bytes[i] = static_cast<uint8_t>(i * 37u + 11u);
++        return bytes;
++    }
++
++    void sendChunks(GSCpuBackend &backend, const std::vector<uint8_t> &bytes, uint32_t chunk)
++    {
++        for (uint32_t offset = 0u; offset < bytes.size();)
++        {
++            const uint32_t length = std::min(chunk, static_cast<uint32_t>(bytes.size()) - offset);
++            backend.UploadImage(bytes.data() + offset, length);
++            offset += length;
++        }
++    }
++}
++
++void register_ps2_gs_upload_tests()
++{
++    MiniTest::Case("GS fragmented image uploads", [](TestCase &tc)
++    {
++        tc.Run("RGB24 and Z24 retain partial pixels across GIF-sized blocks", [](TestCase &)
++        {
++            for (const auto psm : {GS_PSM_CT24, GS_PSM_Z24})
++            {
++                UploadFixture f(psm, 8u, 3u);
++                const auto bytes = uploadBytes(80u); // 72 payload bytes plus final-QW padding.
++                const uint32_t rawPsm = psm == GS_PSM_CT24 ? GS_PSM_CT32 : GS_PSM_Z32;
++                for (uint32_t offset = 0u; offset < bytes.size(); offset += 16u)
++                {
++                    f.backend.UploadImage(bytes.data() + offset, 16u);
++                    const uint32_t complete = std::min((offset + 16u) / 3u, 24u);
++                    requireUpload(f.backend.GetTransferSnapshot().copiedPixels == complete,
++                                  "progress counted incomplete pixels or dropped a partial pixel");
++                    if (complete < 24u)
++                        requireUpload(f.pixel(complete, rawPsm) == 0xA5A5A5A5u,
++                                      "incomplete pixel changed VRAM");
++                }
++                f.check(bytes, 3u);
++                for (uint32_t i = 0u; i < 24u; ++i)
++                    requireUpload((f.pixel(i, rawPsm) >> 24u) == 0xA5u,
++                                  "24-bit upload overwrote the unused high byte");
++                requireUpload(f.pixel(24u, rawPsm) == 0xA5A5A5A5u,
++                              "final-QW padding escaped the transfer rectangle");
++            }
++        });
++        tc.Run("RGB24 and Z24 are invariant under every two-part split", [](TestCase &)
++        {
++            const auto bytes = uploadBytes(21u);
++            for (const auto psm : {GS_PSM_CT24, GS_PSM_Z24})
++                for (uint32_t split = 1u; split < bytes.size(); ++split)
++                {
++                    UploadFixture f(psm);
++                    f.backend.UploadImage(bytes.data(), split);
++                    f.backend.UploadImage(bytes.data() + split, static_cast<uint32_t>(bytes.size()) - split);
++                    f.check(bytes, 3u);
++                }
++        });
++        tc.Run("Eight-byte HWREG-sized chunks preserve 24-bit rows", [](TestCase &)
++        {
++            for (const auto psm : {GS_PSM_CT24, GS_PSM_Z24})
++            {
++                UploadFixture f(psm, 5u, 3u);
++                const auto bytes = uploadBytes(48u);
++                sendChunks(f.backend, bytes, 8u);
++                f.check(bytes, 3u);
++            }
++        });
++        tc.Run("16-bit and 32-bit formats preserve unaligned byte fragments", [](TestCase &)
++        {
++            for (const auto psm : {GS_PSM_CT32, GS_PSM_Z32, GS_PSM_CT16, GS_PSM_CT16S,
++                                   GS_PSM_Z16, GS_PSM_Z16S})
++                for (uint32_t chunk = 1u; chunk <= 7u; ++chunk)
++                {
++                    UploadFixture f(psm, 5u, 2u);
++                    const uint32_t bpp = psm == GS_PSM_CT32 || psm == GS_PSM_Z32 ? 4u : 2u;
++                    const auto bytes = uploadBytes(10u * bpp);
++                    sendChunks(f.backend, bytes, chunk);
++                    f.check(bytes, bpp);
++                }
++        });
++        tc.Run("Indexed formats keep byte and nibble ordering and odd-pixel bounds", [](TestCase &)
++        {
++            for (const auto psm : {GS_PSM_T8, GS_PSM_T8H, GS_PSM_T4, GS_PSM_T4HL, GS_PSM_T4HH})
++            {
++                UploadFixture f(psm);
++                const bool nibble = psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
++                const auto bytes = uploadBytes(nibble ? 4u : 7u);
++                const auto sentinel = f.pixel(7u, psm);
++                sendChunks(f.backend, bytes, 1u);
++                for (uint32_t i = 0u; i < 7u; ++i)
++                {
++                    const uint32_t expected = nibble ? (bytes[i / 2u] >> (4u * (i % 2u))) & 15u : bytes[i];
++                    requireUpload(f.pixel(i, psm) == expected, "indexed upload ordering changed");
++                }
++                requireUpload(f.pixel(7u, psm) == sentinel, "odd final nibble escaped the rectangle");
++                requireUpload(f.backend.GetTransferSnapshot().direction == 3u, "indexed upload did not finish");
++            }
++        });
++        tc.Run("Null and empty input and flushes preserve a partial pixel", [](TestCase &)
++        {
++            UploadFixture f;
++            const auto bytes = uploadBytes(21u);
++            f.backend.UploadImage(bytes.data(), 1u);
++            f.backend.UploadImage(nullptr, 16u);
++            f.backend.UploadImage(bytes.data(), 0u);
++            f.backend.Flush();
++            f.backend.TextureFlush();
++            requireUpload(f.backend.GetTransferSnapshot().copiedPixels == 0u,
++                          "no-op upload published an incomplete pixel");
++            f.backend.UploadImage(bytes.data() + 1u, 20u);
++            f.check(bytes, 3u);
++        });
++        tc.Run("Reset and reinitialization retire incomplete uploads", [](TestCase &)
++        {
++            for (bool reinitialize : {false, true})
++            {
++                UploadFixture f;
++                const auto bytes = uploadBytes(21u);
++                const std::array<uint8_t, 2u> old{0xDEu, 0xADu};
++                f.backend.UploadImage(old.data(), static_cast<uint32_t>(old.size()));
++                if (reinitialize)
++                    f.backend.Initialize(f.vram.data(), static_cast<uint32_t>(f.vram.size()));
++                else
++                    f.backend.Reset();
++                f.backend.UploadImage(bytes.data(), static_cast<uint32_t>(bytes.size()));
++                requireUpload(f.backend.GetTransferSnapshot().copiedPixels == 0u, "retired upload resumed");
++                f.backend.BeginTransfer(f.command);
++                f.backend.UploadImage(bytes.data(), static_cast<uint32_t>(bytes.size()));
++                f.check(bytes, 3u);
++            }
++        });
++        tc.Run("Replacement transfers and completion padding do not leak stale bytes", [](TestCase &)
++        {
++            UploadFixture f;
++            const auto bytes = uploadBytes(32u);
++            f.backend.UploadImage(bytes.data(), 2u);
++            f.command.bitbltbuf.dpsm = GS_PSM_CT32;
++            f.command.trxreg.rrw = 4u;
++            f.backend.BeginTransfer(f.command);
++            f.backend.UploadImage(bytes.data(), 32u);
++            f.check(bytes, 4u);
++            const auto before = f.pixel(4u, GS_PSM_CT32);
++            f.backend.UploadImage(bytes.data(), 32u);
++            requireUpload(f.pixel(4u, GS_PSM_CT32) == before, "finished transfer accepted trailing bytes");
++            f.command.bitbltbuf.dpsm = GS_PSM_CT24;
++            f.command.trxreg.rrw = 7u;
++            f.backend.BeginTransfer(f.command);
++            f.backend.UploadImage(bytes.data(), 21u);
++            f.check(bytes, 3u);
++        });
++        tc.Run("Partial pixels belong to their own backend instance", [](TestCase &)
++        {
++            UploadFixture first, second;
++            auto a = uploadBytes(21u), b = a;
++            for (auto &byte : b) byte ^= 0xFFu;
++            first.backend.UploadImage(a.data(), 1u);
++            second.backend.UploadImage(b.data(), 2u);
++            first.backend.UploadImage(a.data() + 1u, 20u);
++            second.backend.UploadImage(b.data() + 2u, 19u);
++            first.check(a, 3u);
++            second.check(b, 3u);
++        });
++    });
++}
