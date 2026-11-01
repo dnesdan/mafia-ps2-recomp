@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run full production GS transfer and framebuffer clear checks locally, without CI."""
+"""Run full production GS backend contract suites locally, without CI."""
 from __future__ import annotations
 
 import argparse
@@ -18,17 +18,19 @@ def main() -> int:
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"))
     parser.add_argument("--sanitize", action="store_true")
+    parser.add_argument("--suite", choices=("transfers", "triangles"), default="transfers")
     args = parser.parse_args()
     source, build = args.source.resolve(), args.build.resolve()
     if build == source or source in build.parents:
         parser.error("--build must be outside the source tree")
     tests = Path(__file__).resolve().parent
-    units = [tests / "gs_backend_contracts_probe.cpp"] + [source / name for name in (
+    stem = "gs_triangle_edges" if args.suite == "triangles" else "gs_backend_contracts"
+    units = [tests / f"{stem}_probe.cpp"] + [source / name for name in (
         "ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp", "ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp")]
     try:
         hashes = {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest() for p in units[1:]}
         build.mkdir(parents=True, exist_ok=True)
-        binary = build / "gs_backend_contracts_tests"
+        binary = build / f"{stem}_tests"
         command = [args.cxx, "-std=c++20", "-O2", "-g1", "-pthread", "-Wall", "-Wextra",
                    "-fno-fast-math", "-ffp-contract=off", "-fno-omit-frame-pointer"]
         if args.sanitize:
