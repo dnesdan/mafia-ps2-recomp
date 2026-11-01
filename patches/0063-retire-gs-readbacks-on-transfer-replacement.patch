@@ -1,0 +1,23 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1476,6 +1476,10 @@
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
+     m_uploadPixelBytes = 0u;
++    // TRXDIR starts a new transfer lifetime, including non-readback directions.
++    // Retire unread bytes and their cursor together before dispatching it.
++    m_localToHostBuffer.clear();
++    m_localToHostReadPos = 0u;
+ 
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+@@ -1652,8 +1656,6 @@
+ 
+ void GSCpuBackend::PerformLocalToHostTransfer()
+ {
+-    m_localToHostBuffer.clear();
+-    m_localToHostReadPos = 0u;
+     if (!m_vram)
+         return;
+ 
