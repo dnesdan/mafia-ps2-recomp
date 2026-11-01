@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -473,7 +473,10 @@
+ 
+     if (!state.linearFilter)
+     {
+-        return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
++        // Select the containing texel before applying the GS wrap/clamp mode.
++        // Truncating -0.25 toward zero incorrectly selects texel 0, not -1.
++        return samplePoint(static_cast<int>(std::floor(texUf)),
++                           static_cast<int>(std::floor(texVf)));
+     }
+ 
+     const float sampleU = texUf - 0.5f;
