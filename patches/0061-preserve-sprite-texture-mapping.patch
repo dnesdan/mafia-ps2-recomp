@@ -1,0 +1,46 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1172,6 +1172,9 @@
+     int x1 = gsOffsetPixel(v1.x, ctx.xyoffset.ofx);
+     int y1 = gsOffsetPixel(v1.y, ctx.xyoffset.ofy);
+     u32 z1 = static_cast<u32>(v1.z);
++    // Sorting the rectangle must also sort its associated texture endpoints.
++    const bool reverseX = x0 > x1;
++    const bool reverseY = y0 > y1;
+ 
+     if (x0 > x1)
+         std::swap(x0, x1);
+@@ -1210,20 +1213,25 @@
+         float u0f, v0f, u1f, v1f;
+         if (state.prim.fst)
+         {
+-            u0f = static_cast<float>(v0.u >> 4);
+-            v0f = static_cast<float>(v0.v >> 4);
+-            u1f = static_cast<float>(v1.u >> 4);
+-            v1f = static_cast<float>(v1.v >> 4);
++            u0f = static_cast<float>(v0.u) * (1.0f / 16.0f);
++            v0f = static_cast<float>(v0.v) * (1.0f / 16.0f);
++            u1f = static_cast<float>(v1.u) * (1.0f / 16.0f);
++            v1f = static_cast<float>(v1.v) * (1.0f / 16.0f);
+         }
+         else
+         {
+-            const float q0 = fabsQ(v0.q);
++            // GS sprites use the second vertex's Q for both endpoints.
+             const float q1 = fabsQ(v1.q);
+-            u0f = (v0.s / q0) * static_cast<float>(texW);
+-            v0f = (v0.t / q0) * static_cast<float>(texH);
++            u0f = (v0.s / q1) * static_cast<float>(texW);
++            v0f = (v0.t / q1) * static_cast<float>(texH);
+             u1f = (v1.s / q1) * static_cast<float>(texW);
+             v1f = (v1.t / q1) * static_cast<float>(texH);
+         }
++
++        if (reverseX)
++            std::swap(u0f, u1f);
++        if (reverseY)
++            std::swap(v0f, v1f);
+ 
+         float spriteW = static_cast<float>(spanX);
+         float spriteH = static_cast<float>(spanY);
