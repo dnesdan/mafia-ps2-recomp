@@ -1,0 +1,57 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1307,7 +1307,36 @@
+ 
+     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+-    constexpr float kEdgeEpsilon = 1.0e-4f;
++
++    // Half-open edges give a shared sample to exactly one adjacent triangle.
++    // Double precision keeps edge tests exact for the GS's bounded 12.4 inputs;
++    // a normalized-weight epsilon grows with area and can admit exterior pixels.
++    // Keep the existing sample phase and interpolation below unchanged.
++    struct RasterEdge
++    {
++        double x, y, dx, dy;
++        bool inclusive;
++
++        bool contains(double px, double py) const
++        {
++            const double value = dx * (py - y) - dy * (px - x);
++            return value > 0.0 || (value == 0.0 && inclusive);
++        }
++    };
++    auto edge = [winding](double ax, double ay, double bx, double by)
++    {
++        if (winding < 0.0f)
++        {
++            std::swap(ax, bx);
++            std::swap(ay, by);
++        }
++        const double dx = bx - ax, dy = by - ay;
++        // Y increases downwards: upward and rightward horizontal edges own ties.
++        return RasterEdge{ax, ay, dx, dy, dy < 0.0 || (dy == 0.0 && dx > 0.0)};
++    };
++    const RasterEdge edge0 = edge(fx1, fy1, fx2, fy2);
++    const RasterEdge edge1 = edge(fx2, fy2, fx0, fy0);
++    const RasterEdge edge2 = edge(fx0, fy0, fx1, fy1);
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
+@@ -1315,13 +1344,12 @@
+         for (int x = minX; x <= maxX; ++x)
+         {
+             float px = static_cast<float>(x) + 0.5f;
++            if (!edge0.contains(px, py) || !edge1.contains(px, py) || !edge2.contains(px, py))
++                continue;
+ 
+             float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+             float w2 = 1.0f - w0 - w1;
+-
+-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+-                continue;
+ 
+             // Derive the last weight from the others without float sum error in Z.
+             // Equal vertex depths must stay equal even near UINT32_MAX.
